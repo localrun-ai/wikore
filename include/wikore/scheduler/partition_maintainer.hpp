@@ -36,8 +36,10 @@ public:
         int                       usage_events_lookahead = 12;   // months
         // Wake interval during the inter-sweep sleep. Shorter values let the
         // process respond to shutdown sooner (at the cost of more timer events).
-        // Tests use 100ms so the shutdown test completes in under 1 second.
-        std::chrono::milliseconds sleep_chunk            = std::chrono::seconds(30);
+        // 1s bounds daemon-shutdown latency to ~1s without meaningfully more
+        // timer churn (86400 wakes/day is negligible). Tests use 100ms so the
+        // shutdown test completes in under 1 second.
+        std::chrono::milliseconds sleep_chunk            = std::chrono::seconds(1);
         // Optional observer invoked after an inter-sweep timer is armed.
         std::function<void()> on_sleep_armed;
         // Override the reference date for sweeps. Null = use UTC system clock.

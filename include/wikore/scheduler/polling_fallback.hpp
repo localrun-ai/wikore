@@ -53,6 +53,15 @@ public:
     struct Options {
         std::chrono::seconds  interval         = std::chrono::minutes(1);
         std::chrono::minutes  stuck_threshold  = std::chrono::minutes(15);
+        // Wake interval during the inter-sweep sleep. The sleep is chunked so a
+        // SIGTERM arriving right after a sweep returns within one chunk instead
+        // of blocking the whole `interval` -- keeps daemon shutdown prompt.
+        std::chrono::milliseconds sleep_chunk   = std::chrono::seconds(1);
+        // Test hook: invoked once each time the inter-sweep sleep chunk is armed
+        // (right after the timer is scheduled), letting a test flip shutdown
+        // exactly while the coroutine is suspended in the sleep. Unused in
+        // production (empty).
+        std::function<void()> on_sleep_armed;
         // Cap on how many times a single document_version can be requeued
         // after a worker crash. Past this, the row goes to 'error' so a
         // poison message cannot loop forever.
@@ -91,6 +100,10 @@ private:
     // source queues. Returns the transferred count plus a deferred
     // set for sweep #1 to skip.
     drogon::Task<ReapResult> reap_orphan_processing_lists();
+
+    // Sleep for opts_.interval, waking every opts_.sleep_chunk to check
+    // shutdown_ so a SIGTERM does not block for up to a full interval.
+    drogon::Task<void> interruptible_sleep();
 
     drogon::orm::DbClientPtr db_;
     ShutdownPredicate        shutdown_;

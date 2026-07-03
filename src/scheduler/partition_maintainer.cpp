@@ -74,9 +74,9 @@ PartitionMaintainer::PartitionMaintainer(drogon::orm::DbClientPtr db,
 // ---------------------------------------------------------------------------
 // interruptible_sleep
 //
-// Sleeps for opts_.interval but wakes every kSleepChunk to check shutdown_.
-// SIGTERM received at the start of the sleep returns in at most 30 seconds
-// instead of up to 24 hours.
+// Sleeps for opts_.interval but wakes every opts_.sleep_chunk to check
+// shutdown_. SIGTERM received at the start of the sleep returns in at most one
+// chunk (default 1s) instead of up to 24 hours.
 // ---------------------------------------------------------------------------
 
 drogon::Task<void> PartitionMaintainer::interruptible_sleep()

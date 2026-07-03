@@ -9,6 +9,7 @@
 #include <cassert>
 #include <format>
 #include <optional>
+#include <stdexcept>
 
 namespace wikore::scheduler {
 
@@ -30,20 +31,33 @@ constexpr std::string_view kQueuePrefix     = "lr:ingest:q:";
 constexpr std::string_view kProcPrefix      = "lr:ingest:proc:";
 constexpr std::string_view kHeartbeatPrefix = "lr:ingest:hb:";
 
-drogon::Task<void> co_sleep(std::chrono::milliseconds d)
+drogon::Task<void> co_sleep(std::chrono::milliseconds    d,
+                            const std::function<void()>& on_armed = {})
 {
     auto* loop = drogon::app().getLoop();
     struct Awaiter {
         trantor::EventLoop*           loop;
         std::chrono::milliseconds     delay;
+        const std::function<void()>*  on_armed;
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> h) {
             loop->runAfter(static_cast<double>(delay.count()) / 1000.0,
                            [h]() mutable { h.resume(); });
+            if (*on_armed) {
+                try {
+                    (*on_armed)();
+                } catch (const std::exception& ex) {
+                    spdlog::error("[polling-fallback] sleep observer failed: {}",
+                                  ex.what());
+                } catch (...) {
+                    spdlog::error("[polling-fallback] sleep observer failed with "
+                                  "a non-standard exception");
+                }
+            }
         }
         void await_resume() const noexcept {}
     };
-    co_await Awaiter{loop, d};
+    co_await Awaiter{loop, d, &on_armed};
 }
 
 } // namespace
@@ -54,7 +68,14 @@ PollingFallback::PollingFallback(drogon::orm::DbClientPtr db,
     : db_(std::move(db))
     , shutdown_(std::move(shutdown_requested))
     , opts_(std::move(opts))
-{}
+{
+    if (opts_.sleep_chunk <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument("PollingFallback sleep_chunk must be positive");
+    }
+    if (opts_.interval <= std::chrono::seconds::zero()) {
+        throw std::invalid_argument("PollingFallback interval must be positive");
+    }
+}
 
 drogon::Task<int> PollingFallback::sweep_once()
 {
@@ -599,9 +620,23 @@ drogon::Task<void> PollingFallback::run()
             spdlog::error("[polling-fallback] sweep_once raised unknown "
                           "exception; backing off and continuing");
         }
-        co_await co_sleep(std::chrono::duration_cast<std::chrono::milliseconds>(opts_.interval));
+        co_await interruptible_sleep();
     }
     spdlog::info("[polling-fallback] exiting; total_swept={}", total_swept_.load());
+}
+
+drogon::Task<void> PollingFallback::interruptible_sleep()
+{
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::nanoseconds>(opts_.interval);
+    while (!shutdown_()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) break;
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        co_await co_sleep(std::min(remaining, opts_.sleep_chunk), opts_.on_sleep_armed);
+    }
 }
 
 } // namespace wikore::scheduler

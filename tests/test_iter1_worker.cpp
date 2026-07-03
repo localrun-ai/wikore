@@ -372,6 +372,66 @@ TEST_CASE("PollingFallback: promotes stuck pending (no payload) versions to 'err
     CHECK(std::string(v[0]["error_msg"].c_str()).find("stuck pending") != std::string::npos);
 }
 
+TEST_CASE("PollingFallback::run: shutdown during the inter-sweep sleep exits within a chunk",
+          "[integration][iter1]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    seed_iter1_fixtures(db);
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> armed{false};
+    std::chrono::steady_clock::time_point t_arm;
+    wikore::scheduler::PollingFallback::Options opts;
+    // A long interval: with a non-cancellable sleep, run() would block ~1h after
+    // the first sweep. The on_sleep_armed hook flips shutdown exactly while the
+    // coroutine is suspended in the sleep, so the chunked loop must observe it
+    // and return within one 50ms chunk.
+    opts.interval       = std::chrono::hours(1);
+    opts.sleep_chunk    = std::chrono::milliseconds(50);
+    opts.on_sleep_armed = [&] {
+        // Fires from inside await_suspend, once, right after the first chunk
+        // timer is armed. Capture the arm instant so the assertion measures the
+        // sleep tail alone (excluding the preceding DB sweep, whose duration is
+        // machine-dependent), then request shutdown.
+        if (!armed.exchange(true)) t_arm = std::chrono::steady_clock::now();
+        stop.store(true);
+    };
+    wikore::scheduler::PollingFallback poll(db, [&] { return stop.load(); }, opts);
+
+    drogon::sync_wait(poll.run());
+    const auto tail = std::chrono::steady_clock::now() - t_arm;
+
+    // The sleep must have been reached (otherwise the test proves nothing).
+    REQUIRE(armed.load());
+    // Once armed, the coroutine resumes after the current 50ms chunk, observes
+    // shutdown, and breaks. Bounding the tail to a few chunks (not a loose 5s)
+    // means a regression to sleeping the full interval -- or waking only after
+    // several chunks -- actually fails the test.
+    CHECK(tail < opts.sleep_chunk * 3);
+}
+
+TEST_CASE("PollingFallback: ctor rejects non-positive interval and non-positive sleep_chunk",
+          "[iter1]")
+{
+    // No DB needed: the ctor validates Options before touching the client, so a
+    // null DbClientPtr keeps this runnable in the unit-test job (no DATABASE_URL).
+    // A non-positive sleep_chunk would make interruptible_sleep arm a zero/negative
+    // timer that fires immediately -- a busy loop that pins a CPU.
+    drogon::orm::DbClientPtr null_db;
+    auto shutdown = [] { return false; };
+
+    using PF = wikore::scheduler::PollingFallback;
+
+    PF::Options bad_chunk;
+    bad_chunk.sleep_chunk = std::chrono::milliseconds::zero();
+    REQUIRE_THROWS_AS(PF(null_db, shutdown, bad_chunk), std::invalid_argument);
+
+    PF::Options bad_interval;
+    bad_interval.interval = std::chrono::seconds::zero();
+    REQUIRE_THROWS_AS(PF(null_db, shutdown, bad_interval), std::invalid_argument);
+}
+
 TEST_CASE("IngestWorker: malformed JSON payload is discarded without dispatch",
           "[integration][iter1]")
 {
