@@ -148,8 +148,13 @@ public:
 // string cells, and each xl/worksheets/sheetN.xml for row data.
 // Each worksheet becomes a ParsedSection at depth 1 (sheet name as heading).
 // Rows are rendered as pipe-separated cell values; empty rows are skipped.
+// Sparse rows (missing cells between A1 and C1) are padded with empty fields
+// to preserve column alignment.
 // Cell types handled: shared string (t="s"), numeric/formula (absent/t="str"),
 // inline string (t="inlineStr"), boolean (t="b"), error (t="e").
+// Security: 16 MiB per-entry cap, 128 MiB aggregate worksheet XML cap,
+// 500-sheet cap with path deduplication (all return explicit errors).
+// All XML walks are iterative BFS with kXlsxXmlMaxDepth=64 depth limit.
 // ---------------------------------------------------------------------------
 
 class XlsxParser : public ParserPort {

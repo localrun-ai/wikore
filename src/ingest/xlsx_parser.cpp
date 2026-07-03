@@ -7,14 +7,12 @@
 //   2. Reads xl/_rels/workbook.xml.rels to resolve rId -> worksheet filename.
 //   3. Loads xl/sharedStrings.xml (required by most real-world spreadsheets
 //      for string cells).
-//   4. For each worksheet in workbook order:
+//   4. For each worksheet in workbook order (deduplicated paths):
 //        * Reads xl/worksheets/sheetN.xml.
 //        * Walks <row> elements.  Each row becomes one line of pipe-separated
-//          cell values ("val1 | val2 | val3").
-//        * The first non-empty row is treated as a header row if it contains
-//          string cells; subsequent rows are data rows.  Both are emitted as
-//          plain text — no structural distinction is made because spreadsheet
-//          "headings" are layout conventions, not semantic metadata.
+//          cell values, with empty strings inserted for skipped columns to
+//          preserve column alignment (sparse rows: A1, C1 -> "A |  | C").
+//        * Completely empty rows are skipped.
 //   5. Each sheet becomes a ParsedSection at depth 1 with the sheet name as
 //      the heading and all rows as the body text.
 //
@@ -25,11 +23,15 @@
 //   t="b"  — boolean (0/1 -> "FALSE"/"TRUE")
 //   t="e"  — error (rendered as-is, e.g. "#DIV/0!")
 //
-// Cells with empty values are emitted as empty fields to preserve column
-// alignment.  Completely empty rows (all cells empty) are skipped.
-//
-// Security: same in-memory ZIP backend as DocxParser with per-entry
-// uncompressed-size cap and read-return-value check.
+// Security:
+//   * Per-entry decompressed size cap: kXlsxMaxXmlBytes (16 MiB).
+//   * Sheet count cap: kXlsxMaxSheets (500) with path deduplication.
+//   * Aggregate worksheet XML cap: kXlsxMaxTotalXmlBytes (128 MiB).
+//     Exceeding either of the last two caps returns an explicit error.
+//   * All recursive XML walks are replaced by iterative BFS with depth
+//     caps (kXlsxXmlMaxDepth = 64) to prevent stack exhaustion on
+//     pathologically deep documents.
+//   * ZIP magic-byte check; empty/oversized input rejected early.
 //
 // Thread safety: XlsxParser is stateless.
 // ---------------------------------------------------------------------------
@@ -41,19 +43,26 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <queue>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace wikore::ingest {
 
 namespace {
 
-static constexpr std::size_t kXlsxMaxXmlBytes = 16UL * 1024UL * 1024UL;
-static constexpr std::size_t kXlsxMaxSheets   = 500;
+static constexpr std::size_t kXlsxMaxXmlBytes      = 16UL  * 1024UL * 1024UL;
+static constexpr std::size_t kXlsxMaxTotalXmlBytes  = 128UL * 1024UL * 1024UL;
+static constexpr std::size_t kXlsxMaxSheets         = 500;
+static constexpr int         kXlsxXmlMaxDepth       = 64;
 
+// ---------------------------------------------------------------------------
 // In-memory ZIP backend (same pattern as docx/pptx/odt parsers).
+// ---------------------------------------------------------------------------
 struct XlsxMemStream { const char* data; std::size_t size; std::size_t pos; };
 static voidpf xlsx_ms_open(voidpf, const char* fn, int)
     { return (voidpf)(std::uintptr_t)fn; }
@@ -83,6 +92,7 @@ static long  xlsx_ms_seek (voidpf, voidpf s, uLong off, int orig)
 static int xlsx_ms_close(voidpf, voidpf) { return 0; }
 static int xlsx_ms_err  (voidpf, voidpf) { return 0; }
 
+// Returns the decompressed content of one ZIP entry, or empty on error/cap.
 std::string xlsx_extract(const std::string& zip, const char* entry)
 {
     XlsxMemStream ms{zip.data(), zip.size(), 0};
@@ -110,7 +120,7 @@ std::string xlsx_extract(const std::string& zip, const char* entry)
 }
 
 // ---------------------------------------------------------------------------
-// Strip the namespace prefix from an XML node/attribute name.
+// Strip namespace prefix (e.g., "x:foo" -> "foo").
 // ---------------------------------------------------------------------------
 inline std::string_view local_name(std::string_view qname)
 {
@@ -119,11 +129,31 @@ inline std::string_view local_name(std::string_view qname)
 }
 
 // ---------------------------------------------------------------------------
-// Load the shared strings table into a vector.
-// Each <si> element maps to one entry (index 0, 1, 2, ...).
-// Concatenates all <t> text within an <si>, including rich-text runs.
+// Iterative BFS node finder: returns the first descendant whose local name
+// matches target, searching no deeper than max_depth.
 // ---------------------------------------------------------------------------
+pugi::xml_node bfs_find(const pugi::xml_node& root,
+                        std::string_view target, int max_depth = kXlsxXmlMaxDepth)
+{
+    // queue entries: (node, depth)
+    std::queue<std::pair<pugi::xml_node, int>> q;
+    q.push({root, 0});
+    while (!q.empty()) {
+        auto [n, d] = q.front(); q.pop();
+        if (local_name(n.name()) == target) return n;
+        if (d < max_depth)
+            for (const auto& child : n.children())
+                q.push({child, d + 1});
+    }
+    return {};
+}
 
+// ---------------------------------------------------------------------------
+// Load the shared strings table.
+// Each <si> maps to one vector entry. All <t> text within an <si> is
+// concatenated (handles plain and rich-text runs).
+// Depth limit kXlsxXmlMaxDepth prevents stack exhaustion.
+// ---------------------------------------------------------------------------
 std::vector<std::string> load_shared_strings(const std::string& zip)
 {
     auto xml = xlsx_extract(zip, "xl/sharedStrings.xml");
@@ -132,37 +162,34 @@ std::vector<std::string> load_shared_strings(const std::string& zip)
     pugi::xml_document doc;
     if (!doc.load_buffer(xml.data(), xml.size())) return {};
 
-    std::vector<std::string> ss;
-    // Find root sst element by local name
-    pugi::xml_node sst;
-    for (const auto& n : doc.children()) {
-        if (local_name(n.name()) == "sst") { sst = n; break; }
-    }
+    pugi::xml_node sst = bfs_find(doc, "sst");
     if (!sst) return {};
 
+    std::vector<std::string> ss;
     for (const auto& si : sst.children()) {
         if (local_name(si.name()) != "si") continue;
         std::string val;
-        // Collect all <t> text, whether directly under <si> or under <r> runs
-        std::function<void(const pugi::xml_node&)> collect =
-            [&](const pugi::xml_node& n) {
-            for (const auto& child : n.children()) {
-                if (local_name(child.name()) == "t")
-                    val += child.text().get();
-                else
-                    collect(child);
+        // Iterative BFS within each <si> to collect all <t> children.
+        std::queue<std::pair<pugi::xml_node, int>> q;
+        q.push({si, 0});
+        while (!q.empty()) {
+            auto [n, d] = q.front(); q.pop();
+            if (local_name(n.name()) == "t") {
+                val += n.text().get();
+                continue; // <t> never has meaningful children
             }
-        };
-        collect(si);
+            if (d < kXlsxXmlMaxDepth)
+                for (const auto& child : n.children())
+                    q.push({child, d + 1});
+        }
         ss.push_back(std::move(val));
     }
     return ss;
 }
 
 // ---------------------------------------------------------------------------
-// Parse workbook.xml + workbook.xml.rels to get ordered (name, path) pairs.
+// Parse workbook + rels to get deduplicated, ordered (name, path) pairs.
 // ---------------------------------------------------------------------------
-
 struct SheetInfo { std::string name; std::string path; };
 
 std::vector<SheetInfo> load_sheet_order(const std::string& zip)
@@ -171,23 +198,19 @@ std::vector<SheetInfo> load_sheet_order(const std::string& zip)
     auto rels_xml = xlsx_extract(zip, "xl/_rels/workbook.xml.rels");
     if (wb_xml.empty() || rels_xml.empty()) return {};
 
-    // Build rId -> target path from relationships.
     const std::string_view ws_type =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
     std::unordered_map<std::string, std::string> rid_to_path;
     {
         pugi::xml_document rd;
         if (!rd.load_buffer(rels_xml.data(), rels_xml.size())) return {};
-        pugi::xml_node root;
-        for (const auto& n : rd.children())
-            if (local_name(n.name()) == "Relationships") { root = n; break; }
+        pugi::xml_node root = bfs_find(rd, "Relationships");
         if (root)
             for (const auto& rel : root.children()) {
                 if (local_name(rel.name()) != "Relationship") continue;
                 if (std::string_view(rel.attribute("Type").value()) != ws_type)
                     continue;
                 std::string target = rel.attribute("Target").value();
-                // Target is relative to xl/
                 std::string path = target.starts_with("/")
                     ? target.substr(1)
                     : "xl/" + target;
@@ -195,73 +218,77 @@ std::vector<SheetInfo> load_sheet_order(const std::string& zip)
             }
     }
 
-    // Extract sheet names in workbook order.
     pugi::xml_document wb;
     if (!wb.load_buffer(wb_xml.data(), wb_xml.size())) return {};
 
+    pugi::xml_node sheets_node = bfs_find(wb, "sheets");
+    if (!sheets_node) return {};
+
     std::vector<SheetInfo> sheets;
-    std::function<bool(const pugi::xml_node&)> find_sheets_node =
-        [&](const pugi::xml_node& n) -> bool {
-        for (const auto& child : n.children()) {
-            if (local_name(child.name()) == "sheets") {
-                for (const auto& s : child.children()) {
-                    if (local_name(s.name()) != "sheet") continue;
-                    std::string rid;
-                    for (const auto& a : s.attributes()) {
-                        if (local_name(a.name()) == "id") { rid = a.value(); break; }
-                    }
-                    auto it = rid_to_path.find(rid);
-                    if (it != rid_to_path.end())
-                        sheets.push_back({s.attribute("name").value(), it->second});
-                }
-                return true;
-            }
-            if (find_sheets_node(child)) return true;
+    std::unordered_set<std::string> seen_paths; // deduplication guard
+    for (const auto& s : sheets_node.children()) {
+        if (local_name(s.name()) != "sheet") continue;
+        std::string rid;
+        for (const auto& a : s.attributes()) {
+            if (local_name(a.name()) == "id") { rid = a.value(); break; }
         }
-        return false;
-    };
-    find_sheets_node(wb);
+        auto it = rid_to_path.find(rid);
+        if (it == rid_to_path.end()) continue;
+        if (!seen_paths.insert(it->second).second) {
+            spdlog::warn("[xlsx-parser] duplicate worksheet path '{}'; skipping",
+                         it->second);
+            continue;
+        }
+        sheets.push_back({s.attribute("name").value(), it->second});
+    }
     return sheets;
 }
 
 // ---------------------------------------------------------------------------
-// Parse one worksheet XML into rows of cell values.
-// Returns each non-empty row as a pipe-separated string.
+// Parse column letters from a cell reference (e.g. "C1" -> 3, "AA2" -> 27).
+// Returns 1-based column index, or 0 on parse failure.
 // ---------------------------------------------------------------------------
+int col_from_ref(std::string_view r)
+{
+    int col = 0;
+    for (char c : r) {
+        if (c < 'A' || c > 'Z') break;
+        col = col * 26 + (c - 'A' + 1);
+    }
+    return col;
+}
 
+// ---------------------------------------------------------------------------
+// Parse one worksheet XML into rows of pipe-separated cell values.
+// Sparse columns (missing cells between r="A1" and r="C1") are filled with
+// empty strings to preserve column alignment.
+// ---------------------------------------------------------------------------
 std::string parse_worksheet(const std::string&              xml,
                              const std::vector<std::string>& shared_strings)
 {
     pugi::xml_document doc;
     if (!doc.load_buffer(xml.data(), xml.size())) return {};
 
-    // Find sheetData node
-    pugi::xml_node sheet_data;
-    std::function<bool(const pugi::xml_node&)> find_sd =
-        [&](const pugi::xml_node& n) -> bool {
-        for (const auto& child : n.children()) {
-            if (local_name(child.name()) == "sheetData") {
-                sheet_data = child; return true;
-            }
-            if (find_sd(child)) return true;
-        }
-        return false;
-    };
-    find_sd(doc);
+    pugi::xml_node sheet_data = bfs_find(doc, "sheetData");
     if (!sheet_data) return {};
 
     std::string out;
     for (const auto& row : sheet_data.children()) {
         if (local_name(row.name()) != "row") continue;
 
-        std::vector<std::string> cells;
+        // Collect (col_index, value) pairs so sparse rows can be padded.
+        std::vector<std::pair<int, std::string>> col_vals;
+        int max_col = 0;
+
         for (const auto& c : row.children()) {
             if (local_name(c.name()) != "c") continue;
+            const int col = col_from_ref(c.attribute("r").value());
+            if (col > max_col) max_col = col;
+
             std::string_view type = c.attribute("t").value();
             std::string val;
 
             if (type == "s") {
-                // Shared string index
                 auto v = c.child("v");
                 if (v) {
                     int idx = std::atoi(v.text().get());
@@ -270,7 +297,6 @@ std::string parse_worksheet(const std::string&              xml,
                         val = shared_strings[static_cast<std::size_t>(idx)];
                 }
             } else if (type == "inlineStr") {
-                // <is><t>...</t></is>
                 for (const auto& child : c.children())
                     if (local_name(child.name()) == "is")
                         for (const auto& t : child.children())
@@ -284,10 +310,9 @@ std::string parse_worksheet(const std::string&              xml,
                 auto v = c.child("v");
                 if (v) val = v.text().get();
             } else {
-                // Numeric or inline string (t="str" or absent)
+                // Numeric or formula (t="str" or absent)
                 auto v = c.child("v");
                 if (!v) {
-                    // Possibly t="str" with <is><t>
                     for (const auto& ch : c.children())
                         if (local_name(ch.name()) == "is")
                             for (const auto& t : ch.children())
@@ -297,10 +322,18 @@ std::string parse_worksheet(const std::string&              xml,
                     val = v.text().get();
                 }
             }
-            cells.push_back(std::move(val));
+            col_vals.push_back({col, std::move(val)});
         }
 
-        // Skip entirely empty rows
+        if (max_col == 0) continue; // entirely empty row
+
+        // Expand sparse col_vals into a dense vector indexed [0..max_col-1].
+        std::vector<std::string> cells(static_cast<std::size_t>(max_col));
+        for (auto& [cidx, cval] : col_vals)
+            if (cidx >= 1 && cidx <= max_col)
+                cells[static_cast<std::size_t>(cidx - 1)] = std::move(cval);
+
+        // Skip rows where every cell is empty.
         bool has_content = false;
         for (const auto& cv : cells) if (!cv.empty()) { has_content = true; break; }
         if (!has_content) continue;
@@ -333,10 +366,10 @@ Result<ParsedDocument> XlsxParser::parse(const std::string& content,
         || content[2] != '\x03' || content[3] != '\x04')
         return std::unexpected(Error::invalid_input("ingest.mime_type_mismatch"));
 
-    // --- Shared strings (optional; many spreadsheets omit if no strings) ---
+    // --- Shared strings (optional; absent when no string cells) -------------
     const auto shared_strings = load_shared_strings(content);
 
-    // --- Sheet order from workbook + rels -----------------------------------
+    // --- Sheet order from workbook + rels (paths deduplicated) --------------
     auto sheets = load_sheet_order(content);
     if (sheets.empty())
         return std::unexpected(
@@ -349,15 +382,25 @@ Result<ParsedDocument> XlsxParser::parse(const std::string& content,
             Error::invalid_input("ingest.xlsx.too_many_sheets"));
     }
 
-    // --- Parse each sheet ---------------------------------------------------
+    // --- Parse each sheet with aggregate XML cap ----------------------------
     ParsedDocument out;
     out.filename  = filename;
     out.mime_type = "application/vnd.openxmlformats-officedocument"
                     ".spreadsheetml.sheet";
 
+    std::size_t total_xml_bytes = 0;
     for (const auto& sheet : sheets) {
         auto xml = xlsx_extract(content, sheet.path.c_str());
         if (xml.empty()) continue;
+
+        total_xml_bytes += xml.size();
+        if (total_xml_bytes > kXlsxMaxTotalXmlBytes) {
+            spdlog::error(
+                "[xlsx-parser] '{}' aggregate worksheet XML {} > cap {}; rejecting",
+                filename, total_xml_bytes, kXlsxMaxTotalXmlBytes);
+            return std::unexpected(
+                Error::invalid_input("ingest.xlsx.content_limit_exceeded"));
+        }
 
         auto body = parse_worksheet(xml, shared_strings);
         if (body.empty()) continue;
