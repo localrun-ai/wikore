@@ -2,6 +2,7 @@
 #include "wikore/rag/qdrant_filter_builder.hpp"
 #include "wikore/rag/clearance.hpp"
 #include <algorithm>
+#include <chrono>
 #include <utility>
 
 namespace wikore::rag {
@@ -22,14 +23,20 @@ RetrievalOrchestrator::retrieve(const RequestContext& ctx,
 
     const auto& company = ctx.tenant.company_id;
 
-    // The deadline is re-checked before each remote step. Combined with the
-    // per-request timeouts on the embed/Qdrant HTTP clients (so a single
-    // stalled dependency errors rather than hanging), this bounds total
-    // request time instead of only failing fast when the caller is already
-    // past deadline at entry.
+    // Seconds left on the request deadline. Passed as the per-call timeout to
+    // the embed and Qdrant HTTP steps so their budgets come from the SAME
+    // shared deadline rather than independent fixed caps (which could sum past
+    // it, e.g. a 20s embed then a 30s search). Combined with the between-step
+    // deadline checks, this bounds total request time. DB steps (resolve, gate,
+    // tenant lookup) are separately bounded by the DbClient's configured query
+    // timeout.
+    auto remaining_s = [&] {
+        const auto rem = ctx.deadline - std::chrono::steady_clock::now();
+        return std::max(0.0, std::chrono::duration<double>(rem).count());
+    };
 
     // 1. embed the query.
-    auto vec = co_await embedder_->embed(std::move(query));
+    auto vec = co_await embedder_->embed(std::move(query), remaining_s());
     if (!vec) co_return std::unexpected(vec.error());
 
     // 2. resolve the reader's scope (cached; epoch-validated).
@@ -54,7 +61,7 @@ RetrievalOrchestrator::retrieve(const RequestContext& ctx,
     const int fetch = static_cast<int>(std::min(want, kMaxFetch));
     if (ctx.deadline_exceeded())
         co_return std::unexpected(Error::unavailable("retrieve: deadline exceeded before search"));
-    auto candidates = co_await vector_store_->search(*vec, filter, fetch);
+    auto candidates = co_await vector_store_->search(*vec, filter, fetch, remaining_s());
     if (!candidates) co_return std::unexpected(candidates.error());
 
     // 6. EvidenceGate: authoritative live re-validation + hydration. Same

@@ -442,13 +442,39 @@ static void validate_api_key_async(
     std::string hash = sha256_hex(key);
     std::string rk   = "lr:api_key:" + hash;
 
-    // Redis fast path (synchronous, ~0.1ms)
+    // Redis fast path. The cached identity still needs a liveness re-check:
+    // a user soft-deactivated after the entry was cached would otherwise keep
+    // authenticating until the 300s TTL expires. A single users PK lookup is
+    // much cheaper than the api_keys JOIN and keeps deactivation effective
+    // immediately. (Key revocation has the same TTL window; closing that would
+    // need cache eviction on revoke - tracked as follow-up.)
     auto cached = Redis::get(rk);
     if (cached) {
         Identity id;
         (void)glz::read_json(id, *cached);
-        req->getAttributes()->insert("identity", id);
-        next();
+
+        auto db = drogon::app().getDbClient();
+        if (!db) { stop(make_401("service unavailable")); return; }
+
+        auto stop_p = std::make_shared<drogon::FilterCallback>(std::move(stop));
+        auto next_p = std::make_shared<drogon::FilterChainCallback>(std::move(next));
+        auto id_p   = std::make_shared<Identity>(std::move(id));
+
+        db->execSqlAsync(
+            "SELECT 1 FROM users WHERE id = $1::uuid AND deactivated_at IS NULL",
+            [req, id_p, stop_p, next_p](const drogon::orm::Result& rows) mutable {
+                if (rows.empty()) { (*stop_p)(make_401("user deactivated")); return; }
+                req->getAttributes()->insert("identity", *id_p);
+                (*next_p)();
+            },
+            [stop_p](const drogon::orm::DrogonDbException& ex) mutable {
+                spdlog::error("[auth] api_key liveness check DB error: {}",
+                              ex.base().what());
+                auto r = drogon::HttpResponse::newHttpResponse();
+                r->setStatusCode(drogon::k503ServiceUnavailable);
+                (*stop_p)(r);
+            },
+            id_p->user_id);
         return;
     }
 

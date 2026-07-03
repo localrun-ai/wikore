@@ -170,7 +170,8 @@ QdrantVectorStore::QdrantVectorStore(std::string qdrant_url, std::string collect
 drogon::Task<drogon::HttpResponsePtr>
 QdrantVectorStore::send(drogon::HttpMethod method,
                         std::string_view   path,
-                        std::string        body)
+                        std::string        body,
+                        double             timeout_s)
 {
     auto req = drogon::HttpRequest::newHttpRequest();
     req->setMethod(method);
@@ -179,7 +180,10 @@ QdrantVectorStore::send(drogon::HttpMethod method,
         req->setContentTypeCode(drogon::CT_APPLICATION_JSON);
         req->setBody(std::move(body));
     }
-    co_return co_await _client->sendRequestCoro(req, kQdrantTimeoutSecs);
+    // Bound to the caller's remaining deadline when given, never above the cap.
+    const double eff = timeout_s > 0.0 ? std::min(timeout_s, kQdrantTimeoutSecs)
+                                       : kQdrantTimeoutSecs;
+    co_return co_await _client->sendRequestCoro(req, eff);
 }
 
 drogon::Task<Result<void>>
@@ -350,7 +354,8 @@ QdrantVectorStore::set_payload(std::string_view                company_id,
 drogon::Task<Result<std::vector<ChunkCandidate>>>
 QdrantVectorStore::search(const Embedding&    query,
                            const QdrantFilter& filter,
-                           int                 limit)
+                           int                 limit,
+                           double              timeout_s)
 {
     // Fail-closed before the network call. Qdrant currently treats an empty
     // MatchAny array as "match nothing", but relying on a remote system's
@@ -374,7 +379,7 @@ QdrantVectorStore::search(const Embedding&    query,
     try {
         resp = co_await send(drogon::Post,
                              std::format("/collections/{}/points/search", _collection),
-                             std::move(body));
+                             std::move(body), timeout_s);
     } catch (const std::exception& ex) {
         co_return std::unexpected(
             Error::unavailable(std::format("qdrant search: {}", ex.what())));
@@ -460,7 +465,8 @@ NullVectorStore::set_payload(std::string_view                company_id,
 drogon::Task<Result<std::vector<ChunkCandidate>>>
 NullVectorStore::search(const Embedding&    query,
                          const QdrantFilter& filter,
-                         int                 limit)
+                         int                 limit,
+                         double              /*timeout_s*/)
 {
     // Match Qdrant payload-filter semantics:
     //   * an empty access_scope_ids MatchAny matches NOTHING (not "everything"),
