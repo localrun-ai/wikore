@@ -37,14 +37,23 @@ exec_until(drogon::orm::DbClientPtr db,
     if (deadline == no_deadline())
         co_return co_await db->execSqlCoro(sql, args...);
 
+    // Acquire the pooled connection FIRST, then derive the timeout from what is
+    // left of the budget. Computing it before newTransactionCoro would not
+    // charge the query for time spent waiting on a busy pool, letting it run
+    // past the deadline. (The pool-wait itself is not separately bounded:
+    // drogon's coroutine API exposes no acquisition timeout, and racing it
+    // against a timer would orphan the connection. The orchestrator's
+    // between-step deadline checks catch a wait that overran, and the query
+    // below is always bounded to the post-acquisition remainder.)
+    auto trans = co_await db->newTransactionCoro();
+
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   deadline - std::chrono::steady_clock::now()).count();
-    if (ms < 1) ms = 1;   // budget already spent: let the server cancel at once
+    if (ms < 1) ms = 1;   // budget spent during acquisition: cancel at once
 
     // Transaction-local statement_timeout (third arg = is_local). It resets
     // when the transaction ends, so nothing leaks back to the pooled
     // connection.
-    auto trans = co_await db->newTransactionCoro();
     co_await trans->execSqlCoro(
         "SELECT set_config('statement_timeout', $1, true)", std::to_string(ms));
     co_return co_await trans->execSqlCoro(sql, args...);

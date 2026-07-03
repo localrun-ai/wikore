@@ -1,4 +1,5 @@
 #include "wikore/rag/evidence_gate.hpp"
+#include "wikore/adapters/postgres/error_mapper.hpp"
 #include <drogon/drogon.h>
 #include <string>
 #include <unordered_map>
@@ -140,8 +141,9 @@ EvidenceGate::evaluate(std::string_view                   company_id,
             allowed.emplace(r["chunk_id"].as<std::string>(), std::move(h));
         }
     } catch (const drogon::orm::DrogonDbException& ex) {
-        co_return std::unexpected(Error::database_error(
-            std::string("evidence_gate: ") + ex.base().what()));
+        // A deadline statement_timeout (SQLSTATE 57014) maps to
+        // ServiceUnavailable (503); other DB failures to database_error.
+        co_return std::unexpected(postgres::map_db_exception(ex));
     }
 
     // Emit survivors in the candidates' (score) order; drop the rest.

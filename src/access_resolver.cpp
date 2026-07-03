@@ -1,6 +1,7 @@
 #include "wikore/access_resolver.hpp"
 #include "wikore/redis.hpp"
 #include "wikore/adapters/postgres/deadline_exec.hpp"
+#include "wikore/adapters/postgres/error_mapper.hpp"
 #include <drogon/drogon.h>
 #include <glaze/glaze.hpp>
 #include <algorithm>
@@ -112,8 +113,9 @@ PostgresAccessResolver::resolve(std::string_view company_id,
                 scope.org_unit_ids.push_back(r["org_unit_id"].as<std::string>());
         co_return scope;
     } catch (const drogon::orm::DrogonDbException& ex) {
-        co_return std::unexpected(Error::database_error(
-            std::string("access_resolver: ") + ex.base().what()));
+        // map_db_exception turns a deadline statement_timeout (SQLSTATE 57014)
+        // into ServiceUnavailable (503), everything else into database_error.
+        co_return std::unexpected(postgres::map_db_exception(ex));
     }
 }
 

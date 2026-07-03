@@ -109,6 +109,7 @@ add_library(wikore_core STATIC
 )
 target_include_directories(wikore_core PUBLIC include)
 target_link_libraries(wikore_core PUBLIC
+    wikore_infra          # postgres error_mapper (map_db_exception), UnitOfWork
     spdlog::spdlog
     OpenSSL::SSL
     OpenSSL::Crypto

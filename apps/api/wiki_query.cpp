@@ -4,6 +4,7 @@
 #include "wikore/domain/types.hpp"   // RequestContext, Error, uuid_generate
 #include "wikore/rag/types.hpp"      // AllowedCandidate
 #include "wikore/adapters/postgres/deadline_exec.hpp"  // exec_until
+#include "wikore/adapters/postgres/error_mapper.hpp"   // map_db_exception
 
 #include <drogon/orm/Exception.h>
 #include <glaze/glaze.hpp>
@@ -159,8 +160,14 @@ wikore::api::wiki_query(std::shared_ptr<rag::RetrievalOrchestrator> orch,
                 co_return json_error(drogon::k403Forbidden, "user not found or deactivated");
             company_id = rows[0]["company_id"].as<std::string>();
         } catch (const drogon::orm::DrogonDbException& ex) {
-            spdlog::error("[wiki_query] tenant lookup failed: {}", ex.base().what());
-            co_return json_error(drogon::k500InternalServerError, "internal error");
+            // A deadline statement_timeout maps to 503; other DB errors to 500.
+            const auto e    = postgres::map_db_exception(ex);
+            const auto code = status_for(e.kind);
+            spdlog::error("[wiki_query] tenant lookup failed ({}): {}",
+                          static_cast<int>(code), ex.base().what());
+            co_return json_error(code,
+                code == drogon::k503ServiceUnavailable ? "service temporarily unavailable"
+                                                       : "internal error");
         }
 
         // 5. The scope org unit must belong to that company. A miss returns
@@ -174,8 +181,13 @@ wikore::api::wiki_query(std::shared_ptr<rag::RetrievalOrchestrator> orch,
             if (rows.empty())
                 co_return json_error(drogon::k404NotFound, "org unit not found");
         } catch (const drogon::orm::DrogonDbException& ex) {
-            spdlog::error("[wiki_query] scope check failed: {}", ex.base().what());
-            co_return json_error(drogon::k500InternalServerError, "internal error");
+            const auto e    = postgres::map_db_exception(ex);
+            const auto code = status_for(e.kind);
+            spdlog::error("[wiki_query] scope check failed ({}): {}",
+                          static_cast<int>(code), ex.base().what());
+            co_return json_error(code,
+                code == drogon::k503ServiceUnavailable ? "service temporarily unavailable"
+                                                       : "internal error");
         }
 
         // 6. Build the request context and retrieve.

@@ -13,6 +13,7 @@ constexpr std::string_view SQLSTATE_SERIALIZATION_FAILURE  = "40001";
 constexpr std::string_view SQLSTATE_DEADLOCK               = "40P01";
 constexpr std::string_view SQLSTATE_FK_VIOLATION           = "23503";
 constexpr std::string_view SQLSTATE_NOT_NULL_VIOLATION     = "23502";
+constexpr std::string_view SQLSTATE_QUERY_CANCELED         = "57014";
 
 // Maps named CHECK / UNIQUE constraints (and unique-index constraint names) to
 // typed domain Errors. The pg_constraint introspection test
@@ -265,6 +266,16 @@ Error map_db_exception(const drogon::orm::DrogonDbException& ex) {
     const std::string msg        = ex.base().what();
     const std::string sqlstate   = sql_err ? sql_err->sqlState() : "";
     const std::string constraint = detail::extract_constraint(msg);
+
+    // Query cancelled - in this codebase that is a statement_timeout fired by a
+    // deadline-bounded query (postgres::exec_until). Surface it as
+    // ServiceUnavailable so the API returns 503 (deadline), not 500. A timeout
+    // that fires inside a transaction is torn down and reaches us as a plain
+    // DrogonDbException (not a SqlError, so no SQLSTATE), so also match the
+    // stable Postgres message.
+    if (sqlstate == SQLSTATE_QUERY_CANCELED
+        || msg.find("canceling statement due to statement timeout") != std::string::npos)
+        return Error::unavailable("query cancelled (deadline exceeded)");
 
     if (sqlstate == SQLSTATE_SERIALIZATION_FAILURE || sqlstate == SQLSTATE_DEADLOCK)
         return Error::conflict("transaction conflict, retry: " + msg);

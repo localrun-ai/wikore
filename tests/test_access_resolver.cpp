@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include "wikore/access_resolver.hpp"
+#include "wikore/adapters/postgres/error_mapper.hpp"
 #include "wikore/db.hpp"
 #include <drogon/drogon.h>
 #include <drogon/utils/coroutine.h>
@@ -138,16 +139,20 @@ TEST_CASE("exec_until: a query past the deadline is cancelled quickly, not run t
                         + std::chrono::milliseconds(100);
     const auto t0 = std::chrono::steady_clock::now();
     bool threw = false;
+    wikore::Error mapped = wikore::Error::database_error("unset");
     try {
         drogon::sync_wait(wikore::postgres::exec_until(db, deadline,
                                                        "SELECT pg_sleep(2)"));
-    } catch (const drogon::orm::DrogonDbException&) {
-        threw = true;   // query_canceled
+    } catch (const drogon::orm::DrogonDbException& ex) {
+        threw  = true;                              // statement_timeout cancel
+        mapped = wikore::postgres::map_db_exception(ex);
     }
     const auto elapsed = std::chrono::steady_clock::now() - t0;
 
     CHECK(threw);
     CHECK(elapsed < std::chrono::seconds(1));   // far below the 2s sleep
+    // A deadline cancellation must surface as 503, not 500.
+    CHECK(mapped.kind == wikore::Error::Kind::ServiceUnavailable);
 
     // The unbounded sentinel still runs normally (no statement_timeout).
     auto ok = drogon::sync_wait(wikore::postgres::exec_until(
