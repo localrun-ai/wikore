@@ -81,12 +81,30 @@ Result<std::string> resolve_text_mime(const std::string& content,
     if (content.find('\0') != std::string::npos)
         return std::unexpected(Error::invalid_input("ingest.binary_content"));
 
-    if (ext == ".md" || ext == ".markdown")
+    if (ext == ".md" || ext == ".markdown" || ext == ".mdx")
         return std::string{"text/markdown"};
     if (ext == ".txt" || ext.empty())
         return std::string{"text/plain"};
-    if (ext == ".html" || ext == ".htm")
+    if (ext == ".html" || ext == ".htm" || ext == ".xhtml")
         return std::string{"text/html"};
+
+    // Structured text formats: route as text/plain for flat extraction.
+    // These formats rarely carry heading structure useful for section
+    // hierarchy, so PlainTextParser's single-section output is appropriate.
+    // Very large files are split by the chunker at its byte boundary.
+    if (ext == ".json" || ext == ".jsonl" || ext == ".ndjson")
+        return std::string{"text/plain"};
+    if (ext == ".csv"  || ext == ".tsv")
+        return std::string{"text/plain"};
+    if (ext == ".yaml" || ext == ".yml")
+        return std::string{"text/plain"};
+    if (ext == ".xml"  || ext == ".svg")
+        return std::string{"text/html"};  // libxml2 handles XML robustly
+    if (ext == ".rst"  || ext == ".adoc" || ext == ".asciidoc")
+        return std::string{"text/plain"};
+    if (ext == ".log"  || ext == ".conf" || ext == ".ini"
+        || ext == ".toml" || ext == ".env")
+        return std::string{"text/plain"};
 
     if (mime_type == "text/markdown" || mime_type == "text/plain")
         return mime_type;

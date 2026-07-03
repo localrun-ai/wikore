@@ -1365,3 +1365,73 @@ TEST_CASE("XlsxParser: HTTPS worksheet relationship URI is accepted",
     REQUIRE(r->sections.size() == 1);
     CHECK(r->sections[0].text.find("42") != std::string::npos);
 }
+
+// ==========================================================================
+// Text-format extension routing tests
+// ==========================================================================
+
+TEST_CASE("PlainTextParser: .json routed as text/plain and extracted", "[parser]")
+{
+    PlainTextParser p;
+    std::string content = R"({"key": "value", "items": [1, 2, 3]})";
+    auto r = p.parse(content, "data.json", "application/json");
+    REQUIRE(r.has_value());
+    CHECK(r->full_text.find("value") != std::string::npos);
+}
+
+TEST_CASE("PlainTextParser: .csv routed as text/plain and extracted", "[parser]")
+{
+    PlainTextParser p;
+    std::string content = "name,age,role\nAlice,30,engineer\nBob,25,manager\n";
+    auto r = p.parse(content, "staff.csv", "text/csv");
+    REQUIRE(r.has_value());
+    CHECK(r->full_text.find("Alice") != std::string::npos);
+    CHECK(r->full_text.find("manager") != std::string::npos);
+}
+
+TEST_CASE("PlainTextParser: .yaml routed as text/plain and extracted", "[parser]")
+{
+    PlainTextParser p;
+    std::string content = "server:\n  host: localhost\n  port: 8080\n";
+    auto r = p.parse(content, "config.yaml", "text/yaml");
+    REQUIRE(r.has_value());
+    CHECK(r->full_text.find("localhost") != std::string::npos);
+}
+
+TEST_CASE("HtmlParser: .xml routed through HtmlParser and extracted", "[parser]")
+{
+    HtmlParser p;
+    std::string content = R"xml(<?xml version="1.0"?>
+<report><title>Q1 Results</title><body>Revenue increased by 12%.</body></report>)xml";
+    auto r = p.parse(content, "report.xml", "text/xml");
+    REQUIRE(r.has_value());
+    CHECK(r->full_text.find("Revenue") != std::string::npos);
+}
+
+TEST_CASE("PlainTextParser: .log routed as text/plain and extracted", "[parser]")
+{
+    PlainTextParser p;
+    std::string content = "2026-07-04 10:00:00 INFO server started\n"
+                          "2026-07-04 10:00:01 INFO listening on :8080\n";
+    auto r = p.parse(content, "server.log", "text/plain");
+    REQUIRE(r.has_value());
+    CHECK(r->full_text.find("server started") != std::string::npos);
+}
+
+TEST_CASE("PlainTextParser: .rst routed as text/plain and extracted", "[parser]")
+{
+    PlainTextParser p;
+    std::string content = "Introduction\n============\n\nThis is a reStructuredText doc.\n";
+    auto r = p.parse(content, "docs.rst", "text/plain");
+    REQUIRE(r.has_value());
+    CHECK(r->full_text.find("reStructuredText") != std::string::npos);
+}
+
+TEST_CASE("PlainTextParser: .toml routed as text/plain and extracted", "[parser]")
+{
+    PlainTextParser p;
+    std::string content = "[database]\nhost = \"localhost\"\nport = 5432\n";
+    auto r = p.parse(content, "config.toml", "application/toml");
+    REQUIRE(r.has_value());
+    CHECK(r->full_text.find("localhost") != std::string::npos);
+}
