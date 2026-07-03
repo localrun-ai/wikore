@@ -20,15 +20,9 @@ struct Identity {
 };
 
 // Validates a JWT (RS256) against the configured OIDC issuer JWKS.
-// Returns the identity on success, nullopt if invalid/expired.
+// Returns the identity on success, nullopt if invalid/expired. Used by
+// AuthFilter; the internal user (users.id) is resolved asynchronously there.
 std::optional<Identity> validate_jwt(std::string_view token);
-
-// Validates an API key (SHA-256 lookup, DB+Redis cache).
-// Returns the identity bound to the key on success.
-std::optional<Identity> validate_api_key(std::string_view key);
-
-// Resolves bearer token from Authorization header, tries JWT then API key.
-std::optional<Identity> authenticate(const drogon::HttpRequestPtr& req);
 
 // Drogon filter: sets req->getAttributes()->insert("identity", ...) on success,
 // returns 401 on failure. Applied to all /api/* routes except /api/health.

@@ -2,6 +2,7 @@
 #include "wikore/rag/qdrant_filter_builder.hpp"
 #include "wikore/rag/clearance.hpp"
 #include <algorithm>
+#include <chrono>
 #include <utility>
 
 namespace wikore::rag {
@@ -22,13 +23,27 @@ RetrievalOrchestrator::retrieve(const RequestContext& ctx,
 
     const auto& company = ctx.tenant.company_id;
 
+    // Seconds left on the request deadline. Passed as the per-call timeout to
+    // the embed and Qdrant HTTP steps so their budgets come from the SAME
+    // shared deadline rather than independent fixed caps (which could sum past
+    // it, e.g. a 20s embed then a 30s search). Combined with the between-step
+    // deadline checks, this bounds total request time. DB steps (resolve, gate,
+    // tenant lookup) are separately bounded by the DbClient's configured query
+    // timeout.
+    auto remaining_s = [&] {
+        const auto rem = ctx.deadline - std::chrono::steady_clock::now();
+        return std::max(0.0, std::chrono::duration<double>(rem).count());
+    };
+
     // 1. embed the query.
-    auto vec = co_await embedder_->embed(std::move(query));
+    auto vec = co_await embedder_->embed(std::move(query), remaining_s());
     if (!vec) co_return std::unexpected(vec.error());
 
     // 2. resolve the reader's scope (cached; epoch-validated).
+    if (ctx.deadline_exceeded())
+        co_return std::unexpected(Error::unavailable("retrieve: deadline exceeded after embed"));
     auto scope = co_await resolver_->resolve(
-        company, ctx.principal.user_id, scope_org_unit_id);
+        company, ctx.principal.user_id, scope_org_unit_id, ctx.deadline);
     if (!scope) co_return std::unexpected(scope.error());
 
     // 3. derive clearance - the single enforced sensitivity policy.
@@ -44,12 +59,17 @@ RetrievalOrchestrator::retrieve(const RequestContext& ctx,
     const long long want  = static_cast<long long>(limit)
                           * static_cast<long long>(std::max(1, over_fetch_));
     const int fetch = static_cast<int>(std::min(want, kMaxFetch));
-    auto candidates = co_await vector_store_->search(*vec, filter, fetch);
+    if (ctx.deadline_exceeded())
+        co_return std::unexpected(Error::unavailable("retrieve: deadline exceeded before search"));
+    auto candidates = co_await vector_store_->search(*vec, filter, fetch, remaining_s());
     if (!candidates) co_return std::unexpected(candidates.error());
 
     // 6. EvidenceGate: authoritative live re-validation + hydration. Same
     //    scope and clearance as the prefilter, so the two layers agree.
-    auto allowed = co_await gate_.evaluate(company, *scope, labels, *candidates);
+    if (ctx.deadline_exceeded())
+        co_return std::unexpected(Error::unavailable("retrieve: deadline exceeded before gate"));
+    auto allowed = co_await gate_.evaluate(
+        company, *scope, labels, *candidates, {"active"}, ctx.deadline);
     if (!allowed) co_return std::unexpected(allowed.error());
 
     // Return up to `limit`, in the gate-preserved (retrieval score) order.

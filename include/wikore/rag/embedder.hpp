@@ -22,8 +22,10 @@ public:
     // Embed a single text. Most callers should prefer embed_batch.
     // By-value: Drogon Tasks suspend immediately (suspend_always), so reference
     // params would dangle before the coroutine resumes. Copy into the frame.
+    // timeout_s > 0 bounds the HTTP call to that many seconds (callers pass the
+    // remaining request deadline); 0 uses the adapter's default cap.
     virtual drogon::Task<Result<Embedding>>
-    embed(std::string text) = 0;
+    embed(std::string text, double timeout_s = 0) = 0;
 
     // Embed multiple texts in one HTTP round-trip.
     // The returned vector preserves input order.
@@ -48,7 +50,7 @@ public:
     LlamaEmbedder(std::string base_url, std::string model, int dims);
 
     drogon::Task<Result<Embedding>>
-    embed(std::string text) override;
+    embed(std::string text, double timeout_s = 0) override;
 
     drogon::Task<Result<std::vector<Embedding>>>
     embed_batch(std::vector<std::string> texts) override;
@@ -63,7 +65,7 @@ private:
     drogon::HttpClientPtr _client;
 
     drogon::Task<Result<std::vector<Embedding>>>
-    do_embed(std::vector<std::string> texts);
+    do_embed(std::vector<std::string> texts, double timeout_s = 0);
 };
 
 // ---------------------------------------------------------------------------
@@ -78,7 +80,7 @@ class NullEmbedder : public EmbedderPort {
 public:
     explicit NullEmbedder(int dims = 4) : _dims(dims) {}
 
-    drogon::Task<Result<Embedding>> embed(std::string text) override;
+    drogon::Task<Result<Embedding>> embed(std::string text, double timeout_s = 0) override;
     drogon::Task<Result<std::vector<Embedding>>>
     embed_batch(std::vector<std::string> texts) override;
 

@@ -10,6 +10,13 @@
 
 namespace wikore::rag {
 
+// Per-request timeout (seconds) for the embed HTTP call. Without it,
+// sendRequestCoro waits forever, so a stalled llama-server would hang every
+// caller indefinitely (a request-deadline check between steps cannot interrupt
+// an in-flight await). On timeout the coro throws, which the send site below
+// converts to Error::unavailable -> HTTP 503.
+static constexpr double kEmbedTimeoutSecs = 30.0;
+
 // ---------------------------------------------------------------------------
 // JSON schemas for OpenAI-compatible /v1/embeddings
 // ---------------------------------------------------------------------------
@@ -40,13 +47,13 @@ LlamaEmbedder::LlamaEmbedder(std::string base_url, std::string model, int dims)
 }
 
 drogon::Task<Result<Embedding>>
-LlamaEmbedder::embed(std::string text)
+LlamaEmbedder::embed(std::string text, double timeout_s)
 {
     // Avoid braced-init-list + std::move on coroutine param: GCC 13 ICE in
     // build_special_member_call. Build the vector explicitly instead.
     std::vector<std::string> batch;
     batch.push_back(std::move(text));
-    auto result = co_await embed_batch(std::move(batch));
+    auto result = co_await do_embed(std::move(batch), timeout_s);
     if (!result)
         co_return std::unexpected(result.error());
     if (result->empty())
@@ -61,7 +68,7 @@ LlamaEmbedder::embed_batch(std::vector<std::string> texts)
 }
 
 drogon::Task<Result<std::vector<Embedding>>>
-LlamaEmbedder::do_embed(std::vector<std::string> texts)
+LlamaEmbedder::do_embed(std::vector<std::string> texts, double timeout_s)
 {
     EmbedRequest body{_model, texts};
     std::string  json{};
@@ -77,7 +84,11 @@ LlamaEmbedder::do_embed(std::vector<std::string> texts)
 
     drogon::HttpResponsePtr resp;
     try {
-        resp = co_await _client->sendRequestCoro(req);
+        // Bound the call to the caller's remaining deadline when given, but
+        // never above the hard cap.
+        const double eff = timeout_s > 0.0 ? std::min(timeout_s, kEmbedTimeoutSecs)
+                                           : kEmbedTimeoutSecs;
+        resp = co_await _client->sendRequestCoro(req, eff);
     } catch (const std::exception& ex) {
         co_return std::unexpected(
             Error::unavailable(std::format("embed HTTP error: {}", ex.what())));
@@ -153,7 +164,7 @@ static Embedding make_null_embedding(const std::string& text, int dims)
 }
 
 drogon::Task<Result<Embedding>>
-NullEmbedder::embed(std::string text)
+NullEmbedder::embed(std::string text, double /*timeout_s*/)
 {
     co_return make_null_embedding(text, _dims);
 }

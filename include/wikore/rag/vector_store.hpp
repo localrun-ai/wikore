@@ -49,11 +49,14 @@ public:
                 const PayloadPatch&             patch) = 0;
 
     // Search for the top-k most similar vectors that pass the access filter.
-    // Returns ChunkCandidates in descending score order.
+    // Returns ChunkCandidates in descending score order. timeout_s > 0 bounds
+    // the call to that many seconds (callers pass the remaining request
+    // deadline); 0 uses the adapter's default cap.
     virtual drogon::Task<Result<std::vector<ChunkCandidate>>>
     search(const Embedding& query,
            const QdrantFilter& filter,
-           int limit = 20) = 0;
+           int limit = 20,
+           double timeout_s = 0) = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -85,7 +88,8 @@ public:
     drogon::Task<Result<std::vector<ChunkCandidate>>>
     search(const Embedding& query,
            const QdrantFilter& filter,
-           int limit = 20) override;
+           int limit = 20,
+           double timeout_s = 0) override;
 
 private:
     std::string           _qdrant_url;
@@ -97,7 +101,8 @@ private:
     drogon::Task<drogon::HttpResponsePtr>
     send(drogon::HttpMethod method,
          std::string_view path,
-         std::string body = {});
+         std::string body = {},
+         double timeout_s = 0);
 };
 
 // ---------------------------------------------------------------------------
@@ -129,7 +134,8 @@ public:
     drogon::Task<Result<std::vector<ChunkCandidate>>>
     search(const Embedding& query,
            const QdrantFilter& filter,
-           int limit = 20) override;
+           int limit = 20,
+           double timeout_s = 0) override;
 
     // Test introspection: total number of stored points.
     std::size_t point_count() const { return _points.size(); }

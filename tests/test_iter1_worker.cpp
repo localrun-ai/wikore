@@ -147,7 +147,7 @@ struct MutatingEmbedder : wikore::rag::EmbedderPort {
     int         d = 4;
     std::string name = "null-embedder";
 
-    drogon::Task<wikore::Result<wikore::rag::Embedding>> embed(std::string /*t*/) override {
+    drogon::Task<wikore::Result<wikore::rag::Embedding>> embed(std::string /*t*/, double /*timeout_s*/) override {
         // The outbox worker only calls embed_batch (which carries the ACL
         // mutation); embed() just satisfies the interface. Returns a direct
         // value rather than awaiting embed_batch -- a nested co_await here

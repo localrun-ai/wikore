@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include "wikore/access_resolver.hpp"
+#include "wikore/adapters/postgres/error_mapper.hpp"
 #include "wikore/db.hpp"
 #include <drogon/drogon.h>
 #include <drogon/utils/coroutine.h>
@@ -28,7 +29,8 @@ struct SpyResolver : wikore::AccessResolverPort {
     mutable int          calls = 0;
     wikore::AccessScope  canned;
     drogon::Task<wikore::Result<wikore::AccessScope>>
-    resolve(std::string_view, std::string_view, std::string_view) const override {
+    resolve(std::string_view, std::string_view, std::string_view,
+            wikore::postgres::Deadline) const override {
         ++calls;
         co_return canned;
     }
@@ -122,6 +124,55 @@ TEST_CASE("AccessResolver: unknown principal is NotFound", "[integration][access
         CO, "deadbeef-0000-0000-0000-000000000000", f.root));
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().kind == wikore::Error::Kind::NotFound);
+}
+
+TEST_CASE("exec_until: a query past the deadline is cancelled quickly, not run to completion",
+          "[integration][access_resolver]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+
+    // A 2s query with only a 100ms budget must be cancelled by the server's
+    // statement_timeout in ~100ms, not run the full 2s. This proves the
+    // deadline actually bounds DB awaits (Postgres SQLSTATE 57014).
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(100);
+    const auto t0 = std::chrono::steady_clock::now();
+    bool threw = false;
+    wikore::Error mapped = wikore::Error::database_error("unset");
+    try {
+        drogon::sync_wait(wikore::postgres::exec_until(db, deadline,
+                                                       "SELECT pg_sleep(2)"));
+    } catch (const drogon::orm::DrogonDbException& ex) {
+        threw  = true;                              // statement_timeout cancel
+        mapped = wikore::postgres::map_db_exception(ex);
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    CHECK(threw);
+    CHECK(elapsed < std::chrono::seconds(1));   // far below the 2s sleep
+    // A deadline cancellation must surface as 503, not 500.
+    CHECK(mapped.kind == wikore::Error::Kind::ServiceUnavailable);
+
+    // The unbounded sentinel still runs normally (no statement_timeout).
+    auto ok = drogon::sync_wait(wikore::postgres::exec_until(
+        db, wikore::postgres::no_deadline(), "SELECT 1 AS x"));
+    CHECK(ok[0]["x"].as<int>() == 1);
+
+    // An ALREADY-expired deadline must reject even a sub-millisecond query
+    // rather than let it complete within a 1ms clamp and continue the request.
+    const auto expired = std::chrono::steady_clock::now()
+                       - std::chrono::seconds(1);
+    bool rejected = false;
+    wikore::Error emap = wikore::Error::database_error("unset");
+    try {
+        drogon::sync_wait(wikore::postgres::exec_until(db, expired, "SELECT 1"));
+    } catch (const drogon::orm::DrogonDbException& ex) {
+        rejected = true;
+        emap = wikore::postgres::map_db_exception(ex);
+    }
+    CHECK(rejected);
+    CHECK(emap.kind == wikore::Error::Kind::ServiceUnavailable);
 }
 
 TEST_CASE("AccessResolver: scope_epoch stamp advances after a membership change (V032 trigger)",
