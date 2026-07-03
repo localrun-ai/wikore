@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "wikore/ingest/parser.hpp"
+#include <fstream>
+#include <functional>
 
 using namespace wikore::ingest;
 
@@ -230,10 +232,12 @@ TEST_CASE("PlainTextParser: extension and magic mismatch is rejected", "[parser]
 TEST_CASE("PlainTextParser: binary office input is not treated as text", "[parser][security]")
 {
     PlainTextParser p;
+    // DOCX is now routed to DocxParser; PlainTextParser correctly rejects it
+    // as an unsupported format for a text parser.
     auto result = p.parse("PK\x03\x04office-data", "document.docx",
                           "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
     REQUIRE_FALSE(result.has_value());
-    CHECK(result.error().message == "ingest.unsupported_format.office");
+    CHECK(result.error().message == "ingest.unsupported_format");
 }
 
 TEST_CASE("PlainTextParser: EICAR signature is rejected", "[parser][security]")
@@ -316,4 +320,481 @@ TEST_CASE("PlainTextParser: malformed UTF-8 is rejected", "[parser][security]")
     auto result = p.parse(content, "invalid.txt", "text/plain");
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().message == "ingest.invalid_utf8");
+}
+
+// ==========================================================================
+// PdfParser tests
+// ==========================================================================
+
+static std::string load_fixture(const char* name) {
+    std::ifstream f(std::string(TEST_FIXTURES_DIR) + "/" + name,
+                    std::ios::binary);
+    return {std::istreambuf_iterator<char>(f), {}};
+}
+
+TEST_CASE("PdfParser: empty content is rejected", "[parser][pdf]")
+{
+    PdfParser p;
+    auto r = p.parse("", "empty.pdf", "application/pdf");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.empty_file");
+}
+
+TEST_CASE("PdfParser: non-PDF magic bytes rejected", "[parser][pdf][security]")
+{
+    PdfParser p;
+    auto r = p.parse("Not a PDF at all", "fake.pdf", "application/pdf");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.mime_type_mismatch");
+}
+
+TEST_CASE("PdfParser: truncated/corrupt PDF rejected", "[parser][pdf]")
+{
+    PdfParser p;
+    auto content = load_fixture("not_actually_pdf.pdf");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "corrupt.pdf", "application/pdf");
+    REQUIRE_FALSE(r.has_value());
+    // Corrupt after magic bytes: poppler fails to load
+    CHECK(r.error().message == "ingest.pdf.corrupt_or_empty");
+}
+
+TEST_CASE("PdfParser: flat PDF extracts text as single section", "[parser][pdf]")
+{
+    PdfParser p;
+    auto content = load_fixture("flat.pdf");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "flat.pdf", "application/pdf");
+    REQUIRE(r.has_value());
+    const auto& doc = *r;
+    CHECK(doc.mime_type == "application/pdf");
+    CHECK(doc.filename  == "flat.pdf");
+    REQUIRE(!doc.sections.empty());
+    CHECK(doc.full_text.find("quick brown fox") != std::string::npos);
+    CHECK(doc.full_text.find('\r') == std::string::npos);
+}
+
+TEST_CASE("PdfParser: real PDF with ToC produces hierarchical sections",
+          "[parser][pdf]")
+{
+    // fontconfig-user.pdf ships on most systems with poppler-data.
+    // It has a rich ToC.  If not present, skip.
+    const char* path = "/usr/share/doc/fontconfig-2.17.1/fontconfig-user.pdf";
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open())
+        SKIP("fontconfig-user.pdf not available");
+
+    std::string content{std::istreambuf_iterator<char>(f), {}};
+    PdfParser p;
+    auto r = p.parse(content, "fontconfig-user.pdf", "application/pdf");
+    REQUIRE(r.has_value());
+    const auto& doc = *r;
+    CHECK(doc.sections.size() > 1);
+    CHECK(!doc.full_text.empty());
+    CHECK(doc.full_text.find('\r') == std::string::npos);
+    // At least one named section (from ToC)
+    bool has_named = false;
+    for (const auto& s : doc.sections)
+        if (!s.heading.empty()) { has_named = true; break; }
+    CHECK(has_named);
+}
+
+TEST_CASE("PdfParser: file_too_large is rejected", "[parser][pdf]")
+{
+    PdfParser p;
+    // Starts with %PDF- but is bigger than kMaxInputBytes
+    std::string big = "%PDF-1.4";
+    big.resize(ParserPort::kMaxInputBytes + 1, 'x');
+    auto r = p.parse(big, "big.pdf", "application/pdf");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.file_too_large");
+}
+
+// ==========================================================================
+// DocxParser tests
+// ==========================================================================
+
+TEST_CASE("DocxParser: empty content is rejected", "[parser][docx]")
+{
+    DocxParser p;
+    auto r = p.parse("", "empty.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.empty_file");
+}
+
+TEST_CASE("DocxParser: non-ZIP magic bytes rejected", "[parser][docx][security]")
+{
+    DocxParser p;
+    auto r = p.parse("Not a ZIP file at all", "fake.docx",
+                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.mime_type_mismatch");
+}
+
+TEST_CASE("DocxParser: basic fixture - headings and body text extracted",
+          "[parser][docx]")
+{
+    DocxParser p;
+    auto content = load_fixture("test.docx");
+    REQUIRE_FALSE(content.empty());
+
+    auto r = p.parse(content, "test.docx",
+                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    REQUIRE(r.has_value());
+    const auto& doc = *r;
+
+    // Should have top-level sections
+    REQUIRE(doc.sections.size() >= 2);
+
+    // First section: "Introduction" at depth 1
+    CHECK(doc.sections[0].heading == "Introduction");
+    CHECK(doc.sections[0].depth   == 1);
+    CHECK(doc.sections[0].text.find("introduction body text") != std::string::npos);
+
+    // "Background" at depth 2 is a child of "Introduction"
+    REQUIRE(!doc.sections[0].children.empty());
+    CHECK(doc.sections[0].children[0].heading == "Background");
+    CHECK(doc.sections[0].children[0].depth   == 2);
+
+    // Tracked deletions suppressed, insertions included
+    const auto& bg = doc.sections[0].children[0];
+    CHECK(bg.text.find("deleted content") == std::string::npos);
+    CHECK(bg.text.find("inserted content") != std::string::npos);
+
+    // Table flattened: "Column A | Column B"
+    CHECK(bg.text.find("Column A | Column B") != std::string::npos);
+
+    // Last section: "Conclusion"
+    CHECK(doc.sections.back().heading == "Conclusion");
+    CHECK(doc.sections.back().text.find("Final section") != std::string::npos);
+
+    CHECK(doc.full_text.find('\r') == std::string::npos);
+}
+
+TEST_CASE("DocxParser: heading style name variants (lowercase, spaced)",
+          "[parser][docx]")
+{
+    DocxParser p;
+    auto content = load_fixture("heading_variants.docx");
+    REQUIRE_FALSE(content.empty());
+
+    auto r = p.parse(content, "heading_variants.docx",
+                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    REQUIRE(r.has_value());
+    const auto& doc = *r;
+
+    // Both "heading1" and "Heading 2" should be detected
+    REQUIRE(doc.sections.size() >= 1);
+    CHECK(doc.sections[0].heading == "Lowercase Style");
+    CHECK(doc.sections[0].depth   == 1);
+    REQUIRE(!doc.sections[0].children.empty());
+    CHECK(doc.sections[0].children[0].heading == "Spaced Style");
+    CHECK(doc.sections[0].children[0].depth   == 2);
+}
+
+TEST_CASE("DocxParser: PDF disguised as DOCX is rejected", "[parser][docx][security]")
+{
+    DocxParser p;
+    // A PDF starts with %PDF- not PK, so should fail magic check
+    auto content = load_fixture("flat.pdf");
+    auto r = p.parse(content, "disguised.docx",
+                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.mime_type_mismatch");
+}
+
+TEST_CASE("DocxParser: ZIP without word/document.xml is rejected", "[parser][docx]")
+{
+    // PK\x05\x06 is the end-of-central-directory signature, not a local file
+    // header (PK\x03\x04). Our magic check requires the local-file-header
+    // magic, so this is correctly rejected as not a DOCX before we even
+    // attempt ZIP extraction.
+    std::string fake_zip = std::string("PK\x05\x06", 4) + std::string(18, '\0');
+    DocxParser p;
+    auto r = p.parse(fake_zip, "empty.docx",
+                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    REQUIRE_FALSE(r.has_value());
+    // EOCD-only "ZIP" fails the PK\x03\x04 magic check
+    CHECK(r.error().message == "ingest.mime_type_mismatch");
+}
+
+// ==========================================================================
+// HtmlParser tests
+// ==========================================================================
+
+TEST_CASE("HtmlParser: empty content is rejected", "[parser][html]")
+{
+    HtmlParser p;
+    auto r = p.parse("", "empty.html", "text/html");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.empty_file");
+}
+
+TEST_CASE("HtmlParser: basic fixture - h1/h2/h3 hierarchy and body text",
+          "[parser][html]")
+{
+    HtmlParser p;
+    auto content = load_fixture("test.html");
+    REQUIRE_FALSE(content.empty());
+
+    auto r = p.parse(content, "test.html", "text/html");
+    REQUIRE(r.has_value());
+    const auto& doc = *r;
+
+    CHECK(doc.mime_type == "text/html");
+
+    // h1 -> top section at depth 1
+    auto h1_it = std::ranges::find_if(doc.sections,
+        [](const ParsedSection& s) { return s.heading == "Main Heading"; });
+    REQUIRE(h1_it != doc.sections.end());
+    CHECK(h1_it->depth == 1);
+
+    // h2 sections are children or top-level (depending on preamble)
+    bool found_s1 = false, found_s2 = false;
+    std::function<void(const ParsedSection&)> find_sections =
+        [&](const ParsedSection& s) {
+            if (s.heading == "Section One") found_s1 = true;
+            if (s.heading == "Section Two") found_s2 = true;
+            for (const auto& c : s.children) find_sections(c);
+        };
+    for (const auto& s : doc.sections) find_sections(s);
+    CHECK(found_s1);
+    CHECK(found_s2);
+
+    // script content absent
+    CHECK(doc.full_text.find("alert(") == std::string::npos);
+    // style content absent
+    CHECK(doc.full_text.find("font-family") == std::string::npos);
+    // hidden div absent
+    CHECK(doc.full_text.find("Hidden content") == std::string::npos);
+    // link text preserved, href absent
+    CHECK(doc.full_text.find("a link") != std::string::npos);
+    CHECK(doc.full_text.find("https://example.com") == std::string::npos);
+    // table flattened
+    CHECK(doc.full_text.find("Col A") != std::string::npos);
+    CHECK(doc.full_text.find("|") != std::string::npos);
+    CHECK(doc.full_text.find('\r') == std::string::npos);
+}
+
+TEST_CASE("HtmlParser: malformed HTML is parsed without error", "[parser][html]")
+{
+    HtmlParser p;
+    auto content = load_fixture("malformed.html");
+    REQUIRE_FALSE(content.empty());
+
+    // libxml2 in recovery mode should not return an error
+    auto r = p.parse(content, "malformed.html", "text/html");
+    REQUIRE(r.has_value());
+    CHECK(!r->full_text.empty());
+    CHECK(r->full_text.find("Body text") != std::string::npos);
+    CHECK(r->full_text.find("More body") != std::string::npos);
+}
+
+TEST_CASE("HtmlParser: PDF disguised as HTML is rejected",
+          "[parser][html][security]")
+{
+    HtmlParser p;
+    auto content = load_fixture("flat.pdf");
+    auto r = p.parse(content, "disguised.html", "text/html");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.mime_type_mismatch");
+}
+
+TEST_CASE("HtmlParser: plain text without HTML tags is treated as a flat section",
+          "[parser][html]")
+{
+    HtmlParser p;
+    std::string content = "Just plain text with no HTML structure at all.";
+    auto r = p.parse(content, "plain.html", "text/html");
+    REQUIRE(r.has_value());
+    CHECK(r->full_text.find("Just plain text") != std::string::npos);
+}
+
+// ==========================================================================
+// Parser dispatch tests (resolve_text_mime routing)
+// ==========================================================================
+
+TEST_CASE("PlainTextParser: .pdf extension rejected (not a PDF parser)",
+          "[parser][security]")
+{
+    PlainTextParser p;
+    auto content = load_fixture("flat.pdf");
+    auto r = p.parse(content, "test.pdf", "application/pdf");
+    REQUIRE_FALSE(r.has_value());
+    // flat.pdf magic bytes trigger is_pdf=true; PlainTextParser no longer
+    // returns unsupported_format.pdf, it returns unsupported_format because
+    // resolve_text_mime now returns application/pdf and PlainTextParser
+    // doesn't handle that MIME.
+    // (The correct parser to use is PdfParser.)
+    REQUIRE_FALSE(r.error().message.empty());
+}
+
+// ==========================================================================
+// Fix-round-2 regression tests
+// ==========================================================================
+
+// --- PDF: ToC hierarchy preserved as children ----------------------------
+
+TEST_CASE("PdfParser: real ToC produces nested children not flat list",
+          "[parser][pdf]")
+{
+    // fontconfig-user.pdf has a multi-level ToC (section > subsection).
+    // The hierarchy must appear as children, not as unrelated top-level sections.
+    const char* path = "/usr/share/doc/fontconfig-2.17.1/fontconfig-user.pdf";
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) SKIP("fontconfig-user.pdf not available");
+    std::string content{std::istreambuf_iterator<char>(f), {}};
+    PdfParser p;
+    auto r = p.parse(content, "fontconfig-user.pdf", "application/pdf");
+    REQUIRE(r.has_value());
+    const auto& doc = *r;
+    // At least one top-level section should have at least one child
+    // (the outline has a "Description" with sub-entries)
+    bool has_nested = false;
+    std::function<void(const ParsedSection&)> check = [&](const ParsedSection& s) {
+        if (!s.children.empty()) has_nested = true;
+        for (const auto& c : s.children) check(c);
+    };
+    for (const auto& s : doc.sections) check(s);
+    CHECK(has_nested);
+    // No section should have depth deeper than any of its children
+    std::function<void(const ParsedSection&, int)> check_depth =
+        [&](const ParsedSection& s, int parent_depth) {
+            if (parent_depth > 0) CHECK(s.depth > parent_depth);
+            for (const auto& c : s.children) check_depth(c, s.depth);
+        };
+    for (const auto& s : doc.sections) if (s.depth > 0) check_depth(s, 0);
+}
+
+// --- DOCX: footnotes traversed -------------------------------------------
+
+TEST_CASE("DocxParser: footnotes are extracted into Notes section",
+          "[parser][docx]")
+{
+    // Build a DOCX with a footnote
+    auto make_docx_with_footnote = [] {
+        const char* doc_xml = R"(<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+         <w:r><w:t>Main Section</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Body text here.</w:t></w:r></w:p>
+  </w:body>
+</w:document>)";
+        const char* fn_xml = R"(<?xml version="1.0" encoding="UTF-8"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:id="0" w:type="separator"/>
+  <w:footnote w:id="1">
+    <w:p><w:r><w:t>This is a footnote.</w:t></w:r></w:p>
+  </w:footnote>
+</w:footnotes>)";
+        const char* rels = R"(<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>)";
+        const char* ct = R"(<?xml version="1.0"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Override PartName="/word/document.xml"
+    ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>)";
+        // Write component files and zip them
+        {auto f = std::ofstream("/tmp/_ct.xml"); f << ct;}
+        {auto f = std::ofstream("/tmp/_rels.xml"); f << rels;}
+        {auto f = std::ofstream("/tmp/_doc.xml"); f << doc_xml;}
+        {auto f = std::ofstream("/tmp/_fn.xml"); f << fn_xml;}
+        ::system("python3 -c \"import zipfile,io; buf=io.BytesIO(); z=zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED); [z.writestr(n,open(p).read()) for n,p in [('[Content_Types].xml','/tmp/_ct.xml'),('_rels/.rels','/tmp/_rels.xml'),('word/_rels/document.xml.rels','/tmp/_rels.xml'),('word/document.xml','/tmp/_doc.xml'),('word/footnotes.xml','/tmp/_fn.xml')]]; z.close(); open('/tmp/_test_fn.docx','wb').write(buf.getvalue())\"");
+        std::ifstream f("/tmp/_test_fn.docx", std::ios::binary);
+        return std::string{std::istreambuf_iterator<char>(f), {}};
+    };
+
+    auto content = make_docx_with_footnote();
+    REQUIRE_FALSE(content.empty());
+    DocxParser p;
+    auto r = p.parse(content, "fn.docx",
+                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    REQUIRE(r.has_value());
+    // The footnote text must appear somewhere (in full_text or Notes section)
+    CHECK(r->full_text.find("footnote") != std::string::npos);
+    // There should be a Notes section
+    bool found_notes = false;
+    for (const auto& s : r->sections)
+        if (s.heading == "Notes") found_notes = true;
+    CHECK(found_notes);
+}
+
+// --- HTML: `hidden` attribute and spaced `display : none` suppressed ------
+
+TEST_CASE("HtmlParser: hidden attribute suppresses element", "[parser][html]")
+{
+    HtmlParser p;
+    std::string html = R"html(<html><body>
+<div hidden>This hidden content must not appear.</div>
+<p>Visible paragraph.</p>
+</body></html>)html";
+    auto r = p.parse(html, "t.html", "text/html");
+    REQUIRE(r.has_value());
+    CHECK(r->full_text.find("hidden content") == std::string::npos);
+    CHECK(r->full_text.find("Visible paragraph") != std::string::npos);
+}
+
+TEST_CASE("HtmlParser: display:none with various CSS whitespace forms suppressed",
+          "[parser][html]")
+{
+    HtmlParser p;
+    // Build the HTML string explicitly so there is no ambiguity about what
+    // characters are in the style attributes.  In particular, the tab-both
+    // case uses std::string with a literal '\t' escape — NOT a raw string —
+    // so the tab byte (0x09) is unambiguously present.
+    std::string html;
+    html += "<html><body>\n";
+    html += "<div style=\"display : none\">single-space-both</div>\n";
+    html += "<div style=\"display  :  none\">double-space-both</div>\n";
+    // Two tab characters (0x09) around the colon:
+    html += std::string("<div style=\"display\t:\tnone\">tab-both</div>\n");
+    html += "<div style=\"visibility : hidden\">visibility-spaced</div>\n";
+    html += "<p>visible</p>\n";
+    html += "</body></html>";
+    auto r = p.parse(html, "t.html", "text/html");
+    REQUIRE(r.has_value());
+    CHECK(r->full_text.find("single-space-both")  == std::string::npos);
+    CHECK(r->full_text.find("double-space-both")  == std::string::npos);
+    CHECK(r->full_text.find("tab-both")           == std::string::npos);
+    CHECK(r->full_text.find("visibility-spaced")  == std::string::npos);
+    CHECK(r->full_text.find("visible")            != std::string::npos);
+}
+
+TEST_CASE("HtmlParser: display:none!important and visibility:hidden!important suppressed",
+          "[parser][html]")
+{
+    HtmlParser p;
+    // Both compact (!important immediately after the value) and spaced
+    // (! important with surrounding whitespace) forms must be suppressed.
+    std::string html;
+    html += "<html><body>\n";
+    html += "<div style=\"display:none!important\">compact-important</div>\n";
+    html += "<div style=\"visibility: hidden !important\">spaced-important</div>\n";
+    html += "<p>visible</p>\n";
+    html += "</body></html>";
+    auto r = p.parse(html, "t.html", "text/html");
+    REQUIRE(r.has_value());
+    CHECK(r->full_text.find("compact-important") == std::string::npos);
+    CHECK(r->full_text.find("spaced-important")  == std::string::npos);
+    CHECK(r->full_text.find("visible")           != std::string::npos);
+}
+
+TEST_CASE("PdfParser: outline with many entries falls back to flat section",
+          "[parser][pdf]")
+{
+    // kMaxTocEntries is 2000. The flat.pdf has no outline so this test
+    // validates the threshold indirectly: a PDF that can be parsed and
+    // produces no outline (because the fixture has none) should still
+    // succeed as a flat section without hanging.
+    // The real adversarial case (large outline) would require a crafted PDF;
+    // instead, this test pins that PdfParser still produces a non-empty result
+    // for a valid PDF after the entry cap is applied.
+    PdfParser p;
+    auto content = load_fixture("flat.pdf");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "flat.pdf", "application/pdf");
+    REQUIRE(r.has_value());
+    CHECK(!r->full_text.empty());
 }

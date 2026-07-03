@@ -68,6 +68,19 @@ if(NOT hiredis_FOUND)
 endif()
 
 # ---------------------------------------------------------------------------
+# Non-text parser dependencies
+#   poppler-cpp  — PDF text + outline extraction
+#   minizip      — ZIP container for DOCX
+#   pugixml      — lightweight XML parser for word/document.xml
+#   libxml2      — HTML parser (htmlReadMemory)
+# ---------------------------------------------------------------------------
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(POPPLER_CPP REQUIRED IMPORTED_TARGET poppler-cpp)
+pkg_check_modules(MINIZIP     REQUIRED IMPORTED_TARGET minizip)
+pkg_check_modules(LIBXML2     REQUIRED IMPORTED_TARGET libxml-2.0)
+find_package(pugixml REQUIRED)
+
+# ---------------------------------------------------------------------------
 # CPM packages
 # ---------------------------------------------------------------------------
 include(cmake/dependencies.cmake)
@@ -142,11 +155,20 @@ add_library(wikore_ingest_lib STATIC
     src/ingest/types.cpp
     src/ingest/chunker.cpp
     src/ingest/parser.cpp
+    src/ingest/pdf_parser.cpp
+    src/ingest/docx_parser.cpp
+    src/ingest/html_parser.cpp
     src/ingest/document_repo.cpp
     src/ingest/worker.cpp
     src/application/ingest_document_version.cpp
 )
 target_link_libraries(wikore_ingest_lib PUBLIC wikore_rag)
+target_link_libraries(wikore_ingest_lib PRIVATE
+    PkgConfig::POPPLER_CPP
+    PkgConfig::MINIZIP
+    PkgConfig::LIBXML2
+    pugixml::pugixml
+)
 
 # ---------------------------------------------------------------------------
 # wikore_scheduler_lib: outbox drainer + polling fallback

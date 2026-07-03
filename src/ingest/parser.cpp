@@ -58,9 +58,15 @@ Result<std::string> resolve_text_mime(const std::string& content,
     if ((ext == ".docx" || ext == ".xlsx" || ext == ".pptx") && !is_zip)
         return std::unexpected(Error::invalid_input("ingest.mime_type_mismatch"));
     if (is_pdf)
-        return std::unexpected(Error::invalid_input("ingest.unsupported_format.pdf"));
-    if (is_zip)
+        return std::string{"application/pdf"};
+    if (is_zip) {
+        if (ext == ".docx")
+            return std::string{
+                "application/vnd.openxmlformats-officedocument"
+                ".wordprocessingml.document"};
+        // xlsx/pptx not yet supported
         return std::unexpected(Error::invalid_input("ingest.unsupported_format.office"));
+    }
     if (content.find('\0') != std::string::npos)
         return std::unexpected(Error::invalid_input("ingest.binary_content"));
 
@@ -68,8 +74,12 @@ Result<std::string> resolve_text_mime(const std::string& content,
         return std::string{"text/markdown"};
     if (ext == ".txt" || ext.empty())
         return std::string{"text/plain"};
+    if (ext == ".html" || ext == ".htm")
+        return std::string{"text/html"};
 
     if (mime_type == "text/markdown" || mime_type == "text/plain")
+        return mime_type;
+    if (mime_type == "text/html")
         return mime_type;
     return std::unexpected(Error::invalid_input("ingest.unsupported_format"));
 }
@@ -253,6 +263,13 @@ PlainTextParser::parse(const std::string& content,
     auto resolved_mime = resolve_text_mime(content, filename, mime_type);
     if (!resolved_mime)
         return std::unexpected(resolved_mime.error());
+
+    // PlainTextParser only handles text/plain and text/markdown. Other MIME
+    // types (application/pdf, application/vnd.openxmlformats-*) are returned
+    // by resolve_text_mime when the magic bytes match; the caller should have
+    // used the appropriate parser.
+    if (*resolved_mime != "text/plain" && *resolved_mime != "text/markdown")
+        return std::unexpected(Error::invalid_input("ingest.unsupported_format"));
 
     auto normalized = strip_unicode_tags(content);
     if (!normalized)
