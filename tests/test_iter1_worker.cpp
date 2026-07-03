@@ -380,6 +380,8 @@ TEST_CASE("PollingFallback::run: shutdown during the inter-sweep sleep exits wit
     seed_iter1_fixtures(db);
 
     std::atomic<bool> stop{false};
+    std::atomic<bool> armed{false};
+    std::chrono::steady_clock::time_point t_arm;
     wikore::scheduler::PollingFallback::Options opts;
     // A long interval: with a non-cancellable sleep, run() would block ~1h after
     // the first sweep. The on_sleep_armed hook flips shutdown exactly while the
@@ -387,14 +389,26 @@ TEST_CASE("PollingFallback::run: shutdown during the inter-sweep sleep exits wit
     // and return within one 50ms chunk.
     opts.interval       = std::chrono::hours(1);
     opts.sleep_chunk    = std::chrono::milliseconds(50);
-    opts.on_sleep_armed = [&] { stop.store(true); };
+    opts.on_sleep_armed = [&] {
+        // Fires from inside await_suspend, once, right after the first chunk
+        // timer is armed. Capture the arm instant so the assertion measures the
+        // sleep tail alone (excluding the preceding DB sweep, whose duration is
+        // machine-dependent), then request shutdown.
+        if (!armed.exchange(true)) t_arm = std::chrono::steady_clock::now();
+        stop.store(true);
+    };
     wikore::scheduler::PollingFallback poll(db, [&] { return stop.load(); }, opts);
 
-    const auto t0 = std::chrono::steady_clock::now();
     drogon::sync_wait(poll.run());
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
-    // Must be far below the 1h interval -- proves the sleep is cancellable.
-    CHECK(elapsed < std::chrono::seconds(5));
+    const auto tail = std::chrono::steady_clock::now() - t_arm;
+
+    // The sleep must have been reached (otherwise the test proves nothing).
+    REQUIRE(armed.load());
+    // Once armed, the coroutine resumes after the current 50ms chunk, observes
+    // shutdown, and breaks. Bounding the tail to a few chunks (not a loose 5s)
+    // means a regression to sleeping the full interval -- or waking only after
+    // several chunks -- actually fails the test.
+    CHECK(tail < opts.sleep_chunk * 3);
 }
 
 TEST_CASE("PollingFallback: ctor rejects non-positive interval and non-positive sleep_chunk",
