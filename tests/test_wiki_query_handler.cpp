@@ -223,3 +223,23 @@ TEST_CASE("wiki_query: missing identity attribute is 401", "[integration][api]")
 
     CHECK(resp->getStatusCode() == drogon::k401Unauthorized);
 }
+
+TEST_CASE("wiki_query: a soft-deactivated user cannot retrieve (403)",
+          "[integration][api]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    auto f  = seed(db);
+    auto orch = make_orch(db, f.store);
+
+    // Same in-scope query that returns results for an active user, but the
+    // user's row is now soft-deactivated: the read-path tenant lookup must
+    // reject it even though a stale credential still carries a valid user_id.
+    exec_sync(db, "UPDATE users SET deactivated_at = now() WHERE id = $1::uuid",
+              f.user);
+
+    auto resp = drogon::sync_wait(wikore::api::wiki_query(
+        orch, db, make_req(f.user, R"({"query":"leave policy"})"), f.root_a));
+
+    CHECK(resp->getStatusCode() == drogon::k403Forbidden);
+}

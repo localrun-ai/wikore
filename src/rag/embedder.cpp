@@ -10,6 +10,13 @@
 
 namespace wikore::rag {
 
+// Per-request timeout (seconds) for the embed HTTP call. Without it,
+// sendRequestCoro waits forever, so a stalled llama-server would hang every
+// caller indefinitely (a request-deadline check between steps cannot interrupt
+// an in-flight await). On timeout the coro throws, which the send site below
+// converts to Error::unavailable -> HTTP 503.
+static constexpr double kEmbedTimeoutSecs = 30.0;
+
 // ---------------------------------------------------------------------------
 // JSON schemas for OpenAI-compatible /v1/embeddings
 // ---------------------------------------------------------------------------
@@ -77,7 +84,7 @@ LlamaEmbedder::do_embed(std::vector<std::string> texts)
 
     drogon::HttpResponsePtr resp;
     try {
-        resp = co_await _client->sendRequestCoro(req);
+        resp = co_await _client->sendRequestCoro(req, kEmbedTimeoutSecs);
     } catch (const std::exception& ex) {
         co_return std::unexpected(
             Error::unavailable(std::format("embed HTTP error: {}", ex.what())));

@@ -10,6 +10,13 @@
 
 namespace wikore::rag {
 
+// Per-request timeout (seconds) for every Qdrant HTTP call. Without it,
+// sendRequestCoro never returns if Qdrant stalls, hanging the caller
+// indefinitely; on timeout the coro throws, which each send site converts to a
+// Result error. Applied in the shared send() helper so all operations inherit
+// it.
+static constexpr double kQdrantTimeoutSecs = 30.0;
+
 // ---------------------------------------------------------------------------
 // JSON structs for Qdrant REST API
 // ---------------------------------------------------------------------------
@@ -172,7 +179,7 @@ QdrantVectorStore::send(drogon::HttpMethod method,
         req->setContentTypeCode(drogon::CT_APPLICATION_JSON);
         req->setBody(std::move(body));
     }
-    co_return co_await _client->sendRequestCoro(req);
+    co_return co_await _client->sendRequestCoro(req, kQdrantTimeoutSecs);
 }
 
 drogon::Task<Result<void>>

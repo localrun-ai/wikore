@@ -463,6 +463,7 @@ static void validate_api_key_async(
         "WHERE k.key_hash = $1 "
         "  AND k.revoked_at IS NULL "
         "  AND (k.expires_at IS NULL OR k.expires_at > now()) "
+        "  AND u.deactivated_at IS NULL "   // soft-deactivated users lose access
         "LIMIT 1";
 
     // Capture stop/next as shared_ptr so they survive the async callback.
@@ -499,6 +500,61 @@ static void validate_api_key_async(
         hash);
 }
 
+// Resolve a verified JWT to an internal user row and finish the filter chain.
+//
+// validate_jwt() sets Identity::user_id to the raw OIDC `sub` claim, which the
+// schema stores in users.external_sub - NOT users.id. Downstream code (the
+// access resolver, request handlers) keys on users.id, so we must translate
+// (issuer, sub) -> users.id here. We also drop deactivated users: per
+// domain/types.hpp the auth middleware is the single point that rejects them
+// before a RequestContext is built.
+//
+// (issuer, sub) is unique only within a company (V002), so in a deployment
+// where one issuer maps to multiple tenants it could match more than one row.
+// We fail closed on that ambiguity (reject) rather than guess a tenant.
+static void resolve_jwt_user_async(
+    Identity                      jwt_id,
+    const drogon::HttpRequestPtr& req,
+    drogon::FilterCallback&&      stop,
+    drogon::FilterChainCallback&& next)
+{
+    auto db = drogon::app().getDbClient();
+    if (!db) { stop(make_401("service unavailable")); return; }
+
+    static const std::string sql =
+        "SELECT id FROM users "
+        "WHERE external_issuer = $1 AND external_sub = $2 "
+        "  AND deactivated_at IS NULL";
+
+    const std::string issuer = g_cfg ? g_cfg->oidc_issuer : std::string{};
+    const std::string sub    = jwt_id.user_id;
+
+    auto stop_p = std::make_shared<drogon::FilterCallback>(std::move(stop));
+    auto next_p = std::make_shared<drogon::FilterChainCallback>(std::move(next));
+    auto id_p   = std::make_shared<Identity>(std::move(jwt_id));
+
+    db->execSqlAsync(
+        sql,
+        [req, id_p, stop_p, next_p](const drogon::orm::Result& rows) mutable {
+            // 0 rows: not provisioned or deactivated. >1: (issuer, sub)
+            // ambiguous across tenants - fail closed.
+            if (rows.size() != 1) {
+                (*stop_p)(make_401("user not provisioned"));
+                return;
+            }
+            id_p->user_id = rows[0]["id"].as<std::string>();
+            req->getAttributes()->insert("identity", *id_p);
+            (*next_p)();
+        },
+        [stop_p](const drogon::orm::DrogonDbException& ex) mutable {
+            spdlog::error("[auth] jwt user resolve DB error: {}", ex.base().what());
+            auto r = drogon::HttpResponse::newHttpResponse();
+            r->setStatusCode(drogon::k503ServiceUnavailable);
+            (*stop_p)(r);
+        },
+        issuer, sub);
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -523,13 +579,14 @@ std::optional<Identity> authenticate(const drogon::HttpRequestPtr& req) {
 void AuthFilter::doFilter(const drogon::HttpRequestPtr& req,
                           drogon::FilterCallback&&      stop,
                           drogon::FilterChainCallback&& next) {
-    // JWT: synchronous (keys in memory, ~10us)
+    // JWT: token verification is synchronous (keys in memory, ~10us), but
+    // translating the OIDC sub to an internal users.id needs a DB lookup, so
+    // resolution finishes asynchronously.
     const auto& auth = req->getHeader("Authorization");
     if (auth.starts_with("Bearer ")) {
         auto id = validate_jwt(std::string_view(auth).substr(7));
         if (id) {
-            req->getAttributes()->insert("identity", *id);
-            next();
+            resolve_jwt_user_async(*id, req, std::move(stop), std::move(next));
             return;
         }
     }

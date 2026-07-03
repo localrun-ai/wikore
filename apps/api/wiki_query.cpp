@@ -139,12 +139,15 @@ wikore::api::wiki_query(std::shared_ptr<rag::RetrievalOrchestrator> orch,
             co_return json_error(drogon::k404NotFound, "org unit not found");
 
         // 4. Resolve the tenant from the authenticated user (never the URL).
+        //    Re-check deactivated_at here (not just at auth) so a still-cached
+        //    credential cannot keep retrieving documents after deactivation.
         std::string company_id;
         try {
             auto rows = co_await db->execSqlCoro(
-                "SELECT company_id FROM users WHERE id=$1::uuid", id.user_id);
+                "SELECT company_id FROM users "
+                "WHERE id=$1::uuid AND deactivated_at IS NULL", id.user_id);
             if (rows.empty())
-                co_return json_error(drogon::k403Forbidden, "user has no company");
+                co_return json_error(drogon::k403Forbidden, "user not found or deactivated");
             company_id = rows[0]["company_id"].as<std::string>();
         } catch (const drogon::orm::DrogonDbException& ex) {
             spdlog::error("[wiki_query] tenant lookup failed: {}", ex.base().what());

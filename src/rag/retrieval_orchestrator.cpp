@@ -22,11 +22,19 @@ RetrievalOrchestrator::retrieve(const RequestContext& ctx,
 
     const auto& company = ctx.tenant.company_id;
 
+    // The deadline is re-checked before each remote step. Combined with the
+    // per-request timeouts on the embed/Qdrant HTTP clients (so a single
+    // stalled dependency errors rather than hanging), this bounds total
+    // request time instead of only failing fast when the caller is already
+    // past deadline at entry.
+
     // 1. embed the query.
     auto vec = co_await embedder_->embed(std::move(query));
     if (!vec) co_return std::unexpected(vec.error());
 
     // 2. resolve the reader's scope (cached; epoch-validated).
+    if (ctx.deadline_exceeded())
+        co_return std::unexpected(Error::unavailable("retrieve: deadline exceeded after embed"));
     auto scope = co_await resolver_->resolve(
         company, ctx.principal.user_id, scope_org_unit_id);
     if (!scope) co_return std::unexpected(scope.error());
@@ -44,11 +52,15 @@ RetrievalOrchestrator::retrieve(const RequestContext& ctx,
     const long long want  = static_cast<long long>(limit)
                           * static_cast<long long>(std::max(1, over_fetch_));
     const int fetch = static_cast<int>(std::min(want, kMaxFetch));
+    if (ctx.deadline_exceeded())
+        co_return std::unexpected(Error::unavailable("retrieve: deadline exceeded before search"));
     auto candidates = co_await vector_store_->search(*vec, filter, fetch);
     if (!candidates) co_return std::unexpected(candidates.error());
 
     // 6. EvidenceGate: authoritative live re-validation + hydration. Same
     //    scope and clearance as the prefilter, so the two layers agree.
+    if (ctx.deadline_exceeded())
+        co_return std::unexpected(Error::unavailable("retrieve: deadline exceeded before gate"));
     auto allowed = co_await gate_.evaluate(company, *scope, labels, *candidates);
     if (!allowed) co_return std::unexpected(allowed.error());
 
