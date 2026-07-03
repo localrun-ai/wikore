@@ -158,6 +158,21 @@ TEST_CASE("exec_until: a query past the deadline is cancelled quickly, not run t
     auto ok = drogon::sync_wait(wikore::postgres::exec_until(
         db, wikore::postgres::no_deadline(), "SELECT 1 AS x"));
     CHECK(ok[0]["x"].as<int>() == 1);
+
+    // An ALREADY-expired deadline must reject even a sub-millisecond query
+    // rather than let it complete within a 1ms clamp and continue the request.
+    const auto expired = std::chrono::steady_clock::now()
+                       - std::chrono::seconds(1);
+    bool rejected = false;
+    wikore::Error emap = wikore::Error::database_error("unset");
+    try {
+        drogon::sync_wait(wikore::postgres::exec_until(db, expired, "SELECT 1"));
+    } catch (const drogon::orm::DrogonDbException& ex) {
+        rejected = true;
+        emap = wikore::postgres::map_db_exception(ex);
+    }
+    CHECK(rejected);
+    CHECK(emap.kind == wikore::Error::Kind::ServiceUnavailable);
 }
 
 TEST_CASE("AccessResolver: scope_epoch stamp advances after a membership change (V032 trigger)",

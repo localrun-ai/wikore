@@ -259,6 +259,12 @@ const std::unordered_map<std::string, Error> k_constraint_map = {
 } // namespace
 
 Error map_db_exception(const drogon::orm::DrogonDbException& ex) {
+    // A timeout (drogon's client-level SQL execution timeout, or exec_until
+    // rejecting an already-expired deadline) is a request-budget failure, not a
+    // server error -> ServiceUnavailable (503).
+    if (dynamic_cast<const drogon::orm::TimeoutError*>(&ex))
+        return Error::unavailable("query timed out (deadline exceeded)");
+
     // DrogonDbException is not std::exception; use .base() then dynamic_cast
     // to SqlError to access SQLSTATE.
     const auto* sql_err = dynamic_cast<const drogon::orm::SqlError*>(&ex.base());

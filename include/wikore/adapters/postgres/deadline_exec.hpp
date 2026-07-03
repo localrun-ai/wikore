@@ -1,5 +1,6 @@
 #pragma once
 #include <drogon/orm/DbClient.h>
+#include <drogon/orm/Exception.h>
 #include <drogon/utils/coroutine.h>
 #include <chrono>
 #include <string>
@@ -47,9 +48,17 @@ exec_until(drogon::orm::DbClientPtr db,
     // below is always bounded to the post-acquisition remainder.)
     auto trans = co_await db->newTransactionCoro();
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  deadline - std::chrono::steady_clock::now()).count();
-    if (ms < 1) ms = 1;   // budget spent during acquisition: cancel at once
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now()).count();
+
+    // Budget spent (during acquisition or before): reject WITHOUT running the
+    // query. A clamp-to-1ms would let a sub-millisecond statement (e.g.
+    // SELECT 1) finish and let the request continue past its deadline, because
+    // statement_timeout caps execution time - it does not reject an
+    // already-expired deadline. TimeoutError is a DrogonDbException, so it flows
+    // through the same catch sites as a real cancellation and maps to 503.
+    if (ms <= 0)
+        throw drogon::orm::TimeoutError("deadline exceeded before query execution");
 
     // Transaction-local statement_timeout (third arg = is_local). It resets
     // when the transaction ends, so nothing leaks back to the pooled
