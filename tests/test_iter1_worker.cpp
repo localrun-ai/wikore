@@ -397,6 +397,27 @@ TEST_CASE("PollingFallback::run: shutdown during the inter-sweep sleep exits wit
     CHECK(elapsed < std::chrono::seconds(5));
 }
 
+TEST_CASE("PollingFallback: ctor rejects non-positive interval and non-positive sleep_chunk",
+          "[iter1]")
+{
+    // No DB needed: the ctor validates Options before touching the client, so a
+    // null DbClientPtr keeps this runnable in the unit-test job (no DATABASE_URL).
+    // A non-positive sleep_chunk would make interruptible_sleep arm a zero/negative
+    // timer that fires immediately -- a busy loop that pins a CPU.
+    drogon::orm::DbClientPtr null_db;
+    auto shutdown = [] { return false; };
+
+    using PF = wikore::scheduler::PollingFallback;
+
+    PF::Options bad_chunk;
+    bad_chunk.sleep_chunk = std::chrono::milliseconds::zero();
+    REQUIRE_THROWS_AS(PF(null_db, shutdown, bad_chunk), std::invalid_argument);
+
+    PF::Options bad_interval;
+    bad_interval.interval = std::chrono::seconds::zero();
+    REQUIRE_THROWS_AS(PF(null_db, shutdown, bad_interval), std::invalid_argument);
+}
+
 TEST_CASE("IngestWorker: malformed JSON payload is discarded without dispatch",
           "[integration][iter1]")
 {

@@ -9,6 +9,7 @@
 #include <cassert>
 #include <format>
 #include <optional>
+#include <stdexcept>
 
 namespace wikore::scheduler {
 
@@ -67,7 +68,14 @@ PollingFallback::PollingFallback(drogon::orm::DbClientPtr db,
     : db_(std::move(db))
     , shutdown_(std::move(shutdown_requested))
     , opts_(std::move(opts))
-{}
+{
+    if (opts_.sleep_chunk <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument("PollingFallback sleep_chunk must be positive");
+    }
+    if (opts_.interval <= std::chrono::seconds::zero()) {
+        throw std::invalid_argument("PollingFallback interval must be positive");
+    }
+}
 
 drogon::Task<int> PollingFallback::sweep_once()
 {
