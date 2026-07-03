@@ -12,8 +12,11 @@ namespace wikore::ingest {
 //
 // Implementations:
 //   PlainTextParser  - plain text and Markdown (detects # headings)
-//
-// Future: PdfParser, HtmlParser, DocxParser
+//   PdfParser        - PDF via poppler-cpp (outline -> heading hierarchy;
+//                      font-size heuristic fallback when no outline)
+//   DocxParser       - Office Open XML (.docx) via minizip + pugixml
+//                      (w:pStyle HeadingN detection, table flattening)
+//   HtmlParser       - HTML via libxml2 (h1-h6 hierarchy, script/style strip)
 // ---------------------------------------------------------------------------
 
 class ParserPort {
@@ -39,6 +42,81 @@ public:
 // ---------------------------------------------------------------------------
 
 class PlainTextParser : public ParserPort {
+public:
+    Result<ParsedDocument> parse(const std::string& content,
+                                 const std::string& filename,
+                                 const std::string& mime_type) const override;
+};
+
+// ---------------------------------------------------------------------------
+// PdfParser: handles application/pdf.
+//
+// Heading strategy:
+//   1. PDF outline (ToC). If the document has an outline with up to
+//      kMaxTocEntries entries, the outline titles are used as section headings.
+//      Section bodies are assigned by progressively searching for each title
+//      in the extracted text: each title is sought only after the previous
+//      match ends. Title search is case-insensitive and collapses internal
+//      whitespace to handle poppler line-break artefacts.
+//
+//      Known limitation: if the PDF has a printed contents page, the first
+//      occurrence of each heading title appears there rather than in the body.
+//      The progressive search finds those ToC-page occurrences, so short
+//      sections cluster on the contents page and most body text lands under
+//      the final heading. Reliable boundary placement requires PDF outline
+//      destinations (page numbers), which the poppler C++ toc_item API does
+//      not expose; the poppler C API would be needed to implement that. For
+//      now the outline-based split is accepted as a best-effort approach that
+//      is richer than flat output for documents without a printed ToC.
+//
+//   2. Flat fallback. Used when: no outline exists, the outline exceeds
+//      kMaxTocEntries (adversarial/generated PDFs), or fewer than half the
+//      outline titles match anywhere in the extracted text.
+//
+// Password-protected, corrupt, or empty documents return Error::invalid_input.
+// ---------------------------------------------------------------------------
+
+class PdfParser : public ParserPort {
+public:
+    Result<ParsedDocument> parse(const std::string& content,
+                                 const std::string& filename,
+                                 const std::string& mime_type) const override;
+};
+
+// ---------------------------------------------------------------------------
+// DocxParser: handles
+//   application/vnd.openxmlformats-officedocument.wordprocessingml.document
+//
+// Extracts text from word/document.xml inside the ZIP container.
+// Heading detection: w:pStyle with val matching "Heading1".."Heading9"
+//   (locale-invariant; also matches "heading1" lower-case variants).
+// Tables are flattened: cells separated by " | ", rows by newline.
+// Tracked-change deletions (w:del) are suppressed; insertions (w:ins)
+//   are included.
+// Footnotes and endnotes (word/footnotes.xml, word/endnotes.xml) are
+//   appended as a flat "Notes" section if present.
+// ---------------------------------------------------------------------------
+
+class DocxParser : public ParserPort {
+public:
+    Result<ParsedDocument> parse(const std::string& content,
+                                 const std::string& filename,
+                                 const std::string& mime_type) const override;
+};
+
+// ---------------------------------------------------------------------------
+// HtmlParser: handles text/html.
+//
+// Uses libxml2's HTML parser (robust against real-world malformed markup).
+// h1-h6 elements define the section hierarchy at depths 1-6.
+// <script>, <style>, <head>, hidden elements (display:none, visibility:hidden,
+//   aria-hidden="true") and HTML comments are stripped before text extraction.
+// <table> cells are joined with " | "; rows separated by newline.
+// <a> anchors keep their text; href is discarded.
+// Output is UTF-8; the parser handles charset meta tags and BOM.
+// ---------------------------------------------------------------------------
+
+class HtmlParser : public ParserPort {
 public:
     Result<ParsedDocument> parse(const std::string& content,
                                  const std::string& filename,

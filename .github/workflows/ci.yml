@@ -44,7 +44,11 @@ jobs:
             libjsoncpp-dev \
             libpq-dev \
             uuid-dev \
-            git
+            git \
+            libpoppler-cpp-dev \
+            libminizip-dev \
+            libpugixml-dev \
+            libxml2-dev
 
       # Cache the entire build directory keyed on dependencies.cmake.
       # This preserves CMakeCache.txt + Ninja files + compiled dep artifacts
@@ -148,7 +152,11 @@ jobs:
             libpq-dev \
             libspdlog-dev \
             uuid-dev \
-            postgresql-client
+            postgresql-client \
+            libpoppler-cpp-dev \
+            libminizip-dev \
+            libpugixml-dev \
+            libxml2-dev
 
       - name: Download test binary
         uses: actions/download-artifact@v4

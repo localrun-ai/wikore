@@ -28,5 +28,8 @@ target_link_libraries(wikore_tests PRIVATE
     Catch2::Catch2WithMain
     wikore_warnings
 )
+target_compile_definitions(wikore_tests PRIVATE
+    TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+)
 include(Catch)
 catch_discover_tests(wikore_tests)
