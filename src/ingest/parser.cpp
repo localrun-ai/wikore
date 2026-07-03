@@ -69,7 +69,11 @@ Result<std::string> resolve_text_mime(const std::string& content,
             return std::string{
                 "application/vnd.openxmlformats-officedocument"
                 ".presentationml.presentation"};
-        // xlsx/xls not yet supported
+        if (ext == ".xlsx")
+            return std::string{
+                "application/vnd.openxmlformats-officedocument"
+                ".spreadsheetml.sheet"};
+        // Legacy xls not supported
         return std::unexpected(Error::invalid_input("ingest.unsupported_format.office"));
     }
     if (content.find('\0') != std::string::npos)
@@ -405,6 +409,37 @@ PlainTextParser::parse(const std::string& content,
         append_text(s);
 
     return doc;
+}
+
+// ---------------------------------------------------------------------------
+// DispatchingParser::parse
+// ---------------------------------------------------------------------------
+
+Result<ParsedDocument> DispatchingParser::parse(const std::string& content,
+                                                 const std::string& filename,
+                                                 const std::string& /*hint*/) const
+{
+    auto mime_res = resolve_text_mime(content, filename, {});
+    if (!mime_res) return std::unexpected(mime_res.error());
+    const std::string& mime = *mime_res;
+
+    if (mime == "application/pdf")
+        return PdfParser{}.parse(content, filename, mime);
+    if (mime == "application/vnd.openxmlformats-officedocument"
+                ".wordprocessingml.document")
+        return DocxParser{}.parse(content, filename, mime);
+    if (mime == "application/vnd.openxmlformats-officedocument"
+                ".presentationml.presentation")
+        return PptxParser{}.parse(content, filename, mime);
+    if (mime == "application/vnd.openxmlformats-officedocument"
+                ".spreadsheetml.sheet")
+        return XlsxParser{}.parse(content, filename, mime);
+    if (mime == "application/vnd.oasis.opendocument.text")
+        return OdtParser{}.parse(content, filename, mime);
+    if (mime == "text/html")
+        return HtmlParser{}.parse(content, filename, mime);
+    // text/plain, text/markdown, and all routed text/* MIME types
+    return PlainTextParser{}.parse(content, filename, mime);
 }
 
 } // namespace wikore::ingest

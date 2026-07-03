@@ -68,7 +68,7 @@ int main()
         g_shutdown.store(true);
     });
 
-    auto parser = std::make_shared<wikore::ingest::PlainTextParser>();
+    auto parser = std::make_shared<wikore::ingest::DispatchingParser>();
 
     // The worker is constructed inside queueInLoop because Db::get() is
     // only valid once drogon's framework has initialised. Static so the

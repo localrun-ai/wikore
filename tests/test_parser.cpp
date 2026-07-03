@@ -1040,3 +1040,128 @@ TEST_CASE("OdtParser: office:text buried beyond find-text depth cap returns erro
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().message == "ingest.odt.no_text_body");
 }
+
+// ===========================================================================
+// XlsxParser tests
+// ===========================================================================
+
+TEST_CASE("XlsxParser: basic two-sheet workbook produces sections",
+          "[parser][xlsx]")
+{
+    XlsxParser p;
+    auto content = load_fixture("test.xlsx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "test.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    REQUIRE(r.has_value());
+    // Sheet 1: "Staff", Sheet 2: "Totals"
+    REQUIRE(r->sections.size() == 2);
+    CHECK(r->sections[0].heading == "Staff");
+    CHECK(r->sections[1].heading == "Totals");
+}
+
+TEST_CASE("XlsxParser: sheet 1 rows contain expected values",
+          "[parser][xlsx]")
+{
+    XlsxParser p;
+    auto content = load_fixture("test.xlsx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "test.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    REQUIRE(r.has_value());
+    REQUIRE(r->sections.size() >= 1);
+    const auto& body = r->sections[0].text;
+    CHECK(body.find("Alice") != std::string::npos);
+    CHECK(body.find("Engineering") != std::string::npos);
+    CHECK(body.find("95000") != std::string::npos);
+    CHECK(body.find("Bob") != std::string::npos);
+}
+
+TEST_CASE("XlsxParser: full_text concatenates all sheets",
+          "[parser][xlsx]")
+{
+    XlsxParser p;
+    auto content = load_fixture("test.xlsx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "test.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    REQUIRE(r.has_value());
+    CHECK(r->full_text.find("Alice") != std::string::npos);
+    CHECK(r->full_text.find("Summary") != std::string::npos);
+}
+
+TEST_CASE("XlsxParser: not-a-zip content returns mime_type_mismatch",
+          "[parser][xlsx]")
+{
+    XlsxParser p;
+    const std::string bad = "not a zip file";
+    auto r = p.parse(bad, "data.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.mime_type_mismatch");
+}
+
+TEST_CASE("XlsxParser: empty content returns invalid_input",
+          "[parser][xlsx]")
+{
+    XlsxParser p;
+    auto r = p.parse("", "empty.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.empty_file");
+}
+
+TEST_CASE("XlsxParser: section depth is 1",
+          "[parser][xlsx]")
+{
+    XlsxParser p;
+    auto content = load_fixture("test.xlsx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "test.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    REQUIRE(r.has_value());
+    for (const auto& s : r->sections)
+        CHECK(s.depth == 1);
+}
+
+// ---------------------------------------------------------------------------
+// DispatchingParser tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("DispatchingParser: routes .xlsx to XlsxParser",
+          "[parser][dispatcher]")
+{
+    DispatchingParser p;
+    auto content = load_fixture("test.xlsx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "data.xlsx", {});
+    REQUIRE(r.has_value());
+    CHECK(r->sections.size() >= 1);
+}
+
+TEST_CASE("DispatchingParser: routes .pdf to PdfParser",
+          "[parser][dispatcher]")
+{
+    DispatchingParser p;
+    auto content = load_fixture("flat.pdf");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "doc.pdf", {});
+    REQUIRE(r.has_value());
+}
+
+TEST_CASE("DispatchingParser: routes .txt to PlainTextParser",
+          "[parser][dispatcher]")
+{
+    DispatchingParser p;
+    auto r = p.parse("hello world", "notes.txt", {});
+    REQUIRE(r.has_value());
+    CHECK(r->full_text.find("hello") != std::string::npos);
+}
+
+TEST_CASE("DispatchingParser: unsupported binary extension returns error",
+          "[parser][dispatcher]")
+{
+    DispatchingParser p;
+    auto r = p.parse("\x89PNG\r\n\x1a\n", "image.png", {});
+    REQUIRE_FALSE(r.has_value());
+}
