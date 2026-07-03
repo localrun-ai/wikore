@@ -43,7 +43,33 @@ SEC1='5ec10001-0000-0000-0000-000000000000'     # document_section (for K5 test)
 # --------------------------------------------------------------------------
 echo "-- Starting $PG_IMAGE container ($CONTAINER)..."
 docker run --rm -e POSTGRES_PASSWORD=test -d --name "$CONTAINER" "$PG_IMAGE" > /dev/null
-until docker exec "$CONTAINER" psql -U postgres -c '\q' 2>/dev/null; do sleep 1; done
+
+# Robust readiness gate. The official postgres image runs a TEMPORARY server to
+# perform initdb and then restarts the real one. A naive "can I connect?" probe
+# can succeed against that temporary server and then race its shutdown: the
+# socket disappears and the next psql fails with "No such file or directory".
+# So wait for the entrypoint's init-complete marker first (the boundary after
+# which only the real server runs), THEN for that server to accept connections.
+echo "-- Waiting for Postgres to finish init..."
+for _ in $(seq 1 120); do
+  docker logs "$CONTAINER" 2>&1 | grep -q "init process complete" && break
+  sleep 1
+done
+echo "-- Waiting for Postgres to accept connections..."
+ready=0
+for _ in $(seq 1 120); do
+  if docker exec "$CONTAINER" pg_isready -U postgres -q 2>/dev/null \
+     && docker exec "$CONTAINER" psql -U postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+    ready=1; break
+  fi
+  sleep 1
+done
+if [ "$ready" -ne 1 ]; then
+  echo "-- Postgres did not become ready; recent container logs:"
+  docker logs --tail 40 "$CONTAINER" 2>&1 || true
+  docker rm -f "$CONTAINER" > /dev/null 2>&1 || true
+  exit 1
+fi
 
 psql() { docker exec "$CONTAINER" psql -U postgres -At "$@"; }
 sql()  { psql -c "$1"; }
