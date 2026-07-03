@@ -16,9 +16,10 @@ short-lived coordination.
 > cache, sensitivity clearance, the Qdrant prefilter builder, the EvidenceGate
 > authorization boundary, and the retrieval orchestrator - implemented and tested
 > at the library level (see [`docs/iteration_2_design.md`](docs/iteration_2_design.md)).
-> Wiring those into HTTP retrieval routes, as-of and section-expanded retrieval,
-> ACL resynchronization, non-text parsers, the chat pipeline, wiki features, and
-> the evaluation CLI are still under development.
+> The scheduler also refreshes stale ACL payloads in every affected Qdrant
+> collection without re-embedding. Wiring retrieval into HTTP routes, as-of and
+> section-expanded retrieval, non-text parsers, the chat pipeline, wiki features,
+> and the evaluation CLI are still under development.
 
 ## Architecture
 
@@ -31,7 +32,7 @@ flowchart LR
     Queue --> Ingest[wikore_ingest]
     Ingest -->|chunks + audit + outbox<br/>one transaction| PG
 
-    PG -->|claim outbox events| Scheduler[wikore_scheduler]
+    PG -->|ingest + ACL-resync<br/>outbox events| Scheduler[wikore_scheduler]
     Scheduler --> Embed[OpenAI-compatible<br/>embedding endpoint]
     Scheduler --> Qdrant[(Qdrant<br/>derived vector index)]
     Scheduler -->|vector bookkeeping| PG
@@ -47,7 +48,10 @@ flowchart LR
 Embedding and Qdrant writes do not occur inside the ingest transaction. The
 ingest worker commits the durable document state and an outbox event first. The
 scheduler later embeds the committed chunks, upserts deterministic Qdrant
-points, and records the chunk-to-vector mapping in PostgreSQL.
+points, and records the chunk-to-vector mapping in PostgreSQL. ACL changes
+enqueue separate resync events; the scheduler recomputes visibility from live
+PostgreSQL state and patches the affected payloads in every Qdrant collection
+without re-embedding.
 
 ### Components
 
@@ -55,7 +59,7 @@ points, and records the chunk-to-vector mapping in PostgreSQL.
 | --- | --- | --- |
 | `wikore_api` | Authenticated document, organization, wiki, chat, and administration API | Health route works; most application routes return `501` |
 | `wikore_ingest` | Fair per-tenant queue consumption, parsing, chunking, and transactional persistence | Implemented for plain text and Markdown |
-| `wikore_scheduler` | Outbox draining, embedding, Qdrant indexing, stale-claim recovery, and ingest recovery sweeps | Iteration 1 path implemented |
+| `wikore_scheduler` | Ingest and ACL-resync outbox draining, embedding, multi-collection Qdrant payload refresh, ingest recovery sweeps, and partition maintenance | Iteration 1 and ACL-resync paths implemented |
 | `wikore_eval` | Retrieval and answer-quality evaluation harness | Startup stub; planned for a later iteration |
 
 The source is organized as a modular monolith, while expensive and scheduled
@@ -87,8 +91,8 @@ in-memory test adapters.
   tenant, lifecycle, sensitivity, and resource visibility resolved from
   `resource_grants` and `org_unit_closure`. The Qdrant payload is a recall
   prefilter, never the access authority, so a stale index can only drop
-  candidates, never leak one. ACL resynchronization of the index and as-of
-  retrieval are still being finalized.
+  candidates, never leak one. The scheduler asynchronously resynchronizes stale
+  ACL payloads; as-of retrieval is still under development.
 
 ## Ingestion Flow
 
@@ -108,10 +112,12 @@ in-memory test adapters.
 7. The scheduler records `document_chunk_vectors` rows and marks the outbox
    event complete. Transient failures use persisted exponential backoff.
 
-On shutdown, workers drain in-flight work before exiting. If an ingest worker
-dies, the scheduler can recover its processing list or requeue a stale database
-claim. Poison jobs have a bounded resume budget and eventually transition to
-`error` rather than looping forever.
+On shutdown, all four scheduler workers drain in-flight work before exiting.
+Long polling and partition-maintenance sleeps wake in bounded chunks so
+SIGTERM/SIGINT is observed promptly. If an ingest worker dies, the scheduler can
+recover its processing list or requeue a stale database claim. Poison jobs have
+a bounded resume budget and eventually transition to `error` rather than
+looping forever.
 
 ## Access Resolution and Retrieval (Iteration 2)
 
@@ -311,7 +317,7 @@ CI runs three required jobs on every pull request:
 
 Implemented foundation:
 
-- PostgreSQL migrations through V030, including tenant constraints, lifecycle
+- PostgreSQL migrations through V032, including tenant constraints, lifecycle
   state, append-only records, temporal access history, outbox retries, and ingest
   ownership tokens.
 - Hardened UTF-8 plain-text and Markdown parsing with size, MIME, binary,
@@ -331,13 +337,17 @@ Implemented foundation:
 - V031-V032 migrations: runtime partition maintenance, and the ACL epoch,
   per-document version, and per-user scope-epoch columns with same-transaction
   bump triggers.
+- Qdrant ACL resynchronization: the scheduler serializes ingest and resync per
+  document, recomputes visibility from PostgreSQL, and refreshes schema-v3
+  payloads across every indexed embedding-model collection without
+  re-embedding.
 
 Not yet complete:
 
 - Production document upload and administration routes, and HTTP retrieval
   routes wiring the orchestrator to a live embedder and Qdrant.
-- As-of and section-expanded retrieval, the Qdrant ACL resynchronization worker,
-  and the schema-v3 payload backfill.
+- As-of and section-expanded retrieval, and execution of the one-time schema-v3
+  payload backfill for pre-existing points.
 - PDF, DOCX, HTML, and other rich-document parsers.
 - Reranking, answer generation, and SSE streaming.
 - Wiki operations, MCP integrations, retention jobs, and the evaluation harness.
