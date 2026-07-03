@@ -671,50 +671,15 @@ TEST_CASE("PdfParser: real ToC produces nested children not flat list",
 TEST_CASE("DocxParser: footnotes are extracted into Notes section",
           "[parser][docx]")
 {
-    // Build a DOCX with a footnote
-    auto make_docx_with_footnote = [] {
-        const char* doc_xml = R"(<?xml version="1.0" encoding="UTF-8"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-  <w:body>
-    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
-         <w:r><w:t>Main Section</w:t></w:r></w:p>
-    <w:p><w:r><w:t>Body text here.</w:t></w:r></w:p>
-  </w:body>
-</w:document>)";
-        const char* fn_xml = R"(<?xml version="1.0" encoding="UTF-8"?>
-<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-  <w:footnote w:id="0" w:type="separator"/>
-  <w:footnote w:id="1">
-    <w:p><w:r><w:t>This is a footnote.</w:t></w:r></w:p>
-  </w:footnote>
-</w:footnotes>)";
-        const char* rels = R"(<?xml version="1.0"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>)";
-        const char* ct = R"(<?xml version="1.0"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Override PartName="/word/document.xml"
-    ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-</Types>)";
-        // Write component files and zip them
-        {auto f = std::ofstream("/tmp/_ct.xml"); f << ct;}
-        {auto f = std::ofstream("/tmp/_rels.xml"); f << rels;}
-        {auto f = std::ofstream("/tmp/_doc.xml"); f << doc_xml;}
-        {auto f = std::ofstream("/tmp/_fn.xml"); f << fn_xml;}
-        ::system("python3 -c \"import zipfile,io; buf=io.BytesIO(); z=zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED); [z.writestr(n,open(p).read()) for n,p in [('[Content_Types].xml','/tmp/_ct.xml'),('_rels/.rels','/tmp/_rels.xml'),('word/_rels/document.xml.rels','/tmp/_rels.xml'),('word/document.xml','/tmp/_doc.xml'),('word/footnotes.xml','/tmp/_fn.xml')]]; z.close(); open('/tmp/_test_fn.docx','wb').write(buf.getvalue())\"");
-        std::ifstream f("/tmp/_test_fn.docx", std::ios::binary);
-        return std::string{std::istreambuf_iterator<char>(f), {}};
-    };
-
-    auto content = make_docx_with_footnote();
-    REQUIRE_FALSE(content.empty());
+    // Uses tests/fixtures/footnotes.docx (pre-generated, checked in).
+    // Contains one Heading1 section with body text and one footnote.
     DocxParser p;
-    auto r = p.parse(content, "fn.docx",
+    auto content = load_fixture("footnotes.docx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "footnotes.docx",
                      "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
     REQUIRE(r.has_value());
-    // The footnote text must appear somewhere (in full_text or Notes section)
     CHECK(r->full_text.find("footnote") != std::string::npos);
-    // There should be a Notes section
     bool found_notes = false;
     for (const auto& s : r->sections)
         if (s.heading == "Notes") found_notes = true;
@@ -797,4 +762,281 @@ TEST_CASE("PdfParser: outline with many entries falls back to flat section",
     auto r = p.parse(content, "flat.pdf", "application/pdf");
     REQUIRE(r.has_value());
     CHECK(!r->full_text.empty());
+}
+
+// ==========================================================================
+// PptxParser tests
+// ==========================================================================
+
+TEST_CASE("PptxParser: empty content is rejected", "[parser][pptx]")
+{
+    PptxParser p;
+    auto r = p.parse("", "empty.pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.empty_file");
+}
+
+TEST_CASE("PptxParser: non-ZIP magic bytes rejected", "[parser][pptx][security]")
+{
+    PptxParser p;
+    auto r = p.parse("Not a ZIP", "fake.pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.mime_type_mismatch");
+}
+
+TEST_CASE("PptxParser: basic fixture - 3 slides, titles and bodies extracted",
+          "[parser][pptx]")
+{
+    PptxParser p;
+    auto content = load_fixture("test.pptx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "test.pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation");
+    REQUIRE(r.has_value());
+    const auto& doc = *r;
+
+    CHECK(doc.mime_type.find("presentationml") != std::string::npos);
+    CHECK(doc.sections.size() == 3);
+
+    // All sections at depth 1
+    for (const auto& s : doc.sections)
+        CHECK(s.depth == 1);
+
+    // Titles from each slide
+    CHECK(doc.sections[0].heading == "Introduction");
+    CHECK(doc.sections[1].heading == "Background");
+    CHECK(doc.sections[2].heading == "Conclusion");
+
+    // Body text present
+    CHECK(doc.sections[0].text.find("First bullet") != std::string::npos);
+    CHECK(doc.sections[1].text.find("Background section") != std::string::npos);
+    CHECK(doc.sections[2].text.find("Key takeaways") != std::string::npos);
+
+    // full_text contains body (not necessarily titles)
+    CHECK(!doc.full_text.empty());
+    CHECK(doc.full_text.find('\r') == std::string::npos);
+}
+
+TEST_CASE("PptxParser: PDF disguised as PPTX is rejected",
+          "[parser][pptx][security]")
+{
+    PptxParser p;
+    auto content = load_fixture("flat.pdf");
+    auto r = p.parse(content, "disguised.pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.mime_type_mismatch");
+}
+
+// ==========================================================================
+// OdtParser tests
+// ==========================================================================
+
+TEST_CASE("OdtParser: empty content is rejected", "[parser][odt]")
+{
+    OdtParser p;
+    auto r = p.parse("", "empty.odt",
+                     "application/vnd.oasis.opendocument.text");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.empty_file");
+}
+
+TEST_CASE("OdtParser: non-ZIP magic bytes rejected", "[parser][odt][security]")
+{
+    OdtParser p;
+    auto r = p.parse("Not a ZIP", "fake.odt",
+                     "application/vnd.oasis.opendocument.text");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.mime_type_mismatch");
+}
+
+TEST_CASE("OdtParser: basic fixture - headings, body, and table extracted",
+          "[parser][odt]")
+{
+    OdtParser p;
+    auto content = load_fixture("test.odt");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "test.odt",
+                     "application/vnd.oasis.opendocument.text");
+    REQUIRE(r.has_value());
+    const auto& doc = *r;
+
+    CHECK(doc.mime_type == "application/vnd.oasis.opendocument.text");
+
+    // Two depth-1 headings
+    auto h1s = std::count_if(doc.sections.begin(), doc.sections.end(),
+        [](const ParsedSection& s) { return s.depth == 1; });
+    CHECK(h1s == 2);
+
+    // "Executive Summary" at depth 1, "Key Points" at depth 2 as child
+    REQUIRE(doc.sections.size() >= 1);
+    CHECK(doc.sections[0].heading == "Executive Summary");
+    CHECK(doc.sections[0].depth   == 1);
+    REQUIRE(!doc.sections[0].children.empty());
+    CHECK(doc.sections[0].children[0].heading == "Key Points");
+    CHECK(doc.sections[0].children[0].depth   == 2);
+
+    // Body text present
+    CHECK(doc.sections[0].text.find("executive summary") != std::string::npos);
+
+    // Table flattened
+    const auto& key_points = doc.sections[0].children[0];
+    CHECK(key_points.text.find("Item A | Value 1") != std::string::npos);
+
+    // "Conclusion" is the second depth-1 section
+    CHECK(doc.sections.back().heading == "Conclusion");
+
+    CHECK(!doc.full_text.empty());
+    CHECK(doc.full_text.find('\r') == std::string::npos);
+}
+
+TEST_CASE("OdtParser: PDF disguised as ODT is rejected",
+          "[parser][odt][security]")
+{
+    OdtParser p;
+    auto content = load_fixture("flat.pdf");
+    auto r = p.parse(content, "disguised.odt",
+                     "application/vnd.oasis.opendocument.text");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.mime_type_mismatch");
+}
+
+TEST_CASE("OdtParser: ZIP without content.xml is rejected", "[parser][odt]")
+{
+    // Minimal EOCD-only bytes that pass PK magic but have no content.xml
+    // Actually PK\x05\x06 fails the magic check (not \x03\x04).
+    // Use a valid but empty ZIP (no content.xml inside).
+    // We can reuse a DOCX fixture which is a ZIP but has no content.xml.
+    OdtParser p;
+    auto content = load_fixture("test.docx");
+    auto r = p.parse(content, "wrong.odt",
+                     "application/vnd.oasis.opendocument.text");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.odt.missing_content_xml");
+}
+
+// ==========================================================================
+// PR #39 security / correctness regression tests
+// ==========================================================================
+
+TEST_CASE("OdtParser: <text:s text:c=> with large count does not OOM",
+          "[parser][odt][security]")
+{
+    // <text:s text:c="2147483647"/> would attempt a ~2 GB allocation without
+    // the kMaxOdtSpaceExpansion cap. The parser must survive and produce
+    // capped (<=256) space output, not attempt a giant allocation.
+    OdtParser p;
+    const std::string xml_str = R"odt(<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:body><office:text>
+    <text:p>before<text:s text:c="2147483647"/>after</text:p>
+  </office:text></office:body>
+</office:document-content>)odt";
+
+    // Wrap in an in-memory ODT ZIP
+    auto make_odt = [](const std::string& content_xml) {
+        // Write component files
+        {std::ofstream f("/tmp/_odt_test.xml"); f << content_xml;}
+        ::system(
+            "python3 -c \""
+            "import zipfile,io; buf=io.BytesIO();"
+            "z=zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED);"
+            "z.writestr('mimetype','application/vnd.oasis.opendocument.text');"
+            "z.writestr('content.xml',open('/tmp/_odt_test.xml').read());"
+            "z.close();"
+            "open('/tmp/_odt_out.odt','wb').write(buf.getvalue())"
+            "\"");
+        std::ifstream f("/tmp/_odt_out.odt", std::ios::binary);
+        return std::string{std::istreambuf_iterator<char>(f), {}};
+    };
+
+    auto odt_bytes = make_odt(xml_str);
+    REQUIRE_FALSE(odt_bytes.empty());
+
+    auto r = p.parse(odt_bytes, "bigspace.odt",
+                     "application/vnd.oasis.opendocument.text");
+    REQUIRE(r.has_value());
+    // The output must contain "before" and "after" with at most 256 spaces
+    CHECK(r->full_text.find("before") != std::string::npos);
+    CHECK(r->full_text.find("after")  != std::string::npos);
+    // Spaces between them must be capped, not 2 billion
+    auto b = r->full_text.find("before");
+    auto a = r->full_text.find("after");
+    REQUIRE(b != std::string::npos);
+    REQUIRE(a != std::string::npos);
+    CHECK(a - (b + 6) <= 256);  // at most 256 spaces between
+}
+
+TEST_CASE("PptxParser: title-only slide body is indexed (not silently lost)",
+          "[parser][pptx]")
+{
+    // Uses tests/fixtures/title_only.pptx (pre-generated, checked in).
+    PptxParser p;
+    auto content = load_fixture("title_only.pptx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "title_only.pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation");
+    REQUIRE(r.has_value());
+    REQUIRE(r->sections.size() == 1);
+    CHECK(r->sections[0].heading == "Title Only Slide");
+    CHECK(r->sections[0].text == "Title Only Slide");
+    CHECK(r->full_text == "Title Only Slide");
+}
+
+// ==========================================================================
+// PR #39 round-2 regression tests
+// ==========================================================================
+
+TEST_CASE("OdtParser: deeply nested spans trigger limit and return error",
+          "[parser][odt][security]")
+{
+    // Uses tests/fixtures/deep_span.odt (pre-generated, checked in).
+    // Contains 300 levels of nested text:span — well above kOdtMaxSpanDepth (64).
+    // The depth guard fires, lim.truncated is set, and OdtParser::parse must
+    // return an explicit error rather than partial content.
+    OdtParser p;
+    auto content = load_fixture("deep_span.odt");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "deep_span.odt",
+                     "application/vnd.oasis.opendocument.text");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.odt.content_limit_exceeded");
+}
+
+TEST_CASE("PptxParser: alternate namespace prefix on nvSpPr detects title correctly",
+          "[parser][pptx]")
+{
+    // Uses tests/fixtures/alt_ns_title.pptx (pre-generated, checked in).
+    // The nvSpPr element uses prefix "x:" instead of "p:"; child("p:nvSpPr")
+    // would silently miss it. Local-name matching must still detect the title.
+    PptxParser p;
+    auto content = load_fixture("alt_ns_title.pptx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "alt_ns_title.pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation");
+    REQUIRE(r.has_value());
+    REQUIRE(r->sections.size() == 1);
+    CHECK(r->sections[0].heading == "Alt Prefix Title");
+    CHECK(r->sections[0].text.find("Body text") != std::string::npos);
+}
+
+TEST_CASE("OdtParser: office:text buried beyond find-text depth cap returns error",
+          "[parser][odt][security]")
+{
+    // Uses tests/fixtures/deep_wrapper.odt (pre-generated, checked in).
+    // office:text is wrapped by 43 elements before it -- well beyond
+    // kOdtFindTextMaxDepth (32). The iterative BFS stops enqueuing children
+    // at depth 32, so office:text is never reached and the parser returns
+    // ingest.odt.no_text_body rather than overflowing the stack.
+    OdtParser p;
+    auto content = load_fixture("deep_wrapper.odt");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "deep_wrapper.odt",
+                     "application/vnd.oasis.opendocument.text");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.odt.no_text_body");
 }

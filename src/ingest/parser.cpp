@@ -55,7 +55,8 @@ Result<std::string> resolve_text_mime(const std::string& content,
 
     if (ext == ".pdf" && !is_pdf)
         return std::unexpected(Error::invalid_input("ingest.mime_type_mismatch"));
-    if ((ext == ".docx" || ext == ".xlsx" || ext == ".pptx") && !is_zip)
+    if ((ext == ".docx" || ext == ".xlsx" || ext == ".pptx"
+         || ext == ".odp" || ext == ".ods") && !is_zip)
         return std::unexpected(Error::invalid_input("ingest.mime_type_mismatch"));
     if (is_pdf)
         return std::string{"application/pdf"};
@@ -64,7 +65,11 @@ Result<std::string> resolve_text_mime(const std::string& content,
             return std::string{
                 "application/vnd.openxmlformats-officedocument"
                 ".wordprocessingml.document"};
-        // xlsx/pptx not yet supported
+        if (ext == ".pptx")
+            return std::string{
+                "application/vnd.openxmlformats-officedocument"
+                ".presentationml.presentation"};
+        // xlsx/xls not yet supported
         return std::unexpected(Error::invalid_input("ingest.unsupported_format.office"));
     }
     if (content.find('\0') != std::string::npos)
@@ -76,6 +81,8 @@ Result<std::string> resolve_text_mime(const std::string& content,
         return std::string{"text/plain"};
     if (ext == ".html" || ext == ".htm")
         return std::string{"text/html"};
+    if (ext == ".odt")
+        return std::string{"application/vnd.oasis.opendocument.text"};
 
     if (mime_type == "text/markdown" || mime_type == "text/plain")
         return mime_type;

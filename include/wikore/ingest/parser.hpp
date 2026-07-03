@@ -105,6 +105,42 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// PptxParser: handles
+//   application/vnd.openxmlformats-officedocument.presentationml.presentation
+//
+// Slide order is read from ppt/_rels/presentation.xml.rels (falls back to
+// numeric sort of ppt/slides/slide*.xml). Each slide becomes one
+// ParsedSection at depth 1. The title shape (<p:ph type="title"> or
+// <p:ph type="ctrTitle">) becomes the section heading; all other shape text
+// is the section body. Speaker notes are not extracted.
+// ---------------------------------------------------------------------------
+
+class PptxParser : public ParserPort {
+public:
+    Result<ParsedDocument> parse(const std::string& content,
+                                 const std::string& filename,
+                                 const std::string& mime_type) const override;
+};
+
+// ---------------------------------------------------------------------------
+// OdtParser: handles application/vnd.oasis.opendocument.text (.odt)
+//
+// Extracts text from content.xml inside the ZIP. Heading detection:
+//   <text:h text:outline-level="N"> maps to ParsedSection depth N (1..6).
+//   <text:p> becomes body text.
+//   <table:table> is flattened: cells " | ", rows newline.
+//   <text:list> items are prefixed with "- ".
+//   <text:span> is transparent (text extracted, markup discarded).
+// ---------------------------------------------------------------------------
+
+class OdtParser : public ParserPort {
+public:
+    Result<ParsedDocument> parse(const std::string& content,
+                                 const std::string& filename,
+                                 const std::string& mime_type) const override;
+};
+
+// ---------------------------------------------------------------------------
 // HtmlParser: handles text/html.
 //
 // Uses libxml2's HTML parser (robust against real-world malformed markup).
