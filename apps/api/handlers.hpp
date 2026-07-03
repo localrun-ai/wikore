@@ -31,4 +31,13 @@ wiki_query(std::shared_ptr<rag::RetrievalOrchestrator> orch,
            drogon::HttpRequestPtr                      req,
            std::string                                 org_unit_id);
 
+// GET /api/me - the authenticated caller's identity + tenant.
+//
+// Behind AuthFilter, so `identity` is present and its user_id is the internal
+// users.id. Returns { user_id, email, display_name, is_admin, company_id }.
+// company_id is looked up from the (active) user row; a deactivated user is
+// rejected here too as defense in depth.
+drogon::Task<drogon::HttpResponsePtr>
+me(drogon::orm::DbClientPtr db, drogon::HttpRequestPtr req);
+
 } // namespace wikore::api
