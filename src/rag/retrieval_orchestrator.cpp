@@ -43,7 +43,7 @@ RetrievalOrchestrator::retrieve(const RequestContext& ctx,
     if (ctx.deadline_exceeded())
         co_return std::unexpected(Error::unavailable("retrieve: deadline exceeded after embed"));
     auto scope = co_await resolver_->resolve(
-        company, ctx.principal.user_id, scope_org_unit_id);
+        company, ctx.principal.user_id, scope_org_unit_id, ctx.deadline);
     if (!scope) co_return std::unexpected(scope.error());
 
     // 3. derive clearance - the single enforced sensitivity policy.
@@ -68,7 +68,8 @@ RetrievalOrchestrator::retrieve(const RequestContext& ctx,
     //    scope and clearance as the prefilter, so the two layers agree.
     if (ctx.deadline_exceeded())
         co_return std::unexpected(Error::unavailable("retrieve: deadline exceeded before gate"));
-    auto allowed = co_await gate_.evaluate(company, *scope, labels, *candidates);
+    auto allowed = co_await gate_.evaluate(
+        company, *scope, labels, *candidates, {"active"}, ctx.deadline);
     if (!allowed) co_return std::unexpected(allowed.error());
 
     // Return up to `limit`, in the gate-preserved (retrieval score) order.

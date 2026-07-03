@@ -1,5 +1,6 @@
 #pragma once
 #include "wikore/domain/types.hpp"
+#include "wikore/adapters/postgres/deadline_exec.hpp"
 #include <drogon/drogon.h>
 #include <cstdint>
 #include <memory>
@@ -41,10 +42,13 @@ class AccessResolverPort {
 public:
     virtual ~AccessResolverPort() = default;
 
+    // deadline bounds the DB work to the remaining request budget (Postgres
+    // statement_timeout); the default max() means unbounded.
     virtual drogon::Task<Result<AccessScope>>
     resolve(std::string_view company_id,
             std::string_view user_id,
-            std::string_view scope_org_unit_id) const = 0;
+            std::string_view scope_org_unit_id,
+            postgres::Deadline deadline = postgres::no_deadline()) const = 0;
 };
 
 class PostgresAccessResolver : public AccessResolverPort {
@@ -55,7 +59,8 @@ public:
     drogon::Task<Result<AccessScope>>
     resolve(std::string_view company_id,
             std::string_view user_id,
-            std::string_view scope_org_unit_id) const override;
+            std::string_view scope_org_unit_id,
+            postgres::Deadline deadline = postgres::no_deadline()) const override;
 
 private:
     drogon::orm::DbClientPtr db_;
@@ -86,7 +91,8 @@ public:
     drogon::Task<Result<AccessScope>>
     resolve(std::string_view company_id,
             std::string_view user_id,
-            std::string_view scope_org_unit_id) const override;
+            std::string_view scope_org_unit_id,
+            postgres::Deadline deadline = postgres::no_deadline()) const override;
 
 private:
     std::shared_ptr<AccessResolverPort> inner_;

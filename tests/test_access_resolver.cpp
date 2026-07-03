@@ -28,7 +28,8 @@ struct SpyResolver : wikore::AccessResolverPort {
     mutable int          calls = 0;
     wikore::AccessScope  canned;
     drogon::Task<wikore::Result<wikore::AccessScope>>
-    resolve(std::string_view, std::string_view, std::string_view) const override {
+    resolve(std::string_view, std::string_view, std::string_view,
+            wikore::postgres::Deadline) const override {
         ++calls;
         co_return canned;
     }
@@ -122,6 +123,36 @@ TEST_CASE("AccessResolver: unknown principal is NotFound", "[integration][access
         CO, "deadbeef-0000-0000-0000-000000000000", f.root));
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().kind == wikore::Error::Kind::NotFound);
+}
+
+TEST_CASE("exec_until: a query past the deadline is cancelled quickly, not run to completion",
+          "[integration][access_resolver]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+
+    // A 2s query with only a 100ms budget must be cancelled by the server's
+    // statement_timeout in ~100ms, not run the full 2s. This proves the
+    // deadline actually bounds DB awaits (Postgres SQLSTATE 57014).
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(100);
+    const auto t0 = std::chrono::steady_clock::now();
+    bool threw = false;
+    try {
+        drogon::sync_wait(wikore::postgres::exec_until(db, deadline,
+                                                       "SELECT pg_sleep(2)"));
+    } catch (const drogon::orm::DrogonDbException&) {
+        threw = true;   // query_canceled
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    CHECK(threw);
+    CHECK(elapsed < std::chrono::seconds(1));   // far below the 2s sleep
+
+    // The unbounded sentinel still runs normally (no statement_timeout).
+    auto ok = drogon::sync_wait(wikore::postgres::exec_until(
+        db, wikore::postgres::no_deadline(), "SELECT 1 AS x"));
+    CHECK(ok[0]["x"].as<int>() == 1);
 }
 
 TEST_CASE("AccessResolver: scope_epoch stamp advances after a membership change (V032 trigger)",

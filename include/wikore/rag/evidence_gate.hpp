@@ -1,6 +1,7 @@
 #pragma once
 #include "wikore/rag/types.hpp"
 #include "wikore/domain/types.hpp"
+#include "wikore/adapters/postgres/deadline_exec.hpp"
 #include <drogon/drogon.h>
 #include <string>
 #include <string_view>
@@ -36,12 +37,15 @@ public:
     // Returns only the candidates the authoritative state allows, hydrated and
     // in input (score) order. Fail-closed: empty scope, empty clearance, or no
     // candidates yields an empty result without a Postgres round-trip.
+    // deadline bounds the DB round-trip to the remaining request budget
+    // (Postgres statement_timeout); the default max() means unbounded.
     drogon::Task<Result<std::vector<AllowedCandidate>>>
     evaluate(std::string_view                   company_id,
              const AccessScope&                 scope,
              const std::vector<std::string>&    allowed_sensitivity_labels,
              const std::vector<ChunkCandidate>& candidates,
-             const std::vector<std::string>&    lifecycle = {"active"}) const;
+             const std::vector<std::string>&    lifecycle = {"active"},
+             postgres::Deadline                 deadline = postgres::no_deadline()) const;
 
 private:
     drogon::orm::DbClientPtr db_;

@@ -3,6 +3,7 @@
 #include "wikore/auth.hpp"           // Identity
 #include "wikore/domain/types.hpp"   // RequestContext, Error, uuid_generate
 #include "wikore/rag/types.hpp"      // AllowedCandidate
+#include "wikore/adapters/postgres/deadline_exec.hpp"  // exec_until
 
 #include <drogon/orm/Exception.h>
 #include <glaze/glaze.hpp>
@@ -117,6 +118,13 @@ wikore::api::wiki_query(std::shared_ptr<rag::RetrievalOrchestrator> orch,
                         std::string                                 org_unit_id)
 {
     try {
+        // The 30s budget covers the WHOLE request, so it is stamped before the
+        // first DB touch (tenant + org-unit lookups included) and reused for the
+        // RequestContext. Every DB step below runs through postgres::exec_until,
+        // which caps each query's statement_timeout at the time still remaining.
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+
         // 1. Identity. AuthFilter guarantees it; guard defensively.
         if (!req->getAttributes()->find("identity"))
             co_return json_error(drogon::k401Unauthorized, "unauthenticated");
@@ -143,7 +151,8 @@ wikore::api::wiki_query(std::shared_ptr<rag::RetrievalOrchestrator> orch,
         //    credential cannot keep retrieving documents after deactivation.
         std::string company_id;
         try {
-            auto rows = co_await db->execSqlCoro(
+            auto rows = co_await postgres::exec_until(
+                db, deadline,
                 "SELECT company_id FROM users "
                 "WHERE id=$1::uuid AND deactivated_at IS NULL", id.user_id);
             if (rows.empty())
@@ -158,7 +167,8 @@ wikore::api::wiki_query(std::shared_ptr<rag::RetrievalOrchestrator> orch,
         //    404 without distinguishing "absent" from "other tenant" so org
         //    unit existence never leaks across tenants.
         try {
-            auto rows = co_await db->execSqlCoro(
+            auto rows = co_await postgres::exec_until(
+                db, deadline,
                 "SELECT 1 FROM org_units WHERE id=$1::uuid AND company_id=$2::uuid",
                 org_unit_id, company_id);
             if (rows.empty())
@@ -177,7 +187,7 @@ wikore::api::wiki_query(std::shared_ptr<rag::RetrievalOrchestrator> orch,
                           .is_admin           = id.is_admin,
                           .is_service_account = false},
             .span      = {.trace_id = uuid_generate(), .span_id = uuid_generate()},
-            .deadline  = std::chrono::steady_clock::now() + std::chrono::seconds(30),
+            .deadline  = deadline,
         };
 
         // NOTE: single-collection retrieval - the orchestrator holds one

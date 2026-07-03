@@ -1,0 +1,53 @@
+#pragma once
+#include <drogon/orm/DbClient.h>
+#include <drogon/utils/coroutine.h>
+#include <chrono>
+#include <string>
+
+namespace wikore::postgres {
+
+// Convenience alias: a request deadline as a monotonic instant. The sentinel
+// max() means "no deadline" (unbounded).
+using Deadline = std::chrono::steady_clock::time_point;
+
+inline Deadline no_deadline() { return Deadline::max(); }
+
+// ---------------------------------------------------------------------------
+// exec_until - run one statement bounded by a request deadline.
+//
+// drogon exposes no per-call query timeout, and DbClient::setTimeout is
+// client-global (it would race across the shared connection pool). The only
+// safe per-request bound is a Postgres transaction-local statement_timeout:
+// pin a connection with a transaction, set statement_timeout to the
+// milliseconds remaining before `deadline`, then run the query. A query that
+// overruns is cancelled server-side (SQLSTATE 57014) and surfaces as a
+// DrogonDbException, exactly like any other query failure.
+//
+// A max() deadline means unbounded: the statement runs on the shared client
+// with no transaction, preserving the fast path for callers that carry no
+// deadline (background workers, tests).
+// ---------------------------------------------------------------------------
+template <typename... Args>
+drogon::Task<drogon::orm::Result>
+exec_until(drogon::orm::DbClientPtr db,
+           Deadline                 deadline,
+           std::string              sql,
+           Args... args)
+{
+    if (deadline == no_deadline())
+        co_return co_await db->execSqlCoro(sql, args...);
+
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  deadline - std::chrono::steady_clock::now()).count();
+    if (ms < 1) ms = 1;   // budget already spent: let the server cancel at once
+
+    // Transaction-local statement_timeout (third arg = is_local). It resets
+    // when the transaction ends, so nothing leaks back to the pooled
+    // connection.
+    auto trans = co_await db->newTransactionCoro();
+    co_await trans->execSqlCoro(
+        "SELECT set_config('statement_timeout', $1, true)", std::to_string(ms));
+    co_return co_await trans->execSqlCoro(sql, args...);
+}
+
+} // namespace wikore::postgres

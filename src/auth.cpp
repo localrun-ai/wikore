@@ -410,18 +410,6 @@ std::optional<Identity> validate_jwt(std::string_view token) {
 // API key validation
 // ---------------------------------------------------------------------------
 
-// Synchronous variant - uses Redis cache only (no DB). Intended for tests
-// and internal calls where async is not available.
-std::optional<Identity> validate_api_key(std::string_view key) {
-    if (key.empty()) return std::nullopt;
-    std::string hash = sha256_hex(key);
-    auto cached = Redis::get("lr:api_key:" + hash);
-    if (!cached) return std::nullopt;
-    Identity id;
-    (void)glz::read_json(id, *cached);
-    return id;
-}
-
 namespace {
 
 // Async variant used by AuthFilter. Falls back to DB on Redis miss.
@@ -440,18 +428,15 @@ static void validate_api_key_async(
     drogon::FilterChainCallback&& next)
 {
     std::string hash = sha256_hex(key);
-    std::string rk   = "lr:api_key:" + hash;
 
-    // No Redis read fast-path on the request route. The cache maps key_hash ->
-    // Identity but carries none of the state that can invalidate a credential
-    // (key revoked_at / expires_at, user deactivated_at), and nothing evicts
-    // lr:api_key:{hash} when those change - so a hit could authenticate a
-    // revoked/expired/deactivated credential until the TTL expires. Validating
-    // any of that on a hit requires the api_keys lookup below anyway, which
-    // makes the cache pointless for authorization. We therefore always run the
-    // authoritative query; it checks revoked, expired, and deactivated in one
-    // indexed round-trip. (The cache is still WRITTEN below for the synchronous
-    // validate_api_key(), used only by internal/test callers.)
+    // No Redis cache on the request route. A key_hash -> Identity cache carries
+    // none of the state that can invalidate a credential (key revoked_at /
+    // expires_at, user deactivated_at), and nothing evicts it when those
+    // change - so a hit could authenticate a revoked/expired/deactivated
+    // credential until the TTL expires. Checking any of that requires the
+    // api_keys lookup anyway, which makes the cache pointless for
+    // authorization. We always run the authoritative query; it checks revoked,
+    // expired, and deactivated in one indexed round-trip.
     auto db = drogon::app().getDbClient();
     if (!db) { stop(make_401("service unavailable")); return; }
 
@@ -468,11 +453,10 @@ static void validate_api_key_async(
     // Capture stop/next as shared_ptr so they survive the async callback.
     auto stop_p = std::make_shared<drogon::FilterCallback>(std::move(stop));
     auto next_p = std::make_shared<drogon::FilterChainCallback>(std::move(next));
-    auto rk_p   = std::make_shared<std::string>(std::move(rk));
 
     db->execSqlAsync(
         sql,
-        [req, next_p, stop_p, rk_p](const drogon::orm::Result& rows) mutable {
+        [req, next_p, stop_p](const drogon::orm::Result& rows) mutable {
             if (rows.empty()) {
                 (*stop_p)(make_401("invalid api key"));
                 return;
@@ -482,10 +466,6 @@ static void validate_api_key_async(
             id.email        = rows[0]["email"].as<std::string>();
             id.display_name = rows[0]["display_name"].as<std::string>();
             id.is_admin     = rows[0]["is_admin"].as<bool>();
-
-            std::string json;
-            (void)glz::write_json(id, json);
-            Redis::set(*rk_p, json, std::chrono::seconds{300});
 
             req->getAttributes()->insert("identity", id);
             (*next_p)();
@@ -555,21 +535,6 @@ static void resolve_jwt_user_async(
 }
 
 } // anonymous namespace
-
-// ---------------------------------------------------------------------------
-// authenticate() - synchronous, for non-filter code (tests, internal calls)
-// ---------------------------------------------------------------------------
-
-std::optional<Identity> authenticate(const drogon::HttpRequestPtr& req) {
-    const auto& auth = req->getHeader("Authorization");
-    if (auth.starts_with("Bearer ")) {
-        auto id = validate_jwt(std::string_view(auth).substr(7));
-        if (id) return id;
-    }
-    const auto& api_key = req->getHeader("X-API-Key");
-    if (!api_key.empty()) return validate_api_key(api_key);
-    return std::nullopt;
-}
 
 // ---------------------------------------------------------------------------
 // Drogon filters

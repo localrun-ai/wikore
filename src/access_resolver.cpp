@@ -1,5 +1,6 @@
 #include "wikore/access_resolver.hpp"
 #include "wikore/redis.hpp"
+#include "wikore/adapters/postgres/deadline_exec.hpp"
 #include <drogon/drogon.h>
 #include <glaze/glaze.hpp>
 #include <algorithm>
@@ -10,7 +11,8 @@ namespace wikore {
 drogon::Task<Result<AccessScope>>
 PostgresAccessResolver::resolve(std::string_view company_id,
                                 std::string_view user_id,
-                                std::string_view scope_org_unit_id) const
+                                std::string_view scope_org_unit_id,
+                                postgres::Deadline deadline) const
 {
     // SINGLE statement: the scope set AND (acl_epoch, scope_epoch) in one Read
     // Committed snapshot. The scope CTE mirrors AccessService::
@@ -81,8 +83,8 @@ PostgresAccessResolver::resolve(std::string_view company_id,
     )";
 
     try {
-        auto rows = co_await db_->execSqlCoro(
-            kSql, std::string(company_id), std::string(user_id),
+        auto rows = co_await postgres::exec_until(
+            db_, deadline, kSql, std::string(company_id), std::string(user_id),
             std::string(scope_org_unit_id));
 
         if (rows.empty())
@@ -149,7 +151,8 @@ namespace wikore {
 drogon::Task<Result<AccessScope>>
 CachedAccessResolver::resolve(std::string_view company_id,
                               std::string_view user_id,
-                              std::string_view scope_org_unit_id) const
+                              std::string_view scope_org_unit_id,
+                              postgres::Deadline deadline) const
 {
     using namespace std::chrono;
     const std::string key = "lr:eff:" + std::string(company_id) + ":"
@@ -165,7 +168,8 @@ CachedAccessResolver::resolve(std::string_view company_id,
             // Validate the stamp against the LIVE epochs (cheap: two ints).
             // Any DB hiccup here just falls through to a full re-resolve.
             try {
-                auto ep = co_await db_->execSqlCoro(
+                auto ep = co_await postgres::exec_until(
+                    db_, deadline,
                     "SELECT c.acl_epoch, u.scope_epoch "
                     "FROM companies c JOIN users u ON u.company_id = c.id "
                     "WHERE c.id = $1::uuid AND u.id = $2::uuid",
@@ -188,7 +192,7 @@ CachedAccessResolver::resolve(std::string_view company_id,
     }
 
     // --- miss / stale / unparseable: authoritative resolve, then cache ---
-    auto r = co_await inner_->resolve(company_id, user_id, scope_org_unit_id);
+    auto r = co_await inner_->resolve(company_id, user_id, scope_org_unit_id, deadline);
     if (!r)
         co_return r;   // never cache errors (e.g. NotFound)
 

@@ -107,7 +107,8 @@ EvidenceGate::evaluate(std::string_view                   company_id,
                        const AccessScope&                 scope,
                        const std::vector<std::string>&    allowed_sensitivity_labels,
                        const std::vector<ChunkCandidate>& candidates,
-                       const std::vector<std::string>&    lifecycle) const
+                       const std::vector<std::string>&    lifecycle,
+                       postgres::Deadline                 deadline) const
 {
     // Fail-closed short-circuits (also avoid a pointless round-trip): with no
     // reader scope, no clearance, or no candidates nothing can be allowed.
@@ -122,8 +123,8 @@ EvidenceGate::evaluate(std::string_view                   company_id,
 
     std::unordered_map<std::string, Hydrated> allowed;
     try {
-        auto rows = co_await db_->execSqlCoro(
-            kGateSql,
+        auto rows = co_await postgres::exec_until(
+            db_, deadline, kGateSql,
             std::string(company_id),
             pg_array(lifecycle),
             pg_array(allowed_sensitivity_labels),
