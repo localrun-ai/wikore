@@ -99,31 +99,46 @@ static long  xlsx_ms_seek (voidpf, voidpf s, uLong off, int orig)
 static int xlsx_ms_close(voidpf, voidpf) { return 0; }
 static int xlsx_ms_err  (voidpf, voidpf) { return 0; }
 
-// Returns the decompressed content of one ZIP entry, or empty on error/cap.
-std::string xlsx_extract(const std::string& zip, const char* entry)
+// ---------------------------------------------------------------------------
+// xlsx_extract result: distinguishes not-found (optional entry absent) from
+// errors (size cap exceeded, open/read failure — both indicate a corrupt or
+// malicious file and must not be silently skipped).
+// ---------------------------------------------------------------------------
+enum class XlsxExtractStatus { Ok, NotFound, Error };
+struct XlsxExtractResult {
+    std::string       content;
+    XlsxExtractStatus status = XlsxExtractStatus::Ok;
+};
+
+XlsxExtractResult xlsx_extract(const std::string& zip, const char* entry)
 {
     XlsxMemStream ms{zip.data(), zip.size(), 0};
     zlib_filefunc_def ff{xlsx_ms_open, xlsx_ms_read, xlsx_ms_write,
                          xlsx_ms_tell, xlsx_ms_seek, xlsx_ms_close,
                          xlsx_ms_err, nullptr};
     unzFile uf = unzOpen2(reinterpret_cast<const char*>(&ms), &ff);
-    if (!uf) return {};
-    if (unzLocateFile(uf, entry, 1) != UNZ_OK) { unzClose(uf); return {}; }
+    if (!uf) return {{}, XlsxExtractStatus::Error};
+    if (unzLocateFile(uf, entry, 1) != UNZ_OK) {
+        unzClose(uf);
+        return {{}, XlsxExtractStatus::NotFound};
+    }
     unz_file_info fi{};
     if (unzGetCurrentFileInfo(uf, &fi, nullptr, 0, nullptr, 0, nullptr, 0)
-            != UNZ_OK) { unzClose(uf); return {}; }
+            != UNZ_OK) { unzClose(uf); return {{}, XlsxExtractStatus::Error}; }
     if (fi.uncompressed_size > static_cast<uLong>(kXlsxMaxXmlBytes)) {
-        spdlog::warn("[xlsx-parser] entry '{}' uncompressed_size={} > cap",
-                     entry, fi.uncompressed_size);
-        unzClose(uf); return {};
+        spdlog::error("[xlsx-parser] entry '{}' uncompressed_size={} > cap",
+                      entry, fi.uncompressed_size);
+        unzClose(uf); return {{}, XlsxExtractStatus::Error};
     }
-    if (unzOpenCurrentFile(uf) != UNZ_OK) { unzClose(uf); return {}; }
+    if (unzOpenCurrentFile(uf) != UNZ_OK)
+        { unzClose(uf); return {{}, XlsxExtractStatus::Error}; }
     const auto sz = static_cast<std::size_t>(fi.uncompressed_size);
     std::string out(sz, '\0');
     const int got = unzReadCurrentFile(uf, out.data(), static_cast<unsigned>(sz));
     unzCloseCurrentFile(uf); unzClose(uf);
-    if (got < 0 || static_cast<std::size_t>(got) != sz) return {};
-    return out;
+    if (got < 0 || static_cast<std::size_t>(got) != sz)
+        return {{}, XlsxExtractStatus::Error};
+    return {std::move(out), XlsxExtractStatus::Ok};
 }
 
 // ---------------------------------------------------------------------------
@@ -157,20 +172,28 @@ pugi::xml_node bfs_find(const pugi::xml_node& root,
 
 // ---------------------------------------------------------------------------
 // Load the shared strings table.
-// Each <si> maps to one vector entry. All <t> text within an <si> is
-// concatenated (handles plain and rich-text runs).
-// Depth limit kXlsxXmlMaxDepth prevents stack exhaustion.
+// Returns Ok + vector on success, NotFound if the entry is absent (many
+// workbooks have no shared strings), or Error on cap/read/parse failure.
 // ---------------------------------------------------------------------------
-std::vector<std::string> load_shared_strings(const std::string& zip)
+struct SharedStringsResult {
+    std::vector<std::string> strings;
+    XlsxExtractStatus        status = XlsxExtractStatus::Ok;
+};
+
+SharedStringsResult load_shared_strings(const std::string& zip)
 {
-    auto xml = xlsx_extract(zip, "xl/sharedStrings.xml");
-    if (xml.empty()) return {};
+    auto res = xlsx_extract(zip, "xl/sharedStrings.xml");
+    if (res.status == XlsxExtractStatus::NotFound)
+        return {{}, XlsxExtractStatus::NotFound};
+    if (res.status == XlsxExtractStatus::Error)
+        return {{}, XlsxExtractStatus::Error};
 
     pugi::xml_document doc;
-    if (!doc.load_buffer(xml.data(), xml.size())) return {};
+    if (!doc.load_buffer(res.content.data(), res.content.size()))
+        return {{}, XlsxExtractStatus::Error};
 
     pugi::xml_node sst = bfs_find(doc, "sst");
-    if (!sst) return {};
+    if (!sst) return {{}, XlsxExtractStatus::Error};
 
     std::vector<std::string> ss;
     for (const auto& si : sst.children()) {
@@ -191,26 +214,34 @@ std::vector<std::string> load_shared_strings(const std::string& zip)
         }
         ss.push_back(std::move(val));
     }
-    return ss;
+    return {std::move(ss), XlsxExtractStatus::Ok};
 }
 
 // ---------------------------------------------------------------------------
 // Parse workbook + rels to get deduplicated, ordered (name, path) pairs.
+// Returns empty vector on any error (missing or corrupt required entries).
+// Uses a bool out-param to distinguish "no worksheets found" from "error".
 // ---------------------------------------------------------------------------
 struct SheetInfo { std::string name; std::string path; };
 
-std::vector<SheetInfo> load_sheet_order(const std::string& zip)
+// Returns false if a required entry was corrupt/oversized (caller returns
+// ingest.xlsx.corrupt); returns true with an empty vector if the workbook
+// is valid but lists no worksheet paths.
+bool load_sheet_order(const std::string& zip, std::vector<SheetInfo>& out)
 {
-    auto wb_xml   = xlsx_extract(zip, "xl/workbook.xml");
-    auto rels_xml = xlsx_extract(zip, "xl/_rels/workbook.xml.rels");
-    if (wb_xml.empty() || rels_xml.empty()) return {};
+    auto wb_res   = xlsx_extract(zip, "xl/workbook.xml");
+    auto rels_res = xlsx_extract(zip, "xl/_rels/workbook.xml.rels");
+    // Both are required; any failure (including cap-exceeded) is fatal.
+    if (wb_res.status   != XlsxExtractStatus::Ok) return false;
+    if (rels_res.status != XlsxExtractStatus::Ok) return false;
 
     const std::string_view ws_type =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
     std::unordered_map<std::string, std::string> rid_to_path;
     {
         pugi::xml_document rd;
-        if (!rd.load_buffer(rels_xml.data(), rels_xml.size())) return {};
+        if (!rd.load_buffer(rels_res.content.data(), rels_res.content.size()))
+            return false;
         pugi::xml_node root = bfs_find(rd, "Relationships");
         if (root)
             for (const auto& rel : root.children()) {
@@ -226,13 +257,13 @@ std::vector<SheetInfo> load_sheet_order(const std::string& zip)
     }
 
     pugi::xml_document wb;
-    if (!wb.load_buffer(wb_xml.data(), wb_xml.size())) return {};
+    if (!wb.load_buffer(wb_res.content.data(), wb_res.content.size()))
+        return false;
 
     pugi::xml_node sheets_node = bfs_find(wb, "sheets");
-    if (!sheets_node) return {};
+    if (!sheets_node) return true; // valid workbook, but no sheets listed
 
-    std::vector<SheetInfo> sheets;
-    std::unordered_set<std::string> seen_paths; // deduplication guard
+    std::unordered_set<std::string> seen_paths;
     for (const auto& s : sheets_node.children()) {
         if (local_name(s.name()) != "sheet") continue;
         std::string rid;
@@ -246,9 +277,9 @@ std::vector<SheetInfo> load_sheet_order(const std::string& zip)
                          it->second);
             continue;
         }
-        sheets.push_back({s.attribute("name").value(), it->second});
+        out.push_back({s.attribute("name").value(), it->second});
     }
-    return sheets;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -465,10 +496,22 @@ Result<ParsedDocument> XlsxParser::parse(const std::string& content,
         return std::unexpected(Error::invalid_input("ingest.mime_type_mismatch"));
 
     // --- Shared strings (optional; absent when no string cells) -------------
-    const auto shared_strings = load_shared_strings(content);
+    // NotFound is normal; Error means the entry exists but is corrupt/oversized.
+    auto ss_result = load_shared_strings(content);
+    if (ss_result.status == XlsxExtractStatus::Error) {
+        spdlog::error("[xlsx-parser] '{}' sharedStrings.xml corrupt or oversized",
+                      filename);
+        return std::unexpected(Error::invalid_input("ingest.xlsx.corrupt"));
+    }
+    const auto& shared_strings = ss_result.strings;
 
     // --- Sheet order from workbook + rels (paths deduplicated) --------------
-    auto sheets = load_sheet_order(content);
+    std::vector<SheetInfo> sheets;
+    if (!load_sheet_order(content, sheets)) {
+        spdlog::error("[xlsx-parser] '{}' workbook.xml or rels corrupt/oversized",
+                      filename);
+        return std::unexpected(Error::invalid_input("ingest.xlsx.corrupt"));
+    }
     if (sheets.empty())
         return std::unexpected(
             Error::invalid_input("ingest.xlsx.no_worksheets"));
@@ -489,10 +532,21 @@ Result<ParsedDocument> XlsxParser::parse(const std::string& content,
     std::size_t total_xml_bytes  = 0;
     std::size_t output_remaining = kXlsxMaxOutputBytes;
     for (const auto& sheet : sheets) {
-        auto xml = xlsx_extract(content, sheet.path.c_str());
-        if (xml.empty()) continue;
+        auto xml_res = xlsx_extract(content, sheet.path.c_str());
+        if (xml_res.status == XlsxExtractStatus::Error) {
+            spdlog::error("[xlsx-parser] '{}' worksheet '{}' corrupt or oversized",
+                          filename, sheet.path);
+            return std::unexpected(Error::invalid_input("ingest.xlsx.corrupt"));
+        }
+        if (xml_res.status == XlsxExtractStatus::NotFound) {
+            spdlog::warn("[xlsx-parser] '{}' worksheet '{}' missing from ZIP",
+                         filename, sheet.path);
+            // A referenced-but-missing sheet is a structural error: the
+            // workbook manifest is inconsistent with the archive contents.
+            return std::unexpected(Error::invalid_input("ingest.xlsx.corrupt"));
+        }
 
-        total_xml_bytes += xml.size();
+        total_xml_bytes += xml_res.content.size();
         if (total_xml_bytes > kXlsxMaxTotalXmlBytes) {
             spdlog::error(
                 "[xlsx-parser] '{}' aggregate worksheet XML {} > cap {}; rejecting",
@@ -501,7 +555,8 @@ Result<ParsedDocument> XlsxParser::parse(const std::string& content,
                 Error::invalid_input("ingest.xlsx.content_limit_exceeded"));
         }
 
-        auto body = parse_worksheet(xml, shared_strings, output_remaining);
+        auto body = parse_worksheet(xml_res.content, shared_strings,
+                                    output_remaining);
         if (output_remaining == 0) {
             spdlog::error("[xlsx-parser] '{}' output budget exceeded; rejecting",
                           filename);
