@@ -49,6 +49,9 @@ echo "$ERR" | grep -qi "check\|violates" \
   || fail "V036.4" "backwards expires_at accepted: $ERR"
 
 # V036.5: self-approval rejected (separation of duties)
+sql "INSERT INTO privileged_access_scopes
+       (session_id, company_id, org_unit_id, applies_to, maximum_sensitivity)
+     VALUES ('$SESS1', '$CO_ACME', '$ACME_ROOT', 'self_only', 'confidential');" > /dev/null
 ERR=$(sql "INSERT INTO privileged_access_approvals
              (session_id, company_id, approver_user_id, decision, reason)
            VALUES ('$SESS1', '$CO_ACME', '$U_ALICE', 'approved',
@@ -70,6 +73,14 @@ sql "INSERT INTO privileged_access_sessions
      VALUES ('$SESS2', '$CO_ACME', '$U_CAROL', '$U_CAROL',
              'Approved legal review for acquisition documents',
              'sensitive_analysis', now(), now() + INTERVAL '4 hours');" > /dev/null
+
+# Define the complete request before recording a decision. Scope becomes
+# immutable as soon as the first approval/rejection is inserted.
+sql "INSERT INTO privileged_access_scopes
+       (session_id, company_id, org_unit_id, applies_to, maximum_sensitivity,
+        allow_relationships, allow_impact_analysis, allow_diagnostics)
+     VALUES ('$SESS2', '$CO_ACME', '$ACME_ROOT', 'self_and_descendants',
+             'confidential', true, true, false);" > /dev/null
 
 sql "INSERT INTO privileged_access_approvals
        (session_id, company_id, approver_user_id, decision, reason)
@@ -100,7 +111,7 @@ echo "$ERR" | grep -qi "append-only\|append_only" \
 ERR=$(sql "INSERT INTO privileged_access_scopes
              (session_id, company_id, org_unit_id, applies_to,
               maximum_sensitivity)
-           VALUES ('$SESS2', '$CO_ACME', '$ACME_ROOT', 'bad_scope',
+           VALUES ('$SESS1', '$CO_ACME', '$ACME_ROOT', 'bad_scope',
                    'restricted');" 2>&1 || true)
 echo "$ERR" | grep -qi "applies_to_check\|check constraint" \
   && pass "V036.9" "scope applies_to CHECK rejects invalid" \
@@ -110,18 +121,13 @@ echo "$ERR" | grep -qi "applies_to_check\|check constraint" \
 ERR=$(sql "INSERT INTO privileged_access_scopes
              (session_id, company_id, org_unit_id, applies_to,
               maximum_sensitivity)
-           VALUES ('$SESS2', '$CO_ACME', '$ACME_ROOT', 'self_only',
+           VALUES ('$SESS1', '$CO_ACME', '$ACME_ROOT', 'self_only',
                    'top_secret');" 2>&1 || true)
 echo "$ERR" | grep -qi "maximum_sensitivity_check\|check constraint" \
   && pass "V036.10" "scope maximum_sensitivity CHECK rejects invalid" \
   || fail "V036.10" "invalid sensitivity accepted: $ERR"
 
 # V036.11: valid scope accepted
-sql "INSERT INTO privileged_access_scopes
-       (session_id, company_id, org_unit_id, applies_to, maximum_sensitivity,
-        allow_relationships, allow_impact_analysis, allow_diagnostics)
-     VALUES ('$SESS2', '$CO_ACME', '$ACME_ROOT', 'self_and_descendants',
-             'confidential', true, true, false);" > /dev/null
 COUNT=$(sql "SELECT count(*) FROM privileged_access_scopes WHERE session_id='$SESS2';")
 [ "$COUNT" = "1" ] \
   && pass "V036.11" "valid privileged_access_scope accepted" \
@@ -158,6 +164,10 @@ sql "INSERT INTO privileged_access_sessions
              'Approved dual-approval acquisition review',
              'sensitive_analysis', now(), now() + INTERVAL '4 hours',
              true);" > /dev/null
+sql "INSERT INTO privileged_access_scopes
+       (session_id, company_id, org_unit_id, applies_to, maximum_sensitivity)
+     VALUES ('$DUAL_SESS', '$CO_ACME', '$ACME_ROOT', 'self_only',
+             'confidential');" > /dev/null
 ERR=$(sql "INSERT INTO privileged_access_approvals
              (session_id, company_id, approver_user_id, decision, reason)
            VALUES ('$DUAL_SESS', '$CO_ACME', '$U_ALICE', 'approved',
@@ -171,7 +181,7 @@ echo "$ERR" | grep -qi "no_requester_approval\|requester cannot approve" \
 ERR=$(sql "UPDATE privileged_access_sessions
            SET subject_user_id='$U_ALICE'
            WHERE id='$SESS2';" 2>&1 || true)
-echo "$ERR" | grep -qi "actors_immutable_after_approval\|immutable once approvals" \
+echo "$ERR" | grep -qi "request_immutable_after_decision\|request fields are immutable" \
   && pass "V036.15" "subject_user_id UPDATE after approval rejected" \
   || fail "V036.15" "retroactive subject swap accepted: $ERR"
 
@@ -179,17 +189,17 @@ echo "$ERR" | grep -qi "actors_immutable_after_approval\|immutable once approval
 ERR=$(sql "UPDATE privileged_access_sessions
            SET requested_by='$U_ALICE'
            WHERE id='$SESS2';" 2>&1 || true)
-echo "$ERR" | grep -qi "actors_immutable_after_approval\|immutable once approvals" \
+echo "$ERR" | grep -qi "request_immutable_after_decision\|request fields are immutable" \
   && pass "V036.16" "requested_by UPDATE after approval rejected" \
   || fail "V036.16" "retroactive requester swap accepted: $ERR"
 
-# V036.17: unrelated UPDATE (status, activated_at) still works after approval
+# V036.17: validated pending -> approved workflow progression works
 sql "UPDATE privileged_access_sessions
-     SET status='approved', activated_at=now()
+     SET status='approved'
      WHERE id='$SESS2';" > /dev/null
 STATUS=$(sql "SELECT status FROM privileged_access_sessions WHERE id='$SESS2';")
 [ "$STATUS" = "approved" ] \
-  && pass "V036.17" "unrelated column UPDATEs still allowed after approval" \
+  && pass "V036.17" "approved transition accepted with sufficient approval" \
   || fail "V036.17" "workflow progression blocked (status=$STATUS)"
 
 # V036.18: subject/requester UPDATE on a session with NO approvals still works
@@ -208,3 +218,100 @@ COUNT=$(sql "SELECT count(*) FROM privileged_access_sessions
 [ "$COUNT" = "1" ] \
   && pass "V036.18" "subject/requester UPDATE allowed on session with no approvals" \
   || fail "V036.18" "no-approval subject swap wrongly rejected"
+
+# V036.19: pending -> active bypass rejected even when there are no approvals.
+ERR=$(sql "UPDATE privileged_access_sessions SET status='active'
+           WHERE id='$NOAPPR_SESS';" 2>&1 || true)
+echo "$ERR" | grep -qi "legal_transition\|illegal privileged_access transition" \
+  && pass "V036.19" "pending -> active workflow bypass rejected" \
+  || fail "V036.19" "pending -> active bypass accepted: $ERR"
+
+# V036.20: the approved request cannot be expanded after approval.
+ERR=$(sql "UPDATE privileged_access_sessions
+           SET allow_llm=true, expires_at=expires_at + INTERVAL '1 day'
+           WHERE id='$SESS2';" 2>&1 || true)
+echo "$ERR" | grep -qi "request_immutable_after_decision\|request fields are immutable" \
+  && pass "V036.20" "post-approval request expansion rejected" \
+  || fail "V036.20" "post-approval request expansion accepted: $ERR"
+
+# V036.21: approved scopes cannot be expanded or erased.
+ERR=$(sql "UPDATE privileged_access_scopes
+           SET maximum_sensitivity='restricted', allow_diagnostics=true
+           WHERE session_id='$SESS2';" 2>&1 || true)
+echo "$ERR" | grep -qi "scopes_immutable_after_decision\|scopes are immutable" \
+  && pass "V036.21" "post-approval scope expansion rejected" \
+  || fail "V036.21" "post-approval scope expansion accepted: $ERR"
+
+# V036.22: activation is accepted only after the approved transition and the
+# trigger supplies activated_at itself.
+sql "UPDATE privileged_access_sessions SET status='active' WHERE id='$SESS2';" > /dev/null
+COUNT=$(sql "SELECT count(*) FROM privileged_access_sessions
+             WHERE id='$SESS2' AND status='active' AND activated_at IS NOT NULL;")
+[ "$COUNT" = "1" ] \
+  && pass "V036.22" "approved session activated with trigger timestamp" \
+  || fail "V036.22" "valid activation failed (count=$COUNT)"
+
+# V036.23: active cannot return to an earlier workflow state.
+ERR=$(sql "UPDATE privileged_access_sessions SET status='approved'
+           WHERE id='$SESS2';" 2>&1 || true)
+echo "$ERR" | grep -qi "legal_transition\|illegal privileged_access transition" \
+  && pass "V036.23" "backwards workflow transition rejected" \
+  || fail "V036.23" "backwards workflow transition accepted: $ERR"
+
+# V036.24: every state transition has an immutable request + scope snapshot.
+COUNT=$(sql "SELECT count(*) FROM privileged_access_session_history
+             WHERE live_session_id='$SESS2'
+               AND new_status IN ('pending','approved','active')
+               AND jsonb_array_length(scope_snapshot) > 0;")
+# The initial pending snapshot precedes scope creation; approved and active do
+# include it, so exactly two matching transition snapshots are expected.
+[ "$COUNT" = "2" ] \
+  && pass "V036.24" "transition history captures approved scope snapshots" \
+  || fail "V036.24" "transition scope history incomplete (count=$COUNT)"
+
+# V036.25: transition history is append-only.
+ERR=$(sql "DELETE FROM privileged_access_session_history
+           WHERE live_session_id='$SESS2';" 2>&1 || true)
+echo "$ERR" | grep -qi "append-only\|append_only" \
+  && pass "V036.25" "transition history DELETE rejected" \
+  || fail "V036.25" "transition history DELETE accepted: $ERR"
+
+# V036.26: durable privileged records explicitly block ordinary tenant purge.
+PURGE_CO='ca7e0036-0000-0000-0000-000000000000'
+PURGE_USER='ca7e0036-0000-0000-0000-000000000001'
+sql "INSERT INTO companies (id,name,slug)
+     VALUES ('$PURGE_CO','V036 retention','v036-retention');" > /dev/null
+sql "INSERT INTO users (id,company_id,external_sub,email)
+     VALUES ('$PURGE_USER','$PURGE_CO','v036-retention-user','retention@example.test');" > /dev/null
+sql "INSERT INTO privileged_access_sessions
+       (company_id,subject_user_id,requested_by,purpose,access_kind,starts_at,expires_at)
+     VALUES ('$PURGE_CO','$PURGE_USER','$PURGE_USER','Durable security record',
+             'temporary_engagement',now(),now()+INTERVAL '1 hour');" > /dev/null
+ERR=$(sql "DELETE FROM companies WHERE id='$PURGE_CO';" 2>&1 || true)
+echo "$ERR" | grep -qi "foreign key\|violates\|still referenced" \
+  && pass "V036.26" "ordinary tenant purge cannot erase privileged history" \
+  || fail "V036.26" "tenant purge unexpectedly erased privileged record: $ERR"
+
+# V036.27-V036.28: dual approval is enforced by the transition itself.
+U_DAVE='da7e0036-0000-0000-0000-000000000001'
+U_ERIN='e17e0036-0000-0000-0000-000000000001'
+sql "INSERT INTO users (id,company_id,external_sub,email) VALUES
+       ('$U_DAVE','$CO_ACME','sub-dave','dave@acme.com'),
+       ('$U_ERIN','$CO_ACME','sub-erin','erin@acme.com');" > /dev/null
+sql "INSERT INTO privileged_access_approvals
+       (session_id,company_id,approver_user_id,decision,reason)
+     VALUES ('$DUAL_SESS','$CO_ACME','$U_DAVE','approved','first independent approver');" > /dev/null
+ERR=$(sql "UPDATE privileged_access_sessions SET status='approved'
+           WHERE id='$DUAL_SESS';" 2>&1 || true)
+echo "$ERR" | grep -qi "approval_requirement\|needs 2 approvals" \
+  && pass "V036.27" "one approval cannot advance a dual-approval session" \
+  || fail "V036.27" "dual-approval session advanced with one approval: $ERR"
+sql "INSERT INTO privileged_access_approvals
+       (session_id,company_id,approver_user_id,decision,reason)
+     VALUES ('$DUAL_SESS','$CO_ACME','$U_ERIN','approved','second independent approver');" > /dev/null
+sql "UPDATE privileged_access_sessions SET status='approved'
+     WHERE id='$DUAL_SESS';" > /dev/null
+STATUS=$(sql "SELECT status FROM privileged_access_sessions WHERE id='$DUAL_SESS';")
+[ "$STATUS" = "approved" ] \
+  && pass "V036.28" "two independent approvals advance dual-approval session" \
+  || fail "V036.28" "dual-approval session did not advance (status=$STATUS)"

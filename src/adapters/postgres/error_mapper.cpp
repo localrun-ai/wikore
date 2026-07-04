@@ -183,11 +183,37 @@ const std::unordered_map<std::string, Error> k_constraint_map = {
         Error::forbidden("approver cannot be the subject of the privileged access session")},
     {"privileged_access_approvals_no_requester_approval",
         Error::forbidden("requester cannot approve a dual-approval session")},
-    // Retroactive-UPDATE guard on the parent session — subject_user_id and
-    // requested_by are immutable once any approval row exists (otherwise
-    // the separation-of-duties invariants can be defeated post-hoc).
-    {"privileged_access_sessions_actors_immutable_after_approval",
-        Error::conflict("subject_user_id and requested_by are immutable once approvals exist")},
+    // Approval binding and workflow enforcement.
+    {"privileged_access_sessions_request_immutable_after_decision",
+        Error::conflict("privileged access request fields are immutable once a decision exists")},
+    {"privileged_access_sessions_identity_immutable",
+        Error::conflict("privileged access session identity is immutable")},
+    {"privileged_access_scopes_immutable_after_decision",
+        Error::conflict("privileged access scopes are immutable once a decision exists")},
+    {"privileged_access_approvals_session_pending",
+        Error::conflict("approval decisions can only be recorded while the session is pending")},
+    {"privileged_access_approvals_scope_required",
+        Error::invalid_input("privileged access session must have a scope before approval")},
+    {"privileged_access_sessions_legal_transition",
+        Error::conflict("illegal privileged access session transition")},
+    {"privileged_access_sessions_approval_requirement",
+        Error::forbidden("privileged access session does not have the required approvals")},
+    {"privileged_access_sessions_rejection_requirement",
+        Error::conflict("privileged access session requires a rejection decision")},
+    {"privileged_access_sessions_scope_required",
+        Error::forbidden("privileged access session has no approved scope")},
+    {"privileged_access_sessions_active_time_window",
+        Error::forbidden("privileged access session is outside its approved time window")},
+    {"privileged_access_sessions_transition_metadata",
+        Error::conflict("transition metadata may only change with session status")},
+    {"privileged_access_sessions_activated_at",
+        Error::conflict("activated_at is managed by the privileged access workflow")},
+    {"privileged_access_sessions_expiry_time",
+        Error::conflict("privileged access session cannot expire before expires_at")},
+    {"privileged_access_sessions_revocation_metadata",
+        Error::invalid_input("revocation requires actor, timestamp, and reason")},
+    {"privileged_access_session_history_append_only",
+        Error::conflict("privileged access session history is append-only")},
 
     // V035: capability grants (BaryGraph Lite)
     // Empty reason is caller input, not a programming bug.

@@ -37,7 +37,7 @@
 CREATE TABLE privileged_access_sessions (
     id                    UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id            UUID        NOT NULL
-                              REFERENCES companies(id) ON DELETE CASCADE,
+                              REFERENCES companies(id) ON DELETE RESTRICT,
     subject_user_id       UUID        NOT NULL,
     requested_by          UUID        NOT NULL,
     purpose               TEXT        NOT NULL
@@ -92,6 +92,9 @@ CREATE INDEX privileged_access_sessions_expires_idx
 CREATE TRIGGER privileged_access_sessions_updated_at
     BEFORE UPDATE ON privileged_access_sessions
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Session rows are durable security records. Tenant erasure is an explicit
+-- operations workflow; it must not silently cascade away approved access.
 
 COMMENT ON TABLE privileged_access_sessions IS
     'Explicit workflow-gated sessions for sensitive relationship analysis, '
@@ -166,8 +169,33 @@ RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
     session_row privileged_access_sessions%ROWTYPE;
 BEGIN
+    -- Serialize approval insertion with every session/scope mutation. Without
+    -- this lock, an actor or policy UPDATE can observe no uncommitted approval
+    -- while this trigger observes the old session, allowing both to commit.
     SELECT * INTO session_row FROM privileged_access_sessions
-        WHERE id = NEW.session_id;
+        WHERE company_id = NEW.company_id AND id = NEW.session_id
+        FOR UPDATE;
+    IF NOT FOUND THEN
+        -- Let the composite FK produce the authoritative tenant/parent error.
+        RETURN NEW;
+    END IF;
+    IF session_row.status <> 'pending' THEN
+        RAISE EXCEPTION
+            'approval decisions can only be recorded while session % is pending',
+            NEW.session_id
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'privileged_access_approvals_session_pending';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM privileged_access_scopes
+        WHERE company_id = NEW.company_id AND session_id = NEW.session_id
+    ) THEN
+        RAISE EXCEPTION
+            'privileged_access session % must have a scope before approval',
+            NEW.session_id
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'privileged_access_approvals_scope_required';
+    END IF;
     IF NEW.approver_user_id = session_row.subject_user_id THEN
         RAISE EXCEPTION
             'privileged_access approver cannot be the subject of the session'
@@ -221,36 +249,259 @@ CREATE INDEX privileged_access_scopes_session_idx
     ON privileged_access_scopes (session_id);
 
 -- ---------------------------------------------------------------------------
--- Immutable-once-approved guard on privileged_access_sessions.
+-- Approval binding and scope immutability.
 --
 -- Rationale: the separation-of-duties trigger and the require_dual_approval
 -- rule compare NEW.approver_user_id against session_row.subject_user_id and
 -- session_row.requested_by. If those columns can be UPDATEd after approvals
 -- exist, an attacker with UPDATE rights on the session table can swap the
 -- subject or requester to a colleague and retroactively defeat both checks.
--- Once ANY approval row references the session, reject changes to those two
--- columns. Everything else (status, activated_at, revoked_at, ...) stays
--- editable so the workflow can progress.
+-- Once ANY decision references the session, reject changes to every field
+-- that defines what was approved. Status and transition metadata remain
+-- writable, but are validated separately by the state-machine trigger below.
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION privileged_access_sessions_lock_actors_after_approval()
+CREATE OR REPLACE FUNCTION privileged_access_sessions_lock_request_after_decision()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
-    IF NEW.subject_user_id = OLD.subject_user_id
-       AND NEW.requested_by = OLD.requested_by THEN
+    IF NEW.id IS DISTINCT FROM OLD.id OR NEW.company_id IS DISTINCT FROM OLD.company_id THEN
+        RAISE EXCEPTION 'privileged_access session identity is immutable'
+            USING ERRCODE = 'insufficient_privilege',
+                  CONSTRAINT = 'privileged_access_sessions_identity_immutable';
+    END IF;
+    IF NEW.subject_user_id IS NOT DISTINCT FROM OLD.subject_user_id
+       AND NEW.requested_by IS NOT DISTINCT FROM OLD.requested_by
+       AND NEW.purpose IS NOT DISTINCT FROM OLD.purpose
+       AND NEW.access_kind IS NOT DISTINCT FROM OLD.access_kind
+       AND NEW.starts_at IS NOT DISTINCT FROM OLD.starts_at
+       AND NEW.expires_at IS NOT DISTINCT FROM OLD.expires_at
+       AND NEW.allow_llm IS NOT DISTINCT FROM OLD.allow_llm
+       AND NEW.require_dual_approval IS NOT DISTINCT FROM OLD.require_dual_approval THEN
         RETURN NEW;
     END IF;
-    IF EXISTS (SELECT 1 FROM privileged_access_approvals WHERE session_id = OLD.id) THEN
+    IF OLD.status <> 'pending'
+       OR EXISTS (SELECT 1 FROM privileged_access_approvals WHERE session_id = OLD.id) THEN
         RAISE EXCEPTION
-            'subject_user_id and requested_by are immutable once approvals exist for session %',
+            'privileged_access request fields are immutable once decisions exist for session %',
             OLD.id
             USING ERRCODE = 'insufficient_privilege',
-                  CONSTRAINT = 'privileged_access_sessions_actors_immutable_after_approval';
+                  CONSTRAINT = 'privileged_access_sessions_request_immutable_after_decision';
     END IF;
     RETURN NEW;
 END;
 $$;
 
-CREATE TRIGGER privileged_access_sessions_lock_actors
+CREATE TRIGGER privileged_access_sessions_lock_request
     BEFORE UPDATE ON privileged_access_sessions
-    FOR EACH ROW EXECUTE FUNCTION privileged_access_sessions_lock_actors_after_approval();
+    FOR EACH ROW EXECUTE FUNCTION privileged_access_sessions_lock_request_after_decision();
+
+CREATE OR REPLACE FUNCTION privileged_access_scopes_mutable_only_before_decision()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+    target_session_id UUID := COALESCE(NEW.session_id, OLD.session_id);
+    target_company_id UUID := COALESCE(NEW.company_id, OLD.company_id);
+    session_status TEXT;
+BEGIN
+    SELECT status INTO session_status
+      FROM privileged_access_sessions
+     WHERE company_id = target_company_id AND id = target_session_id
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        -- Let the composite FK produce the authoritative tenant/parent error.
+        RETURN COALESCE(NEW, OLD);
+    END IF;
+
+    IF session_status <> 'pending'
+       OR EXISTS (SELECT 1 FROM privileged_access_approvals
+                  WHERE session_id = target_session_id) THEN
+        RAISE EXCEPTION
+            'privileged_access scopes are immutable once a decision exists for session %',
+            target_session_id
+            USING ERRCODE = 'insufficient_privilege',
+                  CONSTRAINT = 'privileged_access_scopes_immutable_after_decision';
+    END IF;
+    RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+CREATE TRIGGER privileged_access_scopes_mutability
+    BEFORE INSERT OR UPDATE OR DELETE ON privileged_access_scopes
+    FOR EACH ROW EXECUTE FUNCTION privileged_access_scopes_mutable_only_before_decision();
+
+-- ---------------------------------------------------------------------------
+-- Database-enforced workflow state machine.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION privileged_access_sessions_validate_transition()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+    approved_count INTEGER;
+    rejected_count INTEGER;
+    required_count INTEGER;
+BEGIN
+    IF NEW.status IS NOT DISTINCT FROM OLD.status THEN
+        IF NEW.activated_at IS DISTINCT FROM OLD.activated_at
+           OR NEW.revoked_at IS DISTINCT FROM OLD.revoked_at
+           OR NEW.revoked_by IS DISTINCT FROM OLD.revoked_by
+           OR NEW.revocation_reason IS DISTINCT FROM OLD.revocation_reason THEN
+            RAISE EXCEPTION 'transition metadata may only change with session status'
+                USING ERRCODE = 'check_violation',
+                      CONSTRAINT = 'privileged_access_sessions_transition_metadata';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF NOT (
+        (OLD.status = 'pending'  AND NEW.status IN ('approved','rejected','expired','revoked')) OR
+        (OLD.status = 'approved' AND NEW.status IN ('active','expired','revoked')) OR
+        (OLD.status = 'active'   AND NEW.status IN ('expired','revoked'))
+    ) THEN
+        RAISE EXCEPTION 'illegal privileged_access transition % -> %', OLD.status, NEW.status
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'privileged_access_sessions_legal_transition';
+    END IF;
+
+    SELECT count(*) FILTER (WHERE decision = 'approved'),
+           count(*) FILTER (WHERE decision = 'rejected')
+      INTO approved_count, rejected_count
+      FROM privileged_access_approvals
+     WHERE session_id = OLD.id;
+    required_count := CASE WHEN NEW.require_dual_approval THEN 2 ELSE 1 END;
+
+    IF NEW.status IN ('approved', 'active') THEN
+        IF rejected_count > 0 OR approved_count < required_count THEN
+            RAISE EXCEPTION
+                'session % needs % approvals and no rejection (approved %, rejected %)',
+                OLD.id, required_count, approved_count, rejected_count
+                USING ERRCODE = 'insufficient_privilege',
+                      CONSTRAINT = 'privileged_access_sessions_approval_requirement';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM privileged_access_scopes WHERE session_id = OLD.id) THEN
+            RAISE EXCEPTION 'session % has no approved scope', OLD.id
+                USING ERRCODE = 'insufficient_privilege',
+                      CONSTRAINT = 'privileged_access_sessions_scope_required';
+        END IF;
+    END IF;
+
+    IF NEW.status = 'rejected' AND rejected_count = 0 THEN
+        RAISE EXCEPTION 'session % cannot be rejected without a rejection decision', OLD.id
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'privileged_access_sessions_rejection_requirement';
+    END IF;
+
+    IF NEW.status = 'active' THEN
+        IF clock_timestamp() < NEW.starts_at OR clock_timestamp() >= NEW.expires_at THEN
+            RAISE EXCEPTION 'session % is outside its approved time window', OLD.id
+                USING ERRCODE = 'insufficient_privilege',
+                      CONSTRAINT = 'privileged_access_sessions_active_time_window';
+        END IF;
+        NEW.activated_at := clock_timestamp();
+    ELSIF NEW.activated_at IS DISTINCT FROM OLD.activated_at THEN
+        RAISE EXCEPTION 'activated_at is set only by transition to active'
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'privileged_access_sessions_activated_at';
+    END IF;
+
+    IF NEW.status = 'expired' AND clock_timestamp() < NEW.expires_at THEN
+        RAISE EXCEPTION 'session % cannot expire before expires_at', OLD.id
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'privileged_access_sessions_expiry_time';
+    END IF;
+
+    IF NEW.status = 'revoked' THEN
+        IF NEW.revoked_at IS NULL OR NEW.revoked_by IS NULL
+           OR length(btrim(COALESCE(NEW.revocation_reason, ''))) < 5 THEN
+            RAISE EXCEPTION 'revocation requires actor, timestamp, and reason'
+                USING ERRCODE = 'check_violation',
+                      CONSTRAINT = 'privileged_access_sessions_revocation_metadata';
+        END IF;
+    ELSIF NEW.revoked_at IS NOT NULL OR NEW.revoked_by IS NOT NULL
+          OR NEW.revocation_reason IS NOT NULL THEN
+        RAISE EXCEPTION 'revocation metadata is only valid for revoked sessions'
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'privileged_access_sessions_revocation_metadata';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER privileged_access_sessions_state_machine
+    BEFORE UPDATE ON privileged_access_sessions
+    FOR EACH ROW EXECUTE FUNCTION privileged_access_sessions_validate_transition();
+
+-- ---------------------------------------------------------------------------
+-- Append-only transition history. There is deliberately no FK to the live
+-- session/company: audit evidence must retain its identifiers after an
+-- explicitly-authorized tenant-erasure operation.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE privileged_access_session_history (
+    id             BIGSERIAL PRIMARY KEY,
+    live_session_id UUID        NOT NULL,
+    company_id     UUID         NOT NULL,
+    old_status     TEXT,
+    new_status     TEXT         NOT NULL,
+    request_snapshot JSONB      NOT NULL,
+    scope_snapshot JSONB        NOT NULL,
+    database_actor TEXT         NOT NULL DEFAULT session_user,
+    changed_at     TIMESTAMPTZ  NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX privileged_access_session_history_lookup_idx
+    ON privileged_access_session_history (company_id, live_session_id, changed_at DESC);
+
+CREATE OR REPLACE FUNCTION privileged_access_sessions_write_history()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' AND NEW.status IS NOT DISTINCT FROM OLD.status THEN
+        RETURN NEW;
+    END IF;
+    INSERT INTO privileged_access_session_history
+        (live_session_id, company_id, old_status, new_status,
+         request_snapshot, scope_snapshot)
+    VALUES
+        (NEW.id, NEW.company_id,
+         CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE OLD.status END,
+         NEW.status,
+         jsonb_build_object(
+             'subject_user_id', NEW.subject_user_id,
+             'requested_by', NEW.requested_by,
+             'purpose', NEW.purpose,
+             'access_kind', NEW.access_kind,
+             'starts_at', NEW.starts_at,
+             'expires_at', NEW.expires_at,
+             'allow_llm', NEW.allow_llm,
+             'require_dual_approval', NEW.require_dual_approval,
+             'activated_at', NEW.activated_at,
+             'revoked_at', NEW.revoked_at,
+             'revoked_by', NEW.revoked_by,
+             'revocation_reason', NEW.revocation_reason),
+         COALESCE((
+             SELECT jsonb_agg(to_jsonb(s) - 'company_id' - 'session_id'
+                              ORDER BY s.org_unit_id)
+               FROM privileged_access_scopes s
+              WHERE s.session_id = NEW.id
+         ), '[]'::jsonb));
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER privileged_access_sessions_history
+    AFTER INSERT OR UPDATE ON privileged_access_sessions
+    FOR EACH ROW EXECUTE FUNCTION privileged_access_sessions_write_history();
+
+CREATE OR REPLACE FUNCTION privileged_access_history_append_only()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'privileged_access_session_history is append-only; % rejected', TG_OP
+        USING ERRCODE = 'insufficient_privilege',
+              CONSTRAINT = 'privileged_access_session_history_append_only';
+END;
+$$;
+
+CREATE TRIGGER privileged_access_session_history_no_update
+    BEFORE UPDATE ON privileged_access_session_history
+    FOR EACH ROW EXECUTE FUNCTION privileged_access_history_append_only();
+CREATE TRIGGER privileged_access_session_history_no_delete
+    BEFORE DELETE ON privileged_access_session_history
+    FOR EACH ROW EXECUTE FUNCTION privileged_access_history_append_only();
