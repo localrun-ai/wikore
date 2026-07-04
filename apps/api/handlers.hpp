@@ -49,4 +49,15 @@ me(drogon::orm::DbClientPtr db, drogon::HttpRequestPtr req);
 drogon::Task<drogon::HttpResponsePtr>
 orgs_tree(drogon::orm::DbClientPtr db, drogon::HttpRequestPtr req);
 
+// GET /api/orgs/{orgUnitId} - a single org unit's detail.
+//
+// Behind AuthFilter. Tenant resolved from the authenticated (active) user.
+// Default-closed: a non-admin may read the unit only if it is within their
+// membership scope; a miss (absent, other tenant, or no access) is 404 so
+// existence never leaks. Admins may read any unit in their tenant. Returns
+// { id, parent_id, type, slug, name, description }.
+drogon::Task<drogon::HttpResponsePtr>
+org_get(drogon::orm::DbClientPtr db, drogon::HttpRequestPtr req,
+        std::string org_unit_id);
+
 } // namespace wikore::api
