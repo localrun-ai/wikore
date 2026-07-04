@@ -1349,3 +1349,19 @@ TEST_CASE("XlsxParser: cells without r= attribute are read sequentially",
     CHECK(body.find("10 | 20 | 30") != std::string::npos);
     CHECK(body.find("1 | 2 |  | 4") != std::string::npos);
 }
+
+TEST_CASE("XlsxParser: HTTPS worksheet relationship URI is accepted",
+          "[parser][xlsx]")
+{
+    // https_rel.xlsx uses the HTTPS variant of the worksheet relationship
+    // Type URI (current Microsoft Open XML SDK output).  Previously the
+    // exact http:// match rejected these files with no_worksheets.
+    XlsxParser p;
+    auto content = load_fixture("https_rel.xlsx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "https_rel.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    REQUIRE(r.has_value());
+    REQUIRE(r->sections.size() == 1);
+    CHECK(r->sections[0].text.find("42") != std::string::npos);
+}

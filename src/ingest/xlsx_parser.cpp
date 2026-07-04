@@ -240,8 +240,14 @@ bool load_sheet_order(const std::string& zip, std::vector<SheetInfo>& out)
     if (wb_res.status   != XlsxExtractStatus::Ok) return false;
     if (rels_res.status != XlsxExtractStatus::Ok) return false;
 
-    const std::string_view ws_type =
-        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
+    // Worksheet relationship Type suffix, shared by all three known URI forms:
+    //   Transitional: http://schemas.openxmlformats.org/.../relationships/worksheet
+    //   HTTPS variant: https://schemas.openxmlformats.org/.../relationships/worksheet
+    //   Strict OOXML:  http://purl.oclc.org/ooxml/officeDocument/relationships/worksheet
+    static constexpr std::string_view kWsTypeSuffix = "/relationships/worksheet";
+    auto is_worksheet_rel = [&](std::string_view type) {
+        return type.ends_with(kWsTypeSuffix);
+    };
     std::unordered_map<std::string, std::string> rid_to_path;
     {
         pugi::xml_document rd;
@@ -251,7 +257,7 @@ bool load_sheet_order(const std::string& zip, std::vector<SheetInfo>& out)
         if (root)
             for (const auto& rel : root.children()) {
                 if (local_name(rel.name()) != "Relationship") continue;
-                if (std::string_view(rel.attribute("Type").value()) != ws_type)
+                if (!is_worksheet_rel(rel.attribute("Type").value()))
                     continue;
                 std::string target = rel.attribute("Target").value();
                 std::string path = target.starts_with("/")
