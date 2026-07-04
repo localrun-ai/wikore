@@ -59,6 +59,8 @@ static constexpr std::size_t kXlsxMaxXmlBytes      = 16UL  * 1024UL * 1024UL;
 static constexpr std::size_t kXlsxMaxTotalXmlBytes  = 128UL * 1024UL * 1024UL;
 static constexpr std::size_t kXlsxMaxSheets         = 500;
 static constexpr int         kXlsxXmlMaxDepth       = 64;
+// XLSX column limit: XFD = 16384 (ECMA-376 §18.3.1.4)
+static constexpr int         kXlsxMaxCol            = 16384;
 
 // ---------------------------------------------------------------------------
 // In-memory ZIP backend (same pattern as docx/pptx/odt parsers).
@@ -245,17 +247,35 @@ std::vector<SheetInfo> load_sheet_order(const std::string& zip)
 }
 
 // ---------------------------------------------------------------------------
+// Find the first direct child whose local name matches lname.
+// Used where node names may carry a namespace prefix (e.g. <x:v>).
+// ---------------------------------------------------------------------------
+pugi::xml_node child_by_local(const pugi::xml_node& n, std::string_view lname)
+{
+    for (const auto& child : n.children())
+        if (local_name(child.name()) == lname) return child;
+    return {};
+}
+
+// ---------------------------------------------------------------------------
 // Parse column letters from a cell reference (e.g. "C1" -> 3, "AA2" -> 27).
-// Returns 1-based column index, or 0 on parse failure.
+// Returns 1-based column index, or 0 if the reference is absent or exceeds
+// kXlsxMaxCol (16384 = XFD, the XLSX column limit).  Overflow-safe: the
+// intermediate value is checked before multiplication so "ZZZZZZ1" cannot
+// produce a multi-gigabyte allocation.
 // ---------------------------------------------------------------------------
 int col_from_ref(std::string_view r)
 {
     int col = 0;
     for (char c : r) {
         if (c < 'A' || c > 'Z') break;
+        // Guard against overflow before multiplying: if col would exceed
+        // kXlsxMaxCol after this step, the reference is invalid.
+        if (col > (kXlsxMaxCol - (c - 'A' + 1)) / 26)
+            return 0;
         col = col * 26 + (c - 'A' + 1);
     }
-    return col;
+    return (col > kXlsxMaxCol) ? 0 : col;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +309,7 @@ std::string parse_worksheet(const std::string&              xml,
             std::string val;
 
             if (type == "s") {
-                auto v = c.child("v");
+                auto v = child_by_local(c, "v");
                 if (v) {
                     int idx = std::atoi(v.text().get());
                     if (idx >= 0 && static_cast<std::size_t>(idx)
@@ -297,27 +317,27 @@ std::string parse_worksheet(const std::string&              xml,
                         val = shared_strings[static_cast<std::size_t>(idx)];
                 }
             } else if (type == "inlineStr") {
-                for (const auto& child : c.children())
-                    if (local_name(child.name()) == "is")
-                        for (const auto& t : child.children())
-                            if (local_name(t.name()) == "t")
-                                val += t.text().get();
+                auto is = child_by_local(c, "is");
+                if (is)
+                    for (const auto& t : is.children())
+                        if (local_name(t.name()) == "t")
+                            val += t.text().get();
             } else if (type == "b") {
-                auto v = c.child("v");
+                auto v = child_by_local(c, "v");
                 val = (v && std::string_view(v.text().get()) == "1")
                       ? "TRUE" : "FALSE";
             } else if (type == "e") {
-                auto v = c.child("v");
+                auto v = child_by_local(c, "v");
                 if (v) val = v.text().get();
             } else {
                 // Numeric or formula (t="str" or absent)
-                auto v = c.child("v");
+                auto v = child_by_local(c, "v");
                 if (!v) {
-                    for (const auto& ch : c.children())
-                        if (local_name(ch.name()) == "is")
-                            for (const auto& t : ch.children())
-                                if (local_name(t.name()) == "t")
-                                    val += t.text().get();
+                    auto is = child_by_local(c, "is");
+                    if (is)
+                        for (const auto& t : is.children())
+                            if (local_name(t.name()) == "t")
+                                val += t.text().get();
                 } else {
                     val = v.text().get();
                 }
