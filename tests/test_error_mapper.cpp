@@ -192,6 +192,10 @@ const std::unordered_set<std::string> k_allowlist = {
     // session-management service.
     "privileged_access_sessions_check",
     "privileged_access_sessions_check1",
+    // Composite-FK target UNIQUE key on (company_id, id) — auto-named by PG.
+    // A duplicate would require a duplicate primary-key id, which the PK
+    // constraint already rejects. Programming bug -> database_error.
+    "privileged_access_sessions_company_id_id_key",
 };
 
 bool integration_db_available() {

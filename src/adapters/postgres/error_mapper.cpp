@@ -181,8 +181,13 @@ const std::unordered_map<std::string, Error> k_constraint_map = {
         Error::conflict("privileged_access_approvals is append-only; decisions cannot be modified")},
     {"privileged_access_approvals_no_self_approval",
         Error::forbidden("approver cannot be the subject of the privileged access session")},
-    {"privileged_access_approvals_dual_approval_requires_two",
-        Error::forbidden("requester cannot be sole approver of a dual-approval session")},
+    {"privileged_access_approvals_no_requester_approval",
+        Error::forbidden("requester cannot approve a dual-approval session")},
+    // Retroactive-UPDATE guard on the parent session — subject_user_id and
+    // requested_by are immutable once any approval row exists (otherwise
+    // the separation-of-duties invariants can be defeated post-hoc).
+    {"privileged_access_sessions_actors_immutable_after_approval",
+        Error::conflict("subject_user_id and requested_by are immutable once approvals exist")},
 
     // V035: capability grants (BaryGraph Lite)
     // Empty reason is caller input, not a programming bug.

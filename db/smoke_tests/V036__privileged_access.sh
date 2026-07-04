@@ -126,3 +126,85 @@ COUNT=$(sql "SELECT count(*) FROM privileged_access_scopes WHERE session_id='$SE
 [ "$COUNT" = "1" ] \
   && pass "V036.11" "valid privileged_access_scope accepted" \
   || fail "V036.11" "valid scope rejected (count=$COUNT)"
+
+# V036.12: cross-tenant approval REJECTED (P1 regression).
+# Try to attach a company-Beta approval row to an Acme session — the
+# composite (company_id, session_id) FK must reject it because no
+# (BETA, SESS2) row exists in privileged_access_sessions.
+ERR=$(sql "INSERT INTO privileged_access_approvals
+             (session_id, company_id, approver_user_id, decision, reason)
+           VALUES ('$SESS2', '$CO_BETA', '$U_BOB', 'approved',
+                   'cross-tenant approval attempt');" 2>&1 || true)
+echo "$ERR" | grep -qi "foreign key\|violates\|not present in table" \
+  && pass "V036.12" "cross-tenant approval rejected by composite FK" \
+  || fail "V036.12" "cross-tenant approval accepted: $ERR"
+
+# V036.13: cross-tenant scope REJECTED (P1 regression).
+ERR=$(sql "INSERT INTO privileged_access_scopes
+             (session_id, company_id, org_unit_id, applies_to, maximum_sensitivity)
+           VALUES ('$SESS2', '$CO_BETA', '$BETA_ROOT', 'self_only',
+                   'confidential');" 2>&1 || true)
+echo "$ERR" | grep -qi "foreign key\|violates\|not present in table" \
+  && pass "V036.13" "cross-tenant scope rejected by composite FK" \
+  || fail "V036.13" "cross-tenant scope accepted: $ERR"
+
+# V036.14: dual-approval trigger uses the renamed constraint
+# (P3 rename: previously *_dual_approval_requires_two -> *_no_requester_approval).
+DUAL_SESS='6a550003-0000-0000-0000-000000000003'
+sql "INSERT INTO privileged_access_sessions
+       (id, company_id, subject_user_id, requested_by, purpose, access_kind,
+        starts_at, expires_at, require_dual_approval)
+     VALUES ('$DUAL_SESS', '$CO_ACME', '$U_CAROL', '$U_ALICE',
+             'Approved dual-approval acquisition review',
+             'sensitive_analysis', now(), now() + INTERVAL '4 hours',
+             true);" > /dev/null
+ERR=$(sql "INSERT INTO privileged_access_approvals
+             (session_id, company_id, approver_user_id, decision, reason)
+           VALUES ('$DUAL_SESS', '$CO_ACME', '$U_ALICE', 'approved',
+                   'requester self-approving');" 2>&1 || true)
+echo "$ERR" | grep -qi "no_requester_approval\|requester cannot approve" \
+  && pass "V036.14" "dual-approval trigger uses renamed constraint" \
+  || fail "V036.14" "unexpected error text: $ERR"
+
+# V036.15: retroactive UPDATE of subject_user_id after approval REJECTED
+# (closes the loophole where separation-of-duties can be defeated post-hoc).
+ERR=$(sql "UPDATE privileged_access_sessions
+           SET subject_user_id='$U_ALICE'
+           WHERE id='$SESS2';" 2>&1 || true)
+echo "$ERR" | grep -qi "actors_immutable_after_approval\|immutable once approvals" \
+  && pass "V036.15" "subject_user_id UPDATE after approval rejected" \
+  || fail "V036.15" "retroactive subject swap accepted: $ERR"
+
+# V036.16: retroactive UPDATE of requested_by after approval REJECTED
+ERR=$(sql "UPDATE privileged_access_sessions
+           SET requested_by='$U_ALICE'
+           WHERE id='$SESS2';" 2>&1 || true)
+echo "$ERR" | grep -qi "actors_immutable_after_approval\|immutable once approvals" \
+  && pass "V036.16" "requested_by UPDATE after approval rejected" \
+  || fail "V036.16" "retroactive requester swap accepted: $ERR"
+
+# V036.17: unrelated UPDATE (status, activated_at) still works after approval
+sql "UPDATE privileged_access_sessions
+     SET status='approved', activated_at=now()
+     WHERE id='$SESS2';" > /dev/null
+STATUS=$(sql "SELECT status FROM privileged_access_sessions WHERE id='$SESS2';")
+[ "$STATUS" = "approved" ] \
+  && pass "V036.17" "unrelated column UPDATEs still allowed after approval" \
+  || fail "V036.17" "workflow progression blocked (status=$STATUS)"
+
+# V036.18: subject/requester UPDATE on a session with NO approvals still works
+NOAPPR_SESS='6a550004-0000-0000-0000-000000000004'
+sql "INSERT INTO privileged_access_sessions
+       (id, company_id, subject_user_id, requested_by, purpose, access_kind,
+        starts_at, expires_at)
+     VALUES ('$NOAPPR_SESS', '$CO_ACME', '$U_ALICE', '$U_ALICE',
+             'Draft engagement, no approvals yet',
+             'temporary_engagement', now(), now() + INTERVAL '1 hour');" > /dev/null
+sql "UPDATE privileged_access_sessions
+     SET subject_user_id='$U_CAROL', requested_by='$U_CAROL'
+     WHERE id='$NOAPPR_SESS';" > /dev/null
+COUNT=$(sql "SELECT count(*) FROM privileged_access_sessions
+             WHERE id='$NOAPPR_SESS' AND subject_user_id='$U_CAROL';")
+[ "$COUNT" = "1" ] \
+  && pass "V036.18" "subject/requester UPDATE allowed on session with no approvals" \
+  || fail "V036.18" "no-approval subject swap wrongly rejected"

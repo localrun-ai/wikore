@@ -73,7 +73,11 @@ CREATE TABLE privileged_access_sessions (
     FOREIGN KEY (company_id, requested_by)
         REFERENCES users(company_id, id),
     FOREIGN KEY (company_id, revoked_by)
-        REFERENCES users(company_id, id)
+        REFERENCES users(company_id, id),
+    -- Composite-FK target: child tables (approvals, scopes) bind
+    -- (company_id, session_id) to (company_id, id) so cross-tenant rows
+    -- cannot attach to another company's session.
+    UNIQUE (company_id, id)
 );
 
 CREATE INDEX privileged_access_sessions_subject_idx
@@ -109,8 +113,14 @@ CREATE TABLE privileged_access_approvals (
     reason           TEXT        NOT NULL CHECK (length(btrim(reason)) >= 5),
     decided_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (session_id, approver_user_id),
-    FOREIGN KEY (session_id)
-        REFERENCES privileged_access_sessions(id) ON DELETE RESTRICT,
+    -- Composite FK ties (company_id, session_id) to the session's own
+    -- (company_id, id). Combined with the composite approver FK below,
+    -- approver, approval row, and session are transitively forced into
+    -- the same tenant — nothing can attach a cross-tenant approval.
+    -- ON DELETE RESTRICT because approvals are audit records that must
+    -- outlive stray parent deletes (which are also blocked by other FKs).
+    FOREIGN KEY (company_id, session_id)
+        REFERENCES privileged_access_sessions(company_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (company_id, approver_user_id)
         REFERENCES users(company_id, id)
 );
@@ -138,7 +148,19 @@ CREATE TRIGGER privileged_access_approvals_no_delete
     FOR EACH ROW EXECUTE FUNCTION privileged_access_approvals_append_only();
 
 -- Separation-of-duties: subject/requester cannot approve their own session.
--- (Company-scoped by the composite FK to users.)
+-- (Company-scoped by the composite session/approver FKs above, so cross-
+-- tenant impersonation is already impossible.)
+--
+-- Note on dual-approval sessions: this BEFORE INSERT trigger cannot verify
+-- that TWO distinct approvals exist — activation logic must count
+-- decision='approved' rows and check >= 2 distinct approvers for a
+-- require_dual_approval session. This trigger enforces the local
+-- invariant: the requester cannot record an 'approved' or 'rejected'
+-- decision on a dual-approval session AT ALL — not as the sole approver
+-- and not as one of the two. That is stricter than the sole-approver
+-- literal reading but is the safer policy: it makes dual-approval a real
+-- second-pair-of-eyes control, not a rubber stamp co-signed by the
+-- requester after a colleague clicks approve.
 CREATE OR REPLACE FUNCTION privileged_access_approvals_separation_of_duties()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
@@ -155,9 +177,9 @@ BEGIN
     IF NEW.approver_user_id = session_row.requested_by
        AND session_row.require_dual_approval THEN
         RAISE EXCEPTION
-            'privileged_access requester cannot be sole approver of a dual-approval session'
+            'privileged_access requester cannot approve a dual-approval session'
             USING ERRCODE = 'insufficient_privilege',
-                  CONSTRAINT = 'privileged_access_approvals_dual_approval_requires_two';
+                  CONSTRAINT = 'privileged_access_approvals_no_requester_approval';
     END IF;
     RETURN NEW;
 END;
@@ -185,11 +207,50 @@ CREATE TABLE privileged_access_scopes (
     allow_impact_analysis BOOLEAN NOT NULL DEFAULT false,
     allow_diagnostics     BOOLEAN NOT NULL DEFAULT false,
     PRIMARY KEY (session_id, org_unit_id),
-    FOREIGN KEY (session_id)
-        REFERENCES privileged_access_sessions(id) ON DELETE RESTRICT,
+    -- Composite FK ties (company_id, session_id) to the session's own
+    -- (company_id, id) so scopes cannot attach one tenant's org units to
+    -- another tenant's session. The org_units composite FK below then
+    -- enforces same-company for the org unit too.
+    FOREIGN KEY (company_id, session_id)
+        REFERENCES privileged_access_sessions(company_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (company_id, org_unit_id)
         REFERENCES org_units(company_id, id) ON DELETE CASCADE
 );
 
 CREATE INDEX privileged_access_scopes_session_idx
     ON privileged_access_scopes (session_id);
+
+-- ---------------------------------------------------------------------------
+-- Immutable-once-approved guard on privileged_access_sessions.
+--
+-- Rationale: the separation-of-duties trigger and the require_dual_approval
+-- rule compare NEW.approver_user_id against session_row.subject_user_id and
+-- session_row.requested_by. If those columns can be UPDATEd after approvals
+-- exist, an attacker with UPDATE rights on the session table can swap the
+-- subject or requester to a colleague and retroactively defeat both checks.
+-- Once ANY approval row references the session, reject changes to those two
+-- columns. Everything else (status, activated_at, revoked_at, ...) stays
+-- editable so the workflow can progress.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION privileged_access_sessions_lock_actors_after_approval()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.subject_user_id = OLD.subject_user_id
+       AND NEW.requested_by = OLD.requested_by THEN
+        RETURN NEW;
+    END IF;
+    IF EXISTS (SELECT 1 FROM privileged_access_approvals WHERE session_id = OLD.id) THEN
+        RAISE EXCEPTION
+            'subject_user_id and requested_by are immutable once approvals exist for session %',
+            OLD.id
+            USING ERRCODE = 'insufficient_privilege',
+                  CONSTRAINT = 'privileged_access_sessions_actors_immutable_after_approval';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER privileged_access_sessions_lock_actors
+    BEFORE UPDATE ON privileged_access_sessions
+    FOR EACH ROW EXECUTE FUNCTION privileged_access_sessions_lock_actors_after_approval();
