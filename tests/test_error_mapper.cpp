@@ -168,6 +168,22 @@ const std::unordered_set<std::string> k_allowlist = {
     // constraints; treated as programming bugs.
     "knowledge_edges_created_by_same_company_fk",
     "knowledge_edges_reviewed_by_same_company_fk",
+
+    // V035: capability grants
+    // The (expires_at > granted_at) and (revoked_at, revoked_by) CHECKs are
+    // named as capability_grants_check_1/2 by PG (unnamed inline CHECKs).
+    // Allow-listed because inserting an inconsistent grant is a programming
+    // bug in the entitlement service.
+    "user_capability_grants_check",
+    "user_capability_grants_check1",
+    "group_capability_grants_check",
+    "group_capability_grants_check1",
+    "org_unit_capability_grants_check",
+    "org_unit_capability_grants_check1",
+    // Composite same-company FK for tenant_features.enabled_by raises as
+    // foreign_key_violation with a named constraint; a cross-tenant actor
+    // is a programming bug -> database_error.
+    "tenant_features_enabled_by_same_company_fk",
 };
 
 bool integration_db_available() {

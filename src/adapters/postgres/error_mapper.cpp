@@ -162,6 +162,25 @@ const std::unordered_map<std::string, Error> k_constraint_map = {
     {"knowledge_edges_no_uuid_reuse",
         Error::conflict("knowledge_edges UUID has prior history; UUIDs cannot be reused after delete")},
 
+    // V035: capability grants (BaryGraph Lite)
+    // Empty reason is caller input, not a programming bug.
+    {"user_capability_grants_reason_check",
+        Error::invalid_input("user capability grant reason must not be empty")},
+    {"group_capability_grants_reason_check",
+        Error::invalid_input("group capability grant reason must not be empty")},
+    {"org_unit_capability_grants_reason_check",
+        Error::invalid_input("org_unit capability grant reason must not be empty")},
+    {"org_unit_capability_grants_applies_to_check",
+        Error::invalid_input("org_unit capability applies_to must be 'self_only' or 'self_and_descendants'")},
+    // Partial unique index on active (unrevoked) grants: a duplicate is a
+    // caller-facing conflict (already granted), not a programming bug.
+    {"user_capability_grants_active_uidx",
+        Error::conflict("an active capability grant already exists for this user; revoke it before re-granting")},
+    {"group_capability_grants_active_uidx",
+        Error::conflict("an active capability grant already exists for this group; revoke it before re-granting")},
+    {"org_unit_capability_grants_active_uidx",
+        Error::conflict("an active capability grant already exists for this org_unit; revoke it before re-granting")},
+
     // -----------------------------------------------------------------------
     // Enum / domain CHECKs (input validation): PG-generated names from
     // `column ... CHECK (column = ANY (...))`. Each maps to invalid_input.
