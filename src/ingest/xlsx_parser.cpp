@@ -57,6 +57,11 @@ namespace {
 
 static constexpr std::size_t kXlsxMaxXmlBytes      = 16UL  * 1024UL * 1024UL;
 static constexpr std::size_t kXlsxMaxTotalXmlBytes  = 128UL * 1024UL * 1024UL;
+// Output text budget: caps the total bytes of rendered cell text + separators
+// across all worksheets.  A 16 MiB worksheet with many short rows each ending
+// at column XFD (16,384 fields) could otherwise produce tens of GiB of
+// " | " separators.  16 MiB matches the ODT parser's per-document limit.
+static constexpr std::size_t kXlsxMaxOutputBytes    = 16UL  * 1024UL * 1024UL;
 static constexpr std::size_t kXlsxMaxSheets         = 500;
 static constexpr int         kXlsxXmlMaxDepth       = 64;
 // XLSX column limit: XFD = 16384 (ECMA-376 §18.3.1.4)
@@ -282,9 +287,14 @@ int col_from_ref(std::string_view r)
 // Parse one worksheet XML into rows of pipe-separated cell values.
 // Sparse columns (missing cells between r="A1" and r="C1") are filled with
 // empty strings to preserve column alignment.
+//
+// remaining: shared global output-byte budget (across all worksheets).
+// Returns empty string and sets remaining=0 if the budget is exceeded;
+// the caller must treat remaining==0 as a content_limit_exceeded error.
 // ---------------------------------------------------------------------------
 std::string parse_worksheet(const std::string&              xml,
-                             const std::vector<std::string>& shared_strings)
+                             const std::vector<std::string>& shared_strings,
+                             std::size_t&                    remaining)
 {
     pugi::xml_document doc;
     if (!doc.load_buffer(xml.data(), xml.size())) return {};
@@ -358,11 +368,20 @@ std::string parse_worksheet(const std::string&              xml,
         for (const auto& cv : cells) if (!cv.empty()) { has_content = true; break; }
         if (!has_content) continue;
 
+        const std::size_t before = out.size();
         if (!out.empty()) out += '\n';
         for (std::size_t i = 0; i < cells.size(); ++i) {
             if (i) out += " | ";
             out += cells[i];
         }
+        // Charge the global output budget by the bytes just appended.
+        const std::size_t added = out.size() - before;
+        if (added > remaining) {
+            spdlog::error("[xlsx-parser] output budget exceeded; rejecting");
+            remaining = 0;
+            return {};
+        }
+        remaining -= added;
     }
     return out;
 }
@@ -402,13 +421,14 @@ Result<ParsedDocument> XlsxParser::parse(const std::string& content,
             Error::invalid_input("ingest.xlsx.too_many_sheets"));
     }
 
-    // --- Parse each sheet with aggregate XML cap ----------------------------
+    // --- Parse each sheet with aggregate XML cap and output budget ----------
     ParsedDocument out;
     out.filename  = filename;
     out.mime_type = "application/vnd.openxmlformats-officedocument"
                     ".spreadsheetml.sheet";
 
-    std::size_t total_xml_bytes = 0;
+    std::size_t total_xml_bytes  = 0;
+    std::size_t output_remaining = kXlsxMaxOutputBytes;
     for (const auto& sheet : sheets) {
         auto xml = xlsx_extract(content, sheet.path.c_str());
         if (xml.empty()) continue;
@@ -422,7 +442,13 @@ Result<ParsedDocument> XlsxParser::parse(const std::string& content,
                 Error::invalid_input("ingest.xlsx.content_limit_exceeded"));
         }
 
-        auto body = parse_worksheet(xml, shared_strings);
+        auto body = parse_worksheet(xml, shared_strings, output_remaining);
+        if (output_remaining == 0) {
+            spdlog::error("[xlsx-parser] '{}' output budget exceeded; rejecting",
+                          filename);
+            return std::unexpected(
+                Error::invalid_input("ingest.xlsx.content_limit_exceeded"));
+        }
         if (body.empty()) continue;
 
         ParsedSection sec;

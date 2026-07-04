@@ -153,6 +153,8 @@ public:
 // Cell types handled: shared string (t="s"), numeric/formula (absent/t="str"),
 // inline string (t="inlineStr"), boolean (t="b"), error (t="e").
 // Security: 16 MiB per-entry cap, 128 MiB aggregate worksheet XML cap,
+// 16 MiB global output text budget (cells + separators, shared across all
+// sheets — prevents separator amplification from wide sparse rows),
 // 500-sheet cap with path deduplication (all return explicit errors).
 // All XML walks are iterative BFS with kXlsxXmlMaxDepth=64 depth limit.
 // ---------------------------------------------------------------------------

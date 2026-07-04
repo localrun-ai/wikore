@@ -1262,3 +1262,18 @@ TEST_CASE("XlsxParser: namespace-prefixed value elements are not silently lost",
     CHECK(r->sections[0].text.find("42") != std::string::npos);
     CHECK(r->sections[0].text.find("99") != std::string::npos);
 }
+
+TEST_CASE("XlsxParser: output budget exhaustion returns explicit error, not gigabytes",
+          "[parser][xlsx][security]")
+{
+    // wide_rows.xlsx: 400 rows each with only column XFD (16384).
+    // Without a budget, expansion produces ~18 MiB of " | " separators.
+    // kXlsxMaxOutputBytes=16 MiB must trigger content_limit_exceeded.
+    XlsxParser p;
+    auto content = load_fixture("wide_rows.xlsx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "wide_rows.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.xlsx.content_limit_exceeded");
+}
