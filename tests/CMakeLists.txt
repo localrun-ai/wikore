@@ -22,6 +22,7 @@ add_executable(wikore_tests
     test_me_handler.cpp
     test_orgs_tree_handler.cpp
     test_org_get_handler.cpp
+    test_allowed_evidence.cpp
     test_llm_provider.cpp
     test_llm_gate.cpp
 )

@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace wikore::rag {
@@ -139,9 +140,9 @@ struct ChunkCandidate {
 // ---------------------------------------------------------------------------
 // AllowedCandidate: a candidate that has passed EvidenceGate.
 //
-// The type distinction enforces the gate at compile time: the Reranker
-// accepts only AllowedCandidate, so a raw ChunkCandidate can never be
-// forwarded to reranking without going through the gate.
+// The type distinction enforces a convention boundary: the Reranker and
+// ContextBuilder accept only AllowedCandidate / AllowedEvidence, so a raw
+// ChunkCandidate cannot be forwarded without passing through the gate.
 // ---------------------------------------------------------------------------
 
 struct AllowedCandidate {
@@ -151,6 +152,24 @@ struct AllowedCandidate {
     std::string  text;              // hydrated from Postgres
     std::optional<std::string> section_heading;
 };
+
+// AllowedChunk is an alias for AllowedCandidate: the name used in the
+// BaryGraph Lite design for the chunk member of AllowedEvidence. The alias
+// avoids rename churn while introducing the AllowedEvidence variant.
+using AllowedChunk = AllowedCandidate;
+
+// ---------------------------------------------------------------------------
+// AllowedEvidence — the variant type accepted by ContextBuilder.
+//
+// Currently a single-member variant containing AllowedChunk (chunk-only
+// retrieval, Iteration 3). AllowedRelationship and AllowedPath will be added
+// as BaryGraph Lite edges become available (V034+).
+//
+// ContextBuilder must accept std::span<const AllowedEvidence> and must NOT
+// be overloaded for ChunkCandidate, raw Qdrant payloads, or diagnostic types.
+// ---------------------------------------------------------------------------
+
+using AllowedEvidence = std::variant<AllowedChunk>;
 
 // ---------------------------------------------------------------------------
 // QdrantFilter: access-controlled search filter for a Qdrant query.
