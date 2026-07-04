@@ -62,12 +62,14 @@ TEST_CASE("token_bucket_take: meters burst and refills over time", "[redis][llm-
     const std::string k = "lr:test:rate:bucket";
     wikore::Redis::del(k);
 
-    // burst = 2, rate = 100 tokens/sec.
-    CHECK(wikore::Redis::token_bucket_take(k, 100.0, 2, 1) == 1);
-    CHECK(wikore::Redis::token_bucket_take(k, 100.0, 2, 1) == 1);
-    CHECK(wikore::Redis::token_bucket_take(k, 100.0, 2, 1) == 0);   // empty (refill negligible)
-    sleep_ms(100);                                                  // +~10 tokens, capped at 2
-    CHECK(wikore::Redis::token_bucket_take(k, 100.0, 2, 1) == 1);   // refilled
+    // burst = 2, rate = 1 token/sec. A low rate keeps the "empty" assertion
+    // robust under loaded CI: even 100 ms of scheduling delay between calls
+    // refills only 0.1 token, so the third call cannot spuriously succeed.
+    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 2, 1) == 1);
+    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 2, 1) == 1);
+    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 2, 1) == 0);   // empty
+    sleep_ms(1100);                                              // >= 1.1 tokens at 1/sec
+    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 2, 1) == 1);   // refilled
     wikore::Redis::del(k);
 }
 
