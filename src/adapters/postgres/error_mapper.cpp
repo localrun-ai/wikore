@@ -155,6 +155,12 @@ const std::unordered_map<std::string, Error> k_constraint_map = {
     // a named constraint; treated as invalid_state (programming bug).
     {"knowledge_edge_endpoints_immutable",
         Error::invalid_state("knowledge_edge_endpoints is immutable; delete the edge and recreate it instead")},
+    // Endpoint orphan-delete guard (parent still exists).
+    {"knowledge_edge_endpoints_no_orphan_delete",
+        Error::invalid_state("knowledge_edge_endpoints cannot be deleted while parent edge exists; delete the edge instead")},
+    // Edge UUID reuse rejection — recreating an edge with a previously-deleted UUID.
+    {"knowledge_edges_no_uuid_reuse",
+        Error::conflict("knowledge_edges UUID has prior history; UUIDs cannot be reused after delete")},
 
     // -----------------------------------------------------------------------
     // Enum / domain CHECKs (input validation): PG-generated names from
