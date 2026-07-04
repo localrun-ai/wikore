@@ -196,6 +196,10 @@ const std::unordered_set<std::string> k_allowlist = {
     // A duplicate would require a duplicate primary-key id, which the PK
     // constraint already rejects. Programming bug -> database_error.
     "privileged_access_sessions_company_id_id_key",
+    // Internal denormalized counter maintained by the approval trigger.
+    "privileged_access_sessions_decision_count_chk",
+    // History change_kind is trigger-owned, not caller input.
+    "privileged_access_session_history_change_kind_check",
 };
 
 bool integration_db_available() {

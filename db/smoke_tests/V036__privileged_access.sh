@@ -276,21 +276,39 @@ echo "$ERR" | grep -qi "append-only\|append_only" \
   && pass "V036.25" "transition history DELETE rejected" \
   || fail "V036.25" "transition history DELETE accepted: $ERR"
 
-# V036.26: durable privileged records explicitly block ordinary tenant purge.
+# V036.26: tenant purge removes live workflow rows but preserves a complete
+# final history snapshot.
 PURGE_CO='ca7e0036-0000-0000-0000-000000000000'
 PURGE_USER='ca7e0036-0000-0000-0000-000000000001'
+PURGE_APPROVER='ca7e0036-0000-0000-0000-000000000002'
+PURGE_SESS='ca7e0036-0000-0000-0000-000000000003'
 sql "INSERT INTO companies (id,name,slug)
      VALUES ('$PURGE_CO','V036 retention','v036-retention');" > /dev/null
-sql "INSERT INTO users (id,company_id,external_sub,email)
-     VALUES ('$PURGE_USER','$PURGE_CO','v036-retention-user','retention@example.test');" > /dev/null
+PURGE_ROOT=$(sql "SELECT id FROM org_units WHERE company_id='$PURGE_CO' AND type='root';")
+sql "INSERT INTO users (id,company_id,external_sub,email) VALUES
+       ('$PURGE_USER','$PURGE_CO','v036-retention-user','retention@example.test'),
+       ('$PURGE_APPROVER','$PURGE_CO','v036-retention-approver','approver@example.test');" > /dev/null
 sql "INSERT INTO privileged_access_sessions
-       (company_id,subject_user_id,requested_by,purpose,access_kind,starts_at,expires_at)
-     VALUES ('$PURGE_CO','$PURGE_USER','$PURGE_USER','Durable security record',
+       (id,company_id,subject_user_id,requested_by,purpose,access_kind,starts_at,expires_at)
+     VALUES ('$PURGE_SESS','$PURGE_CO','$PURGE_USER','$PURGE_USER','Durable security record',
              'temporary_engagement',now(),now()+INTERVAL '1 hour');" > /dev/null
-ERR=$(sql "DELETE FROM companies WHERE id='$PURGE_CO';" 2>&1 || true)
-echo "$ERR" | grep -qi "foreign key\|violates\|still referenced" \
-  && pass "V036.26" "ordinary tenant purge cannot erase privileged history" \
-  || fail "V036.26" "tenant purge unexpectedly erased privileged record: $ERR"
+sql "INSERT INTO privileged_access_scopes
+       (session_id,company_id,org_unit_id,applies_to,maximum_sensitivity)
+     VALUES ('$PURGE_SESS','$PURGE_CO','$PURGE_ROOT','self_only','confidential');" > /dev/null
+sql "INSERT INTO privileged_access_approvals
+       (session_id,company_id,approver_user_id,decision,reason)
+     VALUES ('$PURGE_SESS','$PURGE_CO','$PURGE_APPROVER','approved','retention approval');" > /dev/null
+sql "UPDATE privileged_access_sessions SET status='approved' WHERE id='$PURGE_SESS';" > /dev/null
+sql "DELETE FROM companies WHERE id='$PURGE_CO';" > /dev/null
+ROW=$(sql "SELECT
+              (SELECT count(*) FROM companies WHERE id='$PURGE_CO') || '|' ||
+              jsonb_array_length(scope_snapshot) || '|' ||
+              jsonb_array_length(approval_snapshot)
+           FROM privileged_access_session_history
+           WHERE live_session_id='$PURGE_SESS' AND change_kind='delete';")
+[ "$ROW" = "0|1|1" ] \
+  && pass "V036.26" "tenant purge cascades while final audit snapshot survives" \
+  || fail "V036.26" "tenant purge/history result wrong (row=$ROW)"
 
 # V036.27-V036.28: dual approval is enforced by the transition itself.
 U_DAVE='da7e0036-0000-0000-0000-000000000001'
@@ -315,3 +333,56 @@ STATUS=$(sql "SELECT status FROM privileged_access_sessions WHERE id='$DUAL_SESS
 [ "$STATUS" = "approved" ] \
   && pass "V036.28" "two independent approvals advance dual-approval session" \
   || fail "V036.28" "dual-approval session did not advance (status=$STATUS)"
+
+# V036.29: INSERT cannot bypass the UPDATE-only state machine.
+ERR=$(sql "INSERT INTO privileged_access_sessions
+             (company_id,subject_user_id,requested_by,purpose,access_kind,status,
+              starts_at,expires_at,activated_at)
+           VALUES ('$CO_ACME','$U_ALICE','$U_ALICE','Direct active bypass attempt',
+                   'break_glass','active',now(),now()+INTERVAL '1 hour',now());" 2>&1 || true)
+echo "$ERR" | grep -qi "initial_state\|must start pending" \
+  && pass "V036.29" "non-pending session INSERT rejected" \
+  || fail "V036.29" "active session INSERT accepted: $ERR"
+
+# V036.30: org restructuring may cascade an approved live scope; its exact
+# approved value remains in transition history.
+ORG_DELETE='0d360030-0000-0000-0000-000000000000'
+ORG_SESS='5e360030-0000-0000-0000-000000000000'
+sql "INSERT INTO org_units (id,company_id,parent_id,name,slug,type)
+     VALUES ('$ORG_DELETE','$CO_ACME','$ACME_ROOT','Temporary Review Unit',
+             'temporary-review-unit','department');" > /dev/null
+sql "INSERT INTO privileged_access_sessions
+       (id,company_id,subject_user_id,requested_by,purpose,access_kind,starts_at,expires_at)
+     VALUES ('$ORG_SESS','$CO_ACME','$U_CAROL','$U_CAROL','Org cascade review session',
+             'sensitive_analysis',now(),now()+INTERVAL '1 hour');" > /dev/null
+sql "INSERT INTO privileged_access_scopes
+       (session_id,company_id,org_unit_id,applies_to,maximum_sensitivity)
+     VALUES ('$ORG_SESS','$CO_ACME','$ORG_DELETE','self_only','confidential');" > /dev/null
+sql "INSERT INTO privileged_access_approvals
+       (session_id,company_id,approver_user_id,decision,reason)
+     VALUES ('$ORG_SESS','$CO_ACME','$U_ALICE','approved','org cascade approval');" > /dev/null
+sql "UPDATE privileged_access_sessions SET status='approved' WHERE id='$ORG_SESS';" > /dev/null
+sql "DELETE FROM org_units WHERE id='$ORG_DELETE';" > /dev/null
+ROW=$(sql "SELECT
+              (SELECT count(*) FROM privileged_access_scopes WHERE session_id='$ORG_SESS') || '|' ||
+              count(*)
+           FROM privileged_access_session_history
+           WHERE live_session_id='$ORG_SESS' AND change_kind='transition'
+             AND scope_snapshot @> '[{\"org_unit_id\":\"$ORG_DELETE\"}]'::jsonb;")
+[ "$ROW" = "0|1" ] \
+  && pass "V036.30" "org-unit cascade succeeds and approved scope history survives" \
+  || fail "V036.30" "org-unit cascade/history result wrong (row=$ROW)"
+
+# V036.31: decision_count is trigger-maintained and reflects committed rows.
+COUNT=$(sql "SELECT decision_count FROM privileged_access_sessions WHERE id='$DUAL_SESS';")
+ERR=$(sql "UPDATE privileged_access_sessions SET decision_count=99
+           WHERE id='$DUAL_SESS';" 2>&1 || true)
+[ "$COUNT" = "2" ] && echo "$ERR" | grep -qi "decision_count_managed\|trigger-managed" \
+  && pass "V036.31" "decision_count tracks decisions and rejects direct writes" \
+  || fail "V036.31" "decision_count invariant failed (count=$COUNT err=$ERR)"
+
+# V036.32: TRUNCATE cannot bypass append-only approval enforcement.
+ERR=$(sql "TRUNCATE privileged_access_approvals;" 2>&1 || true)
+echo "$ERR" | grep -qi "append-only\|append_only" \
+  && pass "V036.32" "approval TRUNCATE rejected" \
+  || fail "V036.32" "approval TRUNCATE accepted: $ERR"

@@ -37,7 +37,7 @@
 CREATE TABLE privileged_access_sessions (
     id                    UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id            UUID        NOT NULL
-                              REFERENCES companies(id) ON DELETE RESTRICT,
+                              REFERENCES companies(id) ON DELETE CASCADE,
     subject_user_id       UUID        NOT NULL,
     requested_by          UUID        NOT NULL,
     purpose               TEXT        NOT NULL
@@ -57,6 +57,9 @@ CREATE TABLE privileged_access_sessions (
     expires_at            TIMESTAMPTZ NOT NULL,
     allow_llm             BOOLEAN     NOT NULL DEFAULT false,
     require_dual_approval BOOLEAN     NOT NULL DEFAULT false,
+    decision_count        INTEGER     NOT NULL DEFAULT 0
+                              CONSTRAINT privileged_access_sessions_decision_count_chk
+                              CHECK (decision_count >= 0),
     activated_at          TIMESTAMPTZ,
     revoked_at            TIMESTAMPTZ,
     revoked_by            UUID,
@@ -93,8 +96,24 @@ CREATE TRIGGER privileged_access_sessions_updated_at
     BEFORE UPDATE ON privileged_access_sessions
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
--- Session rows are durable security records. Tenant erasure is an explicit
--- operations workflow; it must not silently cascade away approved access.
+CREATE OR REPLACE FUNCTION privileged_access_sessions_initial_state_fn()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.status <> 'pending' OR NEW.activated_at IS NOT NULL
+       OR NEW.revoked_at IS NOT NULL OR NEW.revoked_by IS NOT NULL
+       OR NEW.revocation_reason IS NOT NULL OR NEW.decision_count <> 0 THEN
+        RAISE EXCEPTION
+            'new privileged_access sessions must start pending with no transition metadata'
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'privileged_access_sessions_initial_state';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER privileged_access_sessions_initial_state
+    BEFORE INSERT ON privileged_access_sessions
+    FOR EACH ROW EXECUTE FUNCTION privileged_access_sessions_initial_state_fn();
 
 COMMENT ON TABLE privileged_access_sessions IS
     'Explicit workflow-gated sessions for sensitive relationship analysis, '
@@ -120,12 +139,10 @@ CREATE TABLE privileged_access_approvals (
     -- (company_id, id). Combined with the composite approver FK below,
     -- approver, approval row, and session are transitively forced into
     -- the same tenant — nothing can attach a cross-tenant approval.
-    -- ON DELETE RESTRICT because approvals are audit records that must
-    -- outlive stray parent deletes (which are also blocked by other FKs).
     FOREIGN KEY (company_id, session_id)
-        REFERENCES privileged_access_sessions(company_id, id) ON DELETE RESTRICT,
+        REFERENCES privileged_access_sessions(company_id, id) ON DELETE CASCADE,
     FOREIGN KEY (company_id, approver_user_id)
-        REFERENCES users(company_id, id)
+        REFERENCES users(company_id, id) ON DELETE CASCADE
 );
 
 CREATE INDEX privileged_access_approvals_session_idx
@@ -136,6 +153,14 @@ CREATE INDEX privileged_access_approvals_session_idx
 CREATE OR REPLACE FUNCTION privileged_access_approvals_append_only()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
+    IF TG_OP = 'DELETE'
+       AND (NOT EXISTS (SELECT 1 FROM companies WHERE id = OLD.company_id)
+            OR NOT EXISTS (SELECT 1 FROM privileged_access_sessions
+                           WHERE id = OLD.session_id)) THEN
+        -- Parent deletion cascade. The session's BEFORE DELETE history
+        -- snapshot has already preserved this decision.
+        RETURN OLD;
+    END IF;
     RAISE EXCEPTION 'privileged_access_approvals is append-only; % rejected', TG_OP
         USING ERRCODE = 'insufficient_privilege',
               CONSTRAINT = 'privileged_access_approvals_append_only';
@@ -149,6 +174,10 @@ CREATE TRIGGER privileged_access_approvals_no_update
 CREATE TRIGGER privileged_access_approvals_no_delete
     BEFORE DELETE ON privileged_access_approvals
     FOR EACH ROW EXECUTE FUNCTION privileged_access_approvals_append_only();
+
+CREATE TRIGGER privileged_access_approvals_no_truncate
+    BEFORE TRUNCATE ON privileged_access_approvals
+    FOR EACH STATEMENT EXECUTE FUNCTION privileged_access_approvals_append_only();
 
 -- Separation-of-duties: subject/requester cannot approve their own session.
 -- (Company-scoped by the composite session/approver FKs above, so cross-
@@ -217,6 +246,20 @@ CREATE TRIGGER privileged_access_approvals_separation_of_duties_trg
     BEFORE INSERT ON privileged_access_approvals
     FOR EACH ROW EXECUTE FUNCTION privileged_access_approvals_separation_of_duties();
 
+CREATE OR REPLACE FUNCTION privileged_access_approvals_increment_count_fn()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE privileged_access_sessions
+       SET decision_count = decision_count + 1
+     WHERE company_id = NEW.company_id AND id = NEW.session_id;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER privileged_access_approvals_increment_count
+    AFTER INSERT ON privileged_access_approvals
+    FOR EACH ROW EXECUTE FUNCTION privileged_access_approvals_increment_count_fn();
+
 -- ---------------------------------------------------------------------------
 -- privileged_access_scopes
 -- ---------------------------------------------------------------------------
@@ -240,7 +283,7 @@ CREATE TABLE privileged_access_scopes (
     -- another tenant's session. The org_units composite FK below then
     -- enforces same-company for the org unit too.
     FOREIGN KEY (company_id, session_id)
-        REFERENCES privileged_access_sessions(company_id, id) ON DELETE RESTRICT,
+        REFERENCES privileged_access_sessions(company_id, id) ON DELETE CASCADE,
     FOREIGN KEY (company_id, org_unit_id)
         REFERENCES org_units(company_id, id) ON DELETE CASCADE
 );
@@ -269,6 +312,12 @@ BEGIN
             USING ERRCODE = 'insufficient_privilege',
                   CONSTRAINT = 'privileged_access_sessions_identity_immutable';
     END IF;
+    IF NEW.decision_count IS DISTINCT FROM OLD.decision_count
+       AND (pg_trigger_depth() < 2 OR NEW.decision_count <> OLD.decision_count + 1) THEN
+        RAISE EXCEPTION 'privileged_access decision_count is trigger-managed'
+            USING ERRCODE = 'insufficient_privilege',
+                  CONSTRAINT = 'privileged_access_sessions_decision_count_managed';
+    END IF;
     IF NEW.subject_user_id IS NOT DISTINCT FROM OLD.subject_user_id
        AND NEW.requested_by IS NOT DISTINCT FROM OLD.requested_by
        AND NEW.purpose IS NOT DISTINCT FROM OLD.purpose
@@ -279,8 +328,10 @@ BEGIN
        AND NEW.require_dual_approval IS NOT DISTINCT FROM OLD.require_dual_approval THEN
         RETURN NEW;
     END IF;
-    IF OLD.status <> 'pending'
-       OR EXISTS (SELECT 1 FROM privileged_access_approvals WHERE session_id = OLD.id) THEN
+    -- OLD is the latest row version after EvalPlanQual. Unlike a subquery
+    -- under READ COMMITTED, this counter therefore observes an approval that
+    -- committed while this UPDATE was blocked on the session row lock.
+    IF OLD.status <> 'pending' OR OLD.decision_count > 0 THEN
         RAISE EXCEPTION
             'privileged_access request fields are immutable once decisions exist for session %',
             OLD.id
@@ -302,6 +353,20 @@ DECLARE
     target_company_id UUID := COALESCE(NEW.company_id, OLD.company_id);
     session_status TEXT;
 BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF NOT EXISTS (SELECT 1 FROM companies WHERE id = OLD.company_id) THEN
+            RETURN OLD; -- tenant cascade
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM privileged_access_sessions
+                       WHERE id = OLD.session_id) THEN
+            RETURN OLD; -- session/company cascade
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM org_units
+                       WHERE company_id = OLD.company_id AND id = OLD.org_unit_id) THEN
+            RETURN OLD; -- org-unit cascade; history retains the approved scope
+        END IF;
+    END IF;
+
     SELECT status INTO session_status
       FROM privileged_access_sessions
      WHERE company_id = target_company_id AND id = target_session_id
@@ -439,10 +504,12 @@ CREATE TABLE privileged_access_session_history (
     id             BIGSERIAL PRIMARY KEY,
     live_session_id UUID        NOT NULL,
     company_id     UUID         NOT NULL,
+    change_kind    TEXT         NOT NULL CHECK (change_kind IN ('insert','transition','delete')),
     old_status     TEXT,
     new_status     TEXT         NOT NULL,
     request_snapshot JSONB      NOT NULL,
     scope_snapshot JSONB        NOT NULL,
+    approval_snapshot JSONB     NOT NULL,
     database_actor TEXT         NOT NULL DEFAULT session_user,
     changed_at     TIMESTAMPTZ  NOT NULL DEFAULT clock_timestamp()
 );
@@ -457,10 +524,11 @@ BEGIN
         RETURN NEW;
     END IF;
     INSERT INTO privileged_access_session_history
-        (live_session_id, company_id, old_status, new_status,
-         request_snapshot, scope_snapshot)
+        (live_session_id, company_id, change_kind, old_status, new_status,
+         request_snapshot, scope_snapshot, approval_snapshot)
     VALUES
         (NEW.id, NEW.company_id,
+         CASE WHEN TG_OP = 'INSERT' THEN 'insert' ELSE 'transition' END,
          CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE OLD.status END,
          NEW.status,
          jsonb_build_object(
@@ -472,6 +540,7 @@ BEGIN
              'expires_at', NEW.expires_at,
              'allow_llm', NEW.allow_llm,
              'require_dual_approval', NEW.require_dual_approval,
+             'decision_count', NEW.decision_count,
              'activated_at', NEW.activated_at,
              'revoked_at', NEW.revoked_at,
              'revoked_by', NEW.revoked_by,
@@ -479,8 +548,14 @@ BEGIN
          COALESCE((
              SELECT jsonb_agg(to_jsonb(s) - 'company_id' - 'session_id'
                               ORDER BY s.org_unit_id)
-               FROM privileged_access_scopes s
+              FROM privileged_access_scopes s
               WHERE s.session_id = NEW.id
+         ), '[]'::jsonb),
+         COALESCE((
+             SELECT jsonb_agg(to_jsonb(a) - 'company_id' - 'session_id'
+                              ORDER BY a.decided_at, a.approver_user_id)
+               FROM privileged_access_approvals a
+              WHERE a.session_id = NEW.id
          ), '[]'::jsonb));
     RETURN NEW;
 END;
@@ -489,6 +564,51 @@ $$;
 CREATE TRIGGER privileged_access_sessions_history
     AFTER INSERT OR UPDATE ON privileged_access_sessions
     FOR EACH ROW EXECUTE FUNCTION privileged_access_sessions_write_history();
+
+-- Capture the final live request, scopes, and decisions before child CASCADEs
+-- run. This is the durable audit record that permits operational rows to be
+-- removed during tenant offboarding without losing historical evidence.
+CREATE OR REPLACE FUNCTION privileged_access_sessions_write_delete_history()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO privileged_access_session_history
+        (live_session_id, company_id, change_kind, old_status, new_status,
+         request_snapshot, scope_snapshot, approval_snapshot)
+    VALUES
+        (OLD.id, OLD.company_id, 'delete', OLD.status, OLD.status,
+         jsonb_build_object(
+             'subject_user_id', OLD.subject_user_id,
+             'requested_by', OLD.requested_by,
+             'purpose', OLD.purpose,
+             'access_kind', OLD.access_kind,
+             'starts_at', OLD.starts_at,
+             'expires_at', OLD.expires_at,
+             'allow_llm', OLD.allow_llm,
+             'require_dual_approval', OLD.require_dual_approval,
+             'decision_count', OLD.decision_count,
+             'activated_at', OLD.activated_at,
+             'revoked_at', OLD.revoked_at,
+             'revoked_by', OLD.revoked_by,
+             'revocation_reason', OLD.revocation_reason),
+         COALESCE((
+             SELECT jsonb_agg(to_jsonb(s) - 'company_id' - 'session_id'
+                              ORDER BY s.org_unit_id)
+               FROM privileged_access_scopes s
+              WHERE s.session_id = OLD.id
+         ), '[]'::jsonb),
+         COALESCE((
+             SELECT jsonb_agg(to_jsonb(a) - 'company_id' - 'session_id'
+                              ORDER BY a.decided_at, a.approver_user_id)
+               FROM privileged_access_approvals a
+              WHERE a.session_id = OLD.id
+         ), '[]'::jsonb));
+    RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER privileged_access_sessions_delete_history
+    BEFORE DELETE ON privileged_access_sessions
+    FOR EACH ROW EXECUTE FUNCTION privileged_access_sessions_write_delete_history();
 
 CREATE OR REPLACE FUNCTION privileged_access_history_append_only()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -505,3 +625,6 @@ CREATE TRIGGER privileged_access_session_history_no_update
 CREATE TRIGGER privileged_access_session_history_no_delete
     BEFORE DELETE ON privileged_access_session_history
     FOR EACH ROW EXECUTE FUNCTION privileged_access_history_append_only();
+CREATE TRIGGER privileged_access_session_history_no_truncate
+    BEFORE TRUNCATE ON privileged_access_session_history
+    FOR EACH STATEMENT EXECUTE FUNCTION privileged_access_history_append_only();
