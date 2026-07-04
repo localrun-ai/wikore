@@ -250,3 +250,16 @@ TEST_CASE("make_llm_provider: openai_compatible throws without base_url",
     // base_url intentionally empty
     CHECK_THROWS_AS(make_llm_provider(cfg), std::invalid_argument);
 }
+
+TEST_CASE("make_llm_provider: gemini returns stub provider (not null, not throw)",
+          "[llm_provider][factory]")
+{
+    LlmProviderConfig cfg;
+    cfg.id       = "gem";
+    cfg.provider = "gemini";
+    cfg.model    = "gemini-pro";
+    // Gemini does not require base_url or azure_api_version.
+    auto p = make_llm_provider(cfg);
+    REQUIRE(p != nullptr);
+    // Stub must not throw on construction. It will return unavailable on call.
+}

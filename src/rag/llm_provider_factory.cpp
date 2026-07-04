@@ -14,6 +14,31 @@ std::shared_ptr<LlmProviderPort> make_openai_compatible_provider(const LlmProvid
 std::shared_ptr<LlmProviderPort> make_azure_openai_provider(const LlmProviderConfig&);
 std::shared_ptr<LlmProviderPort> make_anthropic_provider(const LlmProviderConfig&);
 
+// ---------------------------------------------------------------------------
+// GeminiStubAdapter — placeholder until the real adapter is implemented.
+// Accepts construction so DB-configured gemini rows load without crashing;
+// returns Error::unavailable on any call so callers get a clear message.
+// ---------------------------------------------------------------------------
+namespace {
+class GeminiStubAdapter final : public LlmProviderPort {
+public:
+    explicit GeminiStubAdapter(LlmProviderConfig cfg) : cfg_(std::move(cfg)) {}
+
+    drogon::Task<Result<ChatResponse>>
+    chat(ChatRequest, double) const override {
+        co_return std::unexpected(
+            Error::unavailable("llm: gemini provider not yet implemented"));
+    }
+    drogon::Task<Result<ChatResponse>>
+    chat_stream(ChatRequest, std::function<void(ChatChunk)>, double) const override {
+        co_return std::unexpected(
+            Error::unavailable("llm: gemini provider not yet implemented"));
+    }
+private:
+    LlmProviderConfig cfg_;
+};
+} // namespace
+
 std::shared_ptr<LlmProviderPort>
 make_llm_provider(const LlmProviderConfig& cfg)
 {
@@ -23,8 +48,10 @@ make_llm_provider(const LlmProviderConfig& cfg)
         return make_azure_openai_provider(cfg);
     if (cfg.provider == "anthropic")
         return make_anthropic_provider(cfg);
-    // gemini adapter is a follow-up; reject gracefully so the caller gets a
-    // clear error rather than a null-deref later.
+    if (cfg.provider == "gemini") {
+        spdlog::info("[llm-factory] gemini provider configured but not yet implemented");
+        return std::make_shared<GeminiStubAdapter>(cfg);
+    }
     spdlog::error("[llm-factory] unsupported provider type '{}'", cfg.provider);
     throw std::invalid_argument("unsupported llm provider: " + cfg.provider);
 }

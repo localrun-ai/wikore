@@ -118,8 +118,8 @@ public:
         }
 
         if (resp->getStatusCode() != drogon::k200OK) {
-            spdlog::warn("[llm-anthropic] HTTP {}: {}",
-                static_cast<int>(resp->getStatusCode()), resp->getBody());
+            spdlog::warn("[llm-anthropic] HTTP {} (non-200)",
+                static_cast<int>(resp->getStatusCode()));
             co_return std::unexpected(Error::unavailable(
                 std::format("llm: HTTP {}", static_cast<int>(resp->getStatusCode()))));
         }
@@ -209,14 +209,17 @@ public:
 
                 // Anthropic error event: {"type":"error","error":{...}}
                 if (current_event == "error") {
-                    spdlog::warn("[llm-anthropic] upstream error event: {}",
-                                 std::string(payload));
+                    spdlog::warn("[llm-anthropic] upstream error event received");
                     co_return std::unexpected(
                         Error::unavailable("llm: upstream returned error in stream"));
                 }
 
                 AnthropicStreamEvent ev;
-                if (glz::read_json(ev, std::string(payload))) continue;
+                if (glz::read_json(ev, std::string(payload))) {
+                    spdlog::warn("[llm-anthropic] malformed SSE chunk; aborting stream");
+                    co_return std::unexpected(
+                        Error::unavailable("llm: malformed SSE chunk in stream"));
+                }
 
                 if (current_event == "content_block_delta"
                     && ev.delta.type == "text_delta"

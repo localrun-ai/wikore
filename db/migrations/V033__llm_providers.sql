@@ -63,9 +63,12 @@ CREATE TABLE llm_providers (
     -- openai_compatible rows require a base_url (the endpoint differs per deployment).
     CONSTRAINT llm_providers_openai_compat_requires_base_url_chk
         CHECK (provider <> 'openai_compatible' OR (base_url IS NOT NULL AND base_url <> '')),
-    -- azure_openai rows must supply a deployment URL and api-version.
+    -- azure_openai rows must supply a non-empty deployment URL and api-version.
     CONSTRAINT llm_providers_azure_requires_base_url_chk
-        CHECK (provider <> 'azure_openai' OR (base_url IS NOT NULL AND azure_api_version IS NOT NULL))
+        CHECK (provider <> 'azure_openai' OR (
+            base_url IS NOT NULL AND base_url <> ''
+            AND azure_api_version IS NOT NULL AND azure_api_version <> ''
+        ))
 );
 
 -- At most one default per (company_id) scope.

@@ -149,9 +149,8 @@ public:
         }
 
         if (resp->getStatusCode() != drogon::k200OK) {
-            spdlog::warn("[llm-openai] HTTP {} from {}: {}",
-                static_cast<int>(resp->getStatusCode()),
-                cfg_.base_url, resp->getBody());
+            spdlog::warn("[llm-openai] HTTP {} (non-200)",
+                static_cast<int>(resp->getStatusCode()));
             co_return std::unexpected(Error::unavailable(
                 std::format("llm: HTTP {}", static_cast<int>(resp->getStatusCode()))));
         }
@@ -159,8 +158,7 @@ public:
         OaiResponse oai_resp;
         auto parse_err = glz::read_json(oai_resp, resp->getBody());
         if (parse_err) {
-            spdlog::warn("[llm-openai] JSON parse error: {}",
-                         glz::format_error(parse_err, resp->getBody()));
+            spdlog::warn("[llm-openai] response JSON parse failed");
             co_return std::unexpected(Error::unavailable("llm: invalid response JSON"));
         }
         if (oai_resp.choices.empty()) {
@@ -245,15 +243,13 @@ public:
 
             OaiStreamChunk chunk;
             if (glz::read_json(chunk, json_payload)) {
-                // Unparseable chunk — check if it looks like an error object
-                // {"error": {...}} — abort rather than silently skip.
-                if (json_payload.find("\"error\"") != std::string::npos) {
-                    spdlog::warn("[llm-openai] upstream error in stream: {}",
-                                 json_payload);
-                    co_return std::unexpected(Error::unavailable(
-                        "llm: upstream returned error in stream"));
-                }
-                continue; // genuinely unparseable (e.g. partial chunk) — skip
+                // Any non-empty data line that fails JSON parse is a corrupt
+                // stream — error objects and truncated chunks alike. Never skip
+                // silently: stream completion after a skip would return
+                // truncated content as success.
+                spdlog::warn("[llm-openai] malformed SSE chunk; aborting stream");
+                co_return std::unexpected(
+                    Error::unavailable("llm: malformed SSE chunk in stream"));
             }
 
             if (!chunk.choices.empty()) {
@@ -384,8 +380,8 @@ public:
                 std::format("llm: azure upstream error: {}", e.what())));
         }
         if (resp->getStatusCode() != drogon::k200OK) {
-            spdlog::warn("[llm-azure] HTTP {}: {}",
-                static_cast<int>(resp->getStatusCode()), resp->getBody());
+            spdlog::warn("[llm-azure] HTTP {} (non-200)",
+                static_cast<int>(resp->getStatusCode()));
             co_return std::unexpected(Error::unavailable(
                 std::format("llm: HTTP {}", static_cast<int>(resp->getStatusCode()))));
         }
@@ -446,12 +442,9 @@ public:
             if (json_payload.empty()) continue;
             OaiStreamChunk chunk;
             if (glz::read_json(chunk, json_payload)) {
-                if (json_payload.find("\"error\"") != std::string::npos) {
-                    spdlog::warn("[llm-azure] upstream error in stream: {}", json_payload);
-                    co_return std::unexpected(
-                        Error::unavailable("llm: upstream returned error in stream"));
-                }
-                continue;
+                spdlog::warn("[llm-azure] malformed SSE chunk; aborting stream");
+                co_return std::unexpected(
+                    Error::unavailable("llm: malformed SSE chunk in stream"));
             }
             if (!chunk.choices.empty() && !chunk.choices[0].delta.content.empty()) {
                 accumulated += chunk.choices[0].delta.content;
