@@ -20,6 +20,7 @@ add_executable(wikore_tests
     test_resync_worker.cpp
     test_wiki_query_handler.cpp
     test_me_handler.cpp
+    test_orgs_tree_handler.cpp
 )
 target_link_libraries(wikore_tests PRIVATE
     wikore_ingest_lib
