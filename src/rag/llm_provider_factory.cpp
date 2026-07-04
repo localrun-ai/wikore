@@ -11,6 +11,7 @@ namespace wikore::rag {
 
 // Forward declarations from the individual adapter translation units.
 std::shared_ptr<LlmProviderPort> make_openai_compatible_provider(const LlmProviderConfig&);
+std::shared_ptr<LlmProviderPort> make_azure_openai_provider(const LlmProviderConfig&);
 std::shared_ptr<LlmProviderPort> make_anthropic_provider(const LlmProviderConfig&);
 
 std::shared_ptr<LlmProviderPort>
@@ -18,6 +19,8 @@ make_llm_provider(const LlmProviderConfig& cfg)
 {
     if (cfg.provider == "openai_compatible")
         return make_openai_compatible_provider(cfg);
+    if (cfg.provider == "azure_openai")
+        return make_azure_openai_provider(cfg);
     if (cfg.provider == "anthropic")
         return make_anthropic_provider(cfg);
     // gemini adapter is a follow-up; reject gracefully so the caller gets a

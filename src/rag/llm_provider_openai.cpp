@@ -42,12 +42,19 @@ struct OaiMessage {
     std::string content;
 };
 
+struct OaiStreamOptions {
+    bool include_usage = true;
+};
+
 struct OaiRequest {
     std::string              model;
     std::vector<OaiMessage>  messages;
     int                      max_tokens  = 2048;
     float                    temperature = 0.1f;
     bool                     stream      = false;
+    // stream_options is only included when stream=true.
+    // glaze will skip this field when stream=false because we set it only then.
+    std::optional<OaiStreamOptions> stream_options;
 };
 
 // Non-streaming response
@@ -71,7 +78,6 @@ struct OaiDelta {
 };
 struct OaiStreamChoice {
     OaiDelta    delta;
-    bool        finish_reason_is_stop = false; // not parsed; presence of [DONE] is enough
 };
 struct OaiStreamUsage {
     int prompt_tokens     = 0;
@@ -269,9 +275,16 @@ private:
     {
         OaiRequest oai;
         oai.model       = req.model.empty() ? cfg_.model : req.model;
-        oai.max_tokens  = req.max_tokens  > 0 ? req.max_tokens  : cfg_.max_tokens;
-        oai.temperature = req.temperature >= 0 ? req.temperature : cfg_.temperature;
+        // 0 = sentinel: use provider default
+        oai.max_tokens  = (req.max_tokens > 0) ? req.max_tokens : cfg_.max_tokens;
+        // negative = sentinel: use provider default
+        oai.temperature = (req.temperature >= 0) ? req.temperature : cfg_.temperature;
         oai.stream      = stream;
+        // Ask providers to include token usage in the final streaming chunk.
+        // OpenAI requires stream_options.include_usage=true for this; omitting
+        // it leaves usage at zero.
+        if (stream)
+            oai.stream_options = OaiStreamOptions{.include_usage = true};
         oai.messages.reserve(req.messages.size());
         for (const auto& m : req.messages)
             oai.messages.push_back({.role = m.role, .content = m.content});
@@ -291,6 +304,176 @@ private:
     }
 };
 
+// ---------------------------------------------------------------------------
+// AzureOpenAiAdapter — Azure OpenAI deployment endpoint.
+//
+// Azure OpenAI has a different URL scheme and auth header from vanilla
+// OpenAI-compatible APIs:
+//   URL:    {base_url}/chat/completions?api-version={azure_api_version}
+//   Auth:   api-key: <key>   (not Authorization: Bearer)
+//   Model:  ignored in body — the deployment URL already encodes the model.
+//
+// base_url must be the full deployment URL:
+//   https://{resource}.openai.azure.com/openai/deployments/{deployment}
+// ---------------------------------------------------------------------------
+
+class AzureOpenAiAdapter final : public LlmProviderPort {
+public:
+    explicit AzureOpenAiAdapter(LlmProviderConfig cfg)
+        : cfg_(std::move(cfg))
+    {
+        if (cfg_.base_url.empty())
+            throw std::invalid_argument("azure_openai: base_url required");
+        if (cfg_.azure_api_version.empty())
+            throw std::invalid_argument("azure_openai: azure_api_version required");
+
+        // Extract scheme+host for the HttpClient; path will include the rest.
+        // e.g. "https://myres.openai.azure.com/openai/deployments/gpt4"
+        //   -> client at "https://myres.openai.azure.com"
+        //   -> path "/openai/deployments/gpt4/chat/completions?api-version=..."
+        auto slash3 = cfg_.base_url.find("//");
+        std::string host_part = cfg_.base_url;
+        path_prefix_ = "";
+        if (slash3 != std::string::npos) {
+            auto path_start = cfg_.base_url.find('/', slash3 + 2);
+            if (path_start != std::string::npos) {
+                host_part    = cfg_.base_url.substr(0, path_start);
+                path_prefix_ = cfg_.base_url.substr(path_start);
+            }
+        }
+        client_ = drogon::HttpClient::newHttpClient(host_part);
+        client_->setPipeliningDepth(0);
+    }
+
+    drogon::Task<Result<ChatResponse>>
+    chat(ChatRequest req, double timeout_s) const override
+    {
+        auto [body, err] = build_request(req, false);
+        if (!err.empty()) co_return std::unexpected(Error::invalid_input(err));
+
+        auto http_req = make_http_request(std::move(body));
+        drogon::HttpResponsePtr resp;
+        try {
+            resp = co_await client_->sendRequestCoro(
+                http_req, static_cast<float>(timeout_s));
+        } catch (const std::exception& e) {
+            co_return std::unexpected(Error::unavailable(
+                std::format("llm: azure upstream error: {}", e.what())));
+        }
+        if (resp->getStatusCode() != drogon::k200OK) {
+            spdlog::warn("[llm-azure] HTTP {}: {}",
+                static_cast<int>(resp->getStatusCode()), resp->getBody());
+            co_return std::unexpected(Error::unavailable(
+                std::format("llm: HTTP {}", static_cast<int>(resp->getStatusCode()))));
+        }
+        OaiResponse oai_resp;
+        if (glz::read_json(oai_resp, resp->getBody()))
+            co_return std::unexpected(Error::unavailable("llm: invalid response JSON"));
+        if (oai_resp.choices.empty())
+            co_return std::unexpected(Error::unavailable("llm: empty choices"));
+        co_return ChatResponse{
+            .content       = oai_resp.choices[0].message.content,
+            .input_tokens  = oai_resp.usage.prompt_tokens,
+            .output_tokens = oai_resp.usage.completion_tokens,
+            .model         = cfg_.model,
+            .provider_id   = cfg_.id,
+        };
+    }
+
+    drogon::Task<Result<ChatResponse>>
+    chat_stream(ChatRequest                    req,
+                std::function<void(ChatChunk)> on_chunk,
+                double                         timeout_s) const override
+    {
+        auto [body, err] = build_request(req, true);
+        if (!err.empty()) co_return std::unexpected(Error::invalid_input(err));
+
+        auto http_req = make_http_request(std::move(body));
+        drogon::HttpResponsePtr resp;
+        try {
+            resp = co_await client_->sendRequestCoro(
+                http_req, static_cast<float>(timeout_s));
+        } catch (const std::exception& e) {
+            co_return std::unexpected(Error::unavailable(
+                std::format("llm: azure upstream error: {}", e.what())));
+        }
+        if (resp->getStatusCode() != drogon::k200OK) {
+            co_return std::unexpected(Error::unavailable(
+                std::format("llm: HTTP {}", static_cast<int>(resp->getStatusCode()))));
+        }
+
+        // SSE parsing identical to OpenAiCompatibleAdapter
+        std::string accumulated;
+        int input_tokens = 0, output_tokens = 0;
+        std::string_view raw = resp->getBody();
+        std::size_t pos = 0;
+        while (pos < raw.size()) {
+            auto nl = raw.find('\n', pos);
+            std::string_view line = (nl == std::string_view::npos)
+                ? raw.substr(pos) : raw.substr(pos, nl - pos);
+            if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+            pos = (nl == std::string_view::npos) ? raw.size() : nl + 1;
+            if (line.empty()) continue;
+            std::string json_payload;
+            if (!parse_sse_line(line, json_payload)) break;
+            if (json_payload.empty()) continue;
+            OaiStreamChunk chunk;
+            if (glz::read_json(chunk, json_payload)) continue;
+            if (!chunk.choices.empty() && !chunk.choices[0].delta.content.empty()) {
+                accumulated += chunk.choices[0].delta.content;
+                on_chunk(ChatChunk{.content = chunk.choices[0].delta.content});
+            }
+            if (chunk.usage.prompt_tokens > 0)     input_tokens  = chunk.usage.prompt_tokens;
+            if (chunk.usage.completion_tokens > 0) output_tokens = chunk.usage.completion_tokens;
+        }
+        on_chunk(ChatChunk{.done = true});
+        co_return ChatResponse{
+            .content       = std::move(accumulated),
+            .input_tokens  = input_tokens,
+            .output_tokens = output_tokens,
+            .model         = cfg_.model,
+            .provider_id   = cfg_.id,
+        };
+    }
+
+private:
+    LlmProviderConfig                           cfg_;
+    std::string                                 path_prefix_;
+    mutable std::shared_ptr<drogon::HttpClient> client_;
+
+    std::pair<std::string, std::string>
+    build_request(const ChatRequest& req, bool stream) const
+    {
+        OaiRequest oai;
+        // Azure ignores the model field in the body (deployment URL encodes it),
+        // but some versions echo it back; send cfg_.model for consistency.
+        oai.model       = cfg_.model;
+        oai.max_tokens  = (req.max_tokens > 0) ? req.max_tokens : cfg_.max_tokens;
+        oai.temperature = (req.temperature >= 0) ? req.temperature : cfg_.temperature;
+        oai.stream      = stream;
+        if (stream)
+            oai.stream_options = OaiStreamOptions{.include_usage = true};
+        for (const auto& m : req.messages)
+            oai.messages.push_back({.role = m.role, .content = m.content});
+
+        std::string body;
+        if (glz::write_json(oai, body)) return {"", "llm: failed to serialise request"};
+        return {std::move(body), ""};
+    }
+
+    drogon::HttpRequestPtr make_http_request(std::string body) const
+    {
+        auto req = drogon::HttpRequest::newHttpRequest();
+        req->setMethod(drogon::Post);
+        req->setPath(path_prefix_ + "/chat/completions?api-version="
+                     + cfg_.azure_api_version);
+        req->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+        req->setBody(std::move(body));
+        req->addHeader("api-key", cfg_.api_key);
+        return req;
+    }
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -301,6 +484,12 @@ std::shared_ptr<LlmProviderPort>
 make_openai_compatible_provider(const LlmProviderConfig& cfg)
 {
     return std::make_shared<OpenAiCompatibleAdapter>(cfg);
+}
+
+std::shared_ptr<LlmProviderPort>
+make_azure_openai_provider(const LlmProviderConfig& cfg)
+{
+    return std::make_shared<AzureOpenAiAdapter>(cfg);
 }
 
 } // namespace wikore::rag

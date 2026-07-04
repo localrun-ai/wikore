@@ -4,9 +4,13 @@
 -- company (or a system-wide default when company_id IS NULL).
 --
 -- Provider types:
---   openai_compatible  — anything speaking POST /v1/chat/completions with
---                        OpenAI-format SSE: llama.cpp, Ollama, vLLM, OpenAI,
---                        Groq, Together.ai, Mistral, Perplexity, Azure OpenAI.
+--   openai_compatible  — POST /v1/chat/completions with OpenAI-format SSE:
+--                        llama.cpp, Ollama, vLLM, OpenAI, Groq, Together.ai,
+--                        Mistral, Perplexity.
+--   azure_openai       — Azure OpenAI deployments.  Uses a deployment-specific
+--                        URL, api-version query param, and api-key header.
+--                        base_url must be the full deployment URL:
+--                        https://{resource}.openai.azure.com/openai/deployments/{dep}
 --   anthropic          — Anthropic Messages API (POST /v1/messages).
 --   gemini             — Google Gemini REST API.
 --
@@ -26,14 +30,20 @@ CREATE TABLE llm_providers (
     provider            TEXT        NOT NULL
                             CHECK (provider IN (
                                 'openai_compatible',
+                                'azure_openai',
                                 'anthropic',
                                 'gemini'
                             )),
     display_name        TEXT        NOT NULL,
-    -- base_url required for openai_compatible; NULL for anthropic/gemini
-    -- (SDK default endpoints are used).
+    -- base_url:
+    --   openai_compatible: e.g. http://localhost:8080/v1 (required)
+    --   azure_openai:      full deployment URL (required)
+    --   anthropic/gemini:  NULL uses the SDK default endpoint
     base_url            TEXT,
     model               TEXT        NOT NULL,
+    -- azure_api_version: required for azure_openai (e.g. '2024-02-01'),
+    -- ignored for other providers.
+    azure_api_version   TEXT,
     max_tokens          INT         NOT NULL DEFAULT 2048
                             CHECK (max_tokens BETWEEN 1 AND 131072),
     temperature         NUMERIC(4,3) NOT NULL DEFAULT 0.100
@@ -49,7 +59,10 @@ CREATE TABLE llm_providers (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT llm_providers_credentials_key_id_consistent_chk
-        CHECK ((credentials IS NULL) = (credentials_key_id IS NULL))
+        CHECK ((credentials IS NULL) = (credentials_key_id IS NULL)),
+    -- azure_openai rows must supply a deployment URL and api-version.
+    CONSTRAINT llm_providers_azure_requires_base_url_chk
+        CHECK (provider <> 'azure_openai' OR (base_url IS NOT NULL AND azure_api_version IS NOT NULL))
 );
 
 -- At most one default per (company_id) scope.
@@ -61,11 +74,38 @@ CREATE UNIQUE INDEX llm_providers_one_default_per_scope_idx
 
 CREATE INDEX llm_providers_company_idx ON llm_providers (company_id);
 
+-- Ensure created_by belongs to the same company as the row (when company_id
+-- is not NULL).  System-wide rows (company_id IS NULL) may be created by any
+-- admin user and are exempt.
+CREATE OR REPLACE FUNCTION llm_providers_created_by_same_company()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.company_id IS NOT NULL AND NEW.created_by IS NOT NULL THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM users
+            WHERE id = NEW.created_by
+              AND company_id = NEW.company_id
+        ) THEN
+            RAISE EXCEPTION
+                'llm_providers.created_by must belong to company %',
+                NEW.company_id
+                USING ERRCODE = 'foreign_key_violation',
+                      CONSTRAINT = 'llm_providers_created_by_same_company_fk';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER llm_providers_created_by_same_company_trg
+    BEFORE INSERT OR UPDATE ON llm_providers
+    FOR EACH ROW EXECUTE FUNCTION llm_providers_created_by_same_company();
+
 CREATE TRIGGER llm_providers_updated_at
     BEFORE UPDATE ON llm_providers
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 COMMENT ON TABLE llm_providers IS
     'Admin-managed LLM backend configurations. Supports OpenAI-compatible '
-    'local/cloud providers, Anthropic, and Gemini. Credentials are '
-    'encrypted with AES-256-GCM (same scheme as integrations table).';
+    'local/cloud providers, Azure OpenAI, Anthropic, and Gemini. Credentials '
+    'are encrypted with AES-256-GCM (same scheme as integrations table).';

@@ -43,8 +43,10 @@ struct ChatRequest {
     std::vector<ChatMessage> messages;
     // If empty, the adapter uses the model from its provider config.
     std::string model;
-    int         max_tokens  = 2048;
-    float       temperature = 0.1f;
+    // 0 = use provider default (cfg.max_tokens).
+    int         max_tokens  = 0;
+    // Negative = use provider default (cfg.temperature).
+    float       temperature = -1.0f;
 };
 
 // One streaming delta delivered via the on_chunk callback.
@@ -89,11 +91,12 @@ public:
 
 struct LlmProviderConfig {
     std::string id;            // llm_providers.id (UUID)
-    std::string provider;      // 'openai_compatible' | 'anthropic' | 'gemini'
+    std::string provider;      // 'openai_compatible' | 'azure_openai' | 'anthropic' | 'gemini'
     std::string display_name;
-    std::string base_url;      // OpenAI-compat only
+    std::string base_url;      // required for openai_compatible and azure_openai
     std::string model;
     std::string api_key;       // decrypted; empty for local/unauthenticated
+    std::string azure_api_version; // required for azure_openai (e.g. "2024-02-01")
     int         max_tokens  = 2048;
     float       temperature = 0.1f;
 };

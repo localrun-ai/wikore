@@ -110,6 +110,18 @@ const std::unordered_map<std::string, Error> k_constraint_map = {
     {"shared_chat_revoke_consistent_chk",
         Error::invalid_input("shared_chat revocation must set both revoked_at and revoked_by, or neither")},
 
+    // V033: llm_providers
+    {"llm_providers_credentials_key_id_consistent_chk",
+        Error::invalid_input("llm_provider credential key id consistency violation")},
+    {"llm_providers_azure_requires_base_url_chk",
+        Error::invalid_input("azure_openai provider requires base_url and azure_api_version")},
+    {"llm_providers_max_tokens_check",
+        Error::invalid_input("llm_provider max_tokens must be between 1 and 131072")},
+    {"llm_providers_temperature_check",
+        Error::invalid_input("llm_provider temperature must be between 0 and 2")},
+    {"llm_providers_provider_check",
+        Error::invalid_input("llm_provider type must be openai_compatible, azure_openai, anthropic, or gemini")},
+
     // -----------------------------------------------------------------------
     // Enum / domain CHECKs (input validation): PG-generated names from
     // `column ... CHECK (column = ANY (...))`. Each maps to invalid_input.
