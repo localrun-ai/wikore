@@ -346,14 +346,26 @@ std::string parse_worksheet(const std::string&              xml,
                     }
                 }
             } else if (type == "inlineStr") {
+                // Rich inline strings use <is><r><t>...</t></r></is>;
+                // plain ones use <is><t>...</t></is>.  Collect all <t>
+                // descendants with a BFS bounded by kXlsxXmlMaxDepth.
                 auto is = child_by_local(c, "is");
-                if (is)
-                    for (const auto& t : is.children()) {
-                        if (local_name(t.name()) != "t") continue;
-                        std::string_view tv = t.text().get();
-                        if (!charge(tv.size())) { budget_exceeded = true; break; }
-                        val += tv;
+                if (is) {
+                    std::queue<std::pair<pugi::xml_node, int>> q;
+                    q.push({is, 0});
+                    while (!q.empty() && !budget_exceeded) {
+                        auto [n, d] = q.front(); q.pop();
+                        if (local_name(n.name()) == "t") {
+                            std::string_view tv = n.text().get();
+                            if (!charge(tv.size())) { budget_exceeded = true; break; }
+                            val += tv;
+                            continue; // <t> has no meaningful children
+                        }
+                        if (d < kXlsxXmlMaxDepth)
+                            for (const auto& child : n.children())
+                                q.push({child, d + 1});
                     }
+                }
             } else if (type == "b") {
                 auto v = child_by_local(c, "v");
                 val = (v && std::string_view(v.text().get()) == "1")
@@ -371,13 +383,22 @@ std::string parse_worksheet(const std::string&              xml,
                 auto v = child_by_local(c, "v");
                 if (!v) {
                     auto is = child_by_local(c, "is");
-                    if (is)
-                        for (const auto& t : is.children()) {
-                            if (local_name(t.name()) != "t") continue;
-                            std::string_view tv = t.text().get();
-                            if (!charge(tv.size())) { budget_exceeded = true; break; }
-                            val += tv;
+                    if (is) {
+                        std::queue<std::pair<pugi::xml_node, int>> q;
+                        q.push({is, 0});
+                        while (!q.empty() && !budget_exceeded) {
+                            auto [n, d] = q.front(); q.pop();
+                            if (local_name(n.name()) == "t") {
+                                std::string_view tv = n.text().get();
+                                if (!charge(tv.size())) { budget_exceeded = true; break; }
+                                val += tv;
+                                continue;
+                            }
+                            if (d < kXlsxXmlMaxDepth)
+                                for (const auto& child : n.children())
+                                    q.push({child, d + 1});
                         }
+                    }
                 } else {
                     std::string_view nv = v.text().get();
                     if (!charge(nv.size())) { budget_exceeded = true; break; }

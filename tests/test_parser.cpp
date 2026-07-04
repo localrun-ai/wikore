@@ -1293,3 +1293,22 @@ TEST_CASE("XlsxParser: repeated large shared string hits budget before materiali
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().message == "ingest.xlsx.content_limit_exceeded");
 }
+
+TEST_CASE("XlsxParser: rich inline strings collect all <r><t> runs",
+          "[parser][xlsx]")
+{
+    // rich_inline.xlsx: A1 uses <is><r><t>Hello</t></r><r><t> World</t></r></is>
+    // B1 uses plain <is><t>Plain</t></is>.
+    // Previously only direct <is><t> children were read; <r><t> runs silently
+    // produced empty cells.
+    XlsxParser p;
+    auto content = load_fixture("rich_inline.xlsx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "rich_inline.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    REQUIRE(r.has_value());
+    REQUIRE(r->sections.size() == 1);
+    const auto& text = r->sections[0].text;
+    CHECK(text.find("Hello World") != std::string::npos);
+    CHECK(text.find("Plain") != std::string::npos);
+}
