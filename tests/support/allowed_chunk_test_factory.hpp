@@ -47,6 +47,7 @@ class TestToken {
 class TestGate {
 public:
     static AllowedChunk make(
+        std::string company_id,
         std::string chunk_id,
         std::string text,
         std::string document_version_id = "test-ver",
@@ -55,6 +56,7 @@ public:
     {
         return AllowedChunk{
             AllowedChunk::ConstructionToken{},
+            std::move(company_id),
             std::move(chunk_id),
             std::move(document_version_id),
             score,
@@ -64,17 +66,19 @@ public:
     }
 };
 
-// Convenience wrapper.
+// Convenience wrapper — defaults company_id to "test-company" for tests
+// that don't care about tenant binding.
 inline AllowedChunk make_chunk(
     std::string chunk_id,
     std::string text,
+    std::string company_id          = "test-company",
     std::string document_version_id = "test-ver",
     float       score               = 0.9f,
     std::optional<std::string> section_heading = std::nullopt)
 {
-    return TestGate::make(std::move(chunk_id), std::move(text),
-                          std::move(document_version_id), score,
-                          std::move(section_heading));
+    return TestGate::make(std::move(company_id), std::move(chunk_id),
+                          std::move(text), std::move(document_version_id),
+                          score, std::move(section_heading));
 }
 
 } // namespace wikore::rag::test_support

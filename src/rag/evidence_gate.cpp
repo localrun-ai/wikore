@@ -155,6 +155,7 @@ EvidenceGate::evaluate(std::string_view                   company_id,
             continue;
         out.push_back(AllowedChunk{
             AllowedChunk::ConstructionToken{},
+            std::string(company_id),           // tenant binding stamped here
             c.chunk_id,
             // Authoritative version from PG, NOT the (possibly stale) candidate:
             std::move(it->second.document_version_id),

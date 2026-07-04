@@ -168,12 +168,14 @@ public:
     };
 
     AllowedChunk(ConstructionToken,
+                 std::string  company_id,
                  std::string  chunk_id,
                  std::string  document_version_id,
                  float        score,
                  std::string  text,
                  std::optional<std::string> section_heading)
-        : chunk_id_(std::move(chunk_id))
+        : company_id_(std::move(company_id))
+        , chunk_id_(std::move(chunk_id))
         , document_version_id_(std::move(document_version_id))
         , score_(score)
         , text_(std::move(text))
@@ -181,6 +183,7 @@ public:
 
     AllowedChunk() = delete;
 
+    [[nodiscard]] const std::string& company_id()         const noexcept { return company_id_; }
     [[nodiscard]] const std::string& chunk_id()           const noexcept { return chunk_id_; }
     [[nodiscard]] const std::string& document_version_id()const noexcept { return document_version_id_; }
     [[nodiscard]] float              score()               const noexcept { return score_; }
@@ -189,6 +192,7 @@ public:
                                                                       { return section_heading_; }
 
 private:
+    std::string  company_id_;
     std::string  chunk_id_;
     std::string  document_version_id_;
     float        score_   = 0.0f;
