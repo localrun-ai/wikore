@@ -134,7 +134,7 @@ target_link_libraries(wikore_core PUBLIC
 target_link_libraries(wikore_core PRIVATE hiredis::hiredis)
 
 # ---------------------------------------------------------------------------
-# wikore_rag: embedder, retriever, reranker, generator, pipeline
+# wikore_rag: embedder, retriever, reranker, generator, pipeline, llm providers
 # ---------------------------------------------------------------------------
 add_library(wikore_rag STATIC
     src/rag/embedder.cpp
@@ -146,6 +146,9 @@ add_library(wikore_rag STATIC
     src/rag/evidence_gate.cpp
     src/rag/clearance.cpp
     src/rag/retrieval_orchestrator.cpp
+    src/rag/llm_provider_openai.cpp
+    src/rag/llm_provider_anthropic.cpp
+    src/rag/llm_provider_factory.cpp
 )
 target_link_libraries(wikore_rag PUBLIC wikore_core)
 

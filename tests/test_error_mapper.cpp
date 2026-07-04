@@ -142,6 +142,11 @@ const std::unordered_set<std::string> k_allowlist = {
     "wps_document_same_company_fk",
     "wps_version_belongs_to_document_fk",
     "wps_wiki_page_version_same_company_fk",
+
+    // V033: llm_providers
+    // The same-company trigger raises as foreign_key_violation with a named
+    // constraint; treated as a programming bug -> database_error.
+    "llm_providers_created_by_same_company_fk",
 };
 
 bool integration_db_available() {
