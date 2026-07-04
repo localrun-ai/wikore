@@ -160,6 +160,7 @@ add_library(wikore_ingest_lib STATIC
     src/ingest/docx_parser.cpp
     src/ingest/pptx_parser.cpp
     src/ingest/odt_parser.cpp
+    src/ingest/xlsx_parser.cpp
     src/ingest/html_parser.cpp
     src/ingest/document_repo.cpp
     src/ingest/worker.cpp

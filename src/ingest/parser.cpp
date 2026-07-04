@@ -56,7 +56,7 @@ Result<std::string> resolve_text_mime(const std::string& content,
     if (ext == ".pdf" && !is_pdf)
         return std::unexpected(Error::invalid_input("ingest.mime_type_mismatch"));
     if ((ext == ".docx" || ext == ".xlsx" || ext == ".pptx"
-         || ext == ".odp" || ext == ".ods") && !is_zip)
+         || ext == ".odt" || ext == ".odp" || ext == ".ods") && !is_zip)
         return std::unexpected(Error::invalid_input("ingest.mime_type_mismatch"));
     if (is_pdf)
         return std::string{"application/pdf"};
@@ -69,7 +69,13 @@ Result<std::string> resolve_text_mime(const std::string& content,
             return std::string{
                 "application/vnd.openxmlformats-officedocument"
                 ".presentationml.presentation"};
-        // xlsx/xls not yet supported
+        if (ext == ".xlsx")
+            return std::string{
+                "application/vnd.openxmlformats-officedocument"
+                ".spreadsheetml.sheet"};
+        if (ext == ".odt")
+            return std::string{"application/vnd.oasis.opendocument.text"};
+        // Legacy xls / odp / ods not supported
         return std::unexpected(Error::invalid_input("ingest.unsupported_format.office"));
     }
     if (content.find('\0') != std::string::npos)
@@ -81,8 +87,6 @@ Result<std::string> resolve_text_mime(const std::string& content,
         return std::string{"text/plain"};
     if (ext == ".html" || ext == ".htm")
         return std::string{"text/html"};
-    if (ext == ".odt")
-        return std::string{"application/vnd.oasis.opendocument.text"};
 
     if (mime_type == "text/markdown" || mime_type == "text/plain")
         return mime_type;
@@ -405,6 +409,37 @@ PlainTextParser::parse(const std::string& content,
         append_text(s);
 
     return doc;
+}
+
+// ---------------------------------------------------------------------------
+// DispatchingParser::parse
+// ---------------------------------------------------------------------------
+
+Result<ParsedDocument> DispatchingParser::parse(const std::string& content,
+                                                 const std::string& filename,
+                                                 const std::string& /*hint*/) const
+{
+    auto mime_res = resolve_text_mime(content, filename, {});
+    if (!mime_res) return std::unexpected(mime_res.error());
+    const std::string& mime = *mime_res;
+
+    if (mime == "application/pdf")
+        return PdfParser{}.parse(content, filename, mime);
+    if (mime == "application/vnd.openxmlformats-officedocument"
+                ".wordprocessingml.document")
+        return DocxParser{}.parse(content, filename, mime);
+    if (mime == "application/vnd.openxmlformats-officedocument"
+                ".presentationml.presentation")
+        return PptxParser{}.parse(content, filename, mime);
+    if (mime == "application/vnd.openxmlformats-officedocument"
+                ".spreadsheetml.sheet")
+        return XlsxParser{}.parse(content, filename, mime);
+    if (mime == "application/vnd.oasis.opendocument.text")
+        return OdtParser{}.parse(content, filename, mime);
+    if (mime == "text/html")
+        return HtmlParser{}.parse(content, filename, mime);
+    // text/plain, text/markdown, and all routed text/* MIME types
+    return PlainTextParser{}.parse(content, filename, mime);
 }
 
 } // namespace wikore::ingest

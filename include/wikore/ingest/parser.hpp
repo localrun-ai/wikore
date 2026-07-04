@@ -141,6 +141,32 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// XlsxParser: handles
+//   application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+//
+// Reads xl/workbook.xml for sheet order and names, xl/sharedStrings.xml for
+// string cells, and each xl/worksheets/sheetN.xml for row data.
+// Each worksheet becomes a ParsedSection at depth 1 (sheet name as heading).
+// Rows are rendered as pipe-separated cell values; empty rows are skipped.
+// Sparse rows (missing cells between A1 and C1) are padded with empty fields
+// to preserve column alignment.
+// Cell types handled: shared string (t="s"), numeric/formula (absent/t="str"),
+// inline string (t="inlineStr"), boolean (t="b"), error (t="e").
+// Security: 16 MiB per-entry cap, 128 MiB aggregate worksheet XML cap,
+// 16 MiB global output text budget (cells + separators, shared across all
+// sheets — prevents separator amplification from wide sparse rows),
+// 500-sheet cap with path deduplication (all return explicit errors).
+// All XML walks are iterative BFS with kXlsxXmlMaxDepth=64 depth limit.
+// ---------------------------------------------------------------------------
+
+class XlsxParser : public ParserPort {
+public:
+    Result<ParsedDocument> parse(const std::string& content,
+                                 const std::string& filename,
+                                 const std::string& mime_type) const override;
+};
+
+// ---------------------------------------------------------------------------
 // HtmlParser: handles text/html.
 //
 // Uses libxml2's HTML parser (robust against real-world malformed markup).
@@ -153,6 +179,21 @@ public:
 // ---------------------------------------------------------------------------
 
 class HtmlParser : public ParserPort {
+public:
+    Result<ParsedDocument> parse(const std::string& content,
+                                 const std::string& filename,
+                                 const std::string& mime_type) const override;
+};
+
+// ---------------------------------------------------------------------------
+// DispatchingParser — production routing layer.
+//
+// Calls resolve_text_mime() to determine the MIME type from the file extension
+// and content magic bytes, then dispatches to the appropriate concrete parser.
+// This is the parser to inject into IngestDocumentVersionUseCase in production.
+// ---------------------------------------------------------------------------
+
+class DispatchingParser : public ParserPort {
 public:
     Result<ParsedDocument> parse(const std::string& content,
                                  const std::string& filename,
