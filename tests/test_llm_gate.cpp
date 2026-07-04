@@ -3,12 +3,17 @@
 #include "wikore/redis.hpp"
 #include "wikore/config.hpp"
 
+#include <chrono>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
+#include <thread>
 
 // Tests for the per-tenant LLM guardrails (concurrency semaphore + token-bucket
-// rate limiter). The Redis primitives take an explicit now_ms, so refill and
-// lease-expiry are driven deterministically. Skips without REDIS_URL.
+// rate limiter). The clock lives in Redis (redis.call('TIME')), so time-based
+// behavior (lease expiry, refill) is exercised with real elapsed time via short
+// sleeps. Redis-backed cases skip without REDIS_URL; config validation does not
+// need Redis.
 
 namespace {
 
@@ -21,6 +26,8 @@ void init_redis()
     wikore::Redis::init(cfg);
 }
 
+void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+
 } // namespace
 
 TEST_CASE("sem_acquire: caps concurrency and reclaims expired leases", "[redis][llm-gate]")
@@ -30,18 +37,20 @@ TEST_CASE("sem_acquire: caps concurrency and reclaims expired leases", "[redis][
     const std::string k = "lr:test:sem:cap";
     wikore::Redis::del(k);
 
-    // cap = 2, lease ttl = 100 ms, all at t=1000.
-    CHECK(wikore::Redis::sem_acquire(k, 2, 100, "A", 1000) == 1);
-    CHECK(wikore::Redis::sem_acquire(k, 2, 100, "B", 1000) == 1);
-    CHECK(wikore::Redis::sem_acquire(k, 2, 100, "C", 1000) == 0);   // at capacity
+    // cap = 2, long lease so nothing expires mid-test.
+    CHECK(wikore::Redis::sem_acquire(k, 2, 60000, "A") == 1);
+    CHECK(wikore::Redis::sem_acquire(k, 2, 60000, "B") == 1);
+    CHECK(wikore::Redis::sem_acquire(k, 2, 60000, "C") == 0);   // at capacity
     wikore::Redis::sem_release(k, "A");
-    CHECK(wikore::Redis::sem_acquire(k, 2, 100, "C", 1000) == 1);   // slot freed
-
-    // Crash-safe reclaim: cap = 1. A acquired at t=1000 expires at t=1100.
+    CHECK(wikore::Redis::sem_acquire(k, 2, 60000, "C") == 1);   // slot freed
     wikore::Redis::del(k);
-    CHECK(wikore::Redis::sem_acquire(k, 1, 100, "A", 1000) == 1);
-    CHECK(wikore::Redis::sem_acquire(k, 1, 100, "B", 1050) == 0);   // A still active
-    CHECK(wikore::Redis::sem_acquire(k, 1, 100, "C", 1200) == 1);   // A expired -> pruned
+
+    // Crash-safe reclaim: cap = 1, 100 ms lease. A is never released; after the
+    // lease elapses a later acquire prunes it and admits.
+    CHECK(wikore::Redis::sem_acquire(k, 1, 100, "A") == 1);
+    CHECK(wikore::Redis::sem_acquire(k, 1, 100, "B") == 0);     // A still active
+    sleep_ms(200);
+    CHECK(wikore::Redis::sem_acquire(k, 1, 100, "C") == 1);     // A expired -> pruned
     wikore::Redis::del(k);
 }
 
@@ -52,20 +61,12 @@ TEST_CASE("token_bucket_take: meters burst and refills over time", "[redis][llm-
     const std::string k = "lr:test:rate:bucket";
     wikore::Redis::del(k);
 
-    // burst = 3, rate = 1 token/sec.
-    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 3, 1, 0) == 1);
-    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 3, 1, 0) == 1);
-    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 3, 1, 0) == 1);
-    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 3, 1, 0) == 0);   // empty
-
-    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 3, 1, 1000) == 1); // +1 after 1s
-    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 3, 1, 1000) == 0);
-
-    // 10s later refills but is capped at burst (3), not 10.
-    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 3, 1, 11000) == 1);
-    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 3, 1, 11000) == 1);
-    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 3, 1, 11000) == 1);
-    CHECK(wikore::Redis::token_bucket_take(k, 1.0, 3, 1, 11000) == 0);
+    // burst = 2, rate = 100 tokens/sec.
+    CHECK(wikore::Redis::token_bucket_take(k, 100.0, 2, 1) == 1);
+    CHECK(wikore::Redis::token_bucket_take(k, 100.0, 2, 1) == 1);
+    CHECK(wikore::Redis::token_bucket_take(k, 100.0, 2, 1) == 0);   // empty (refill negligible)
+    sleep_ms(100);                                                  // +~10 tokens, capped at 2
+    CHECK(wikore::Redis::token_bucket_take(k, 100.0, 2, 1) == 1);   // refilled
     wikore::Redis::del(k);
 }
 
@@ -107,8 +108,8 @@ TEST_CASE("LlmGate::allow_rate: burst then denial", "[redis][llm-gate]")
     if (!redis_available()) SKIP("REDIS_URL not set");
     init_redis();
     wikore::Redis::del("lr:llm:rate:tR");
-    // rate 1/sec, burst 3: three quick calls pass (no meaningful refill in <1ms),
-    // the fourth is denied.
+    // rate 1/sec, burst 3: three quick calls pass (refill negligible in the few
+    // ms they take), the fourth is denied.
     wikore::rag::LlmGate gate(wikore::rag::LlmLimits{
         .max_concurrency = 100, .rate_per_sec = 1.0, .burst = 3, .lease_ttl_ms = 60000});
 
@@ -117,4 +118,24 @@ TEST_CASE("LlmGate::allow_rate: burst then denial", "[redis][llm-gate]")
     CHECK(gate.allow_rate("tR"));
     CHECK_FALSE(gate.allow_rate("tR"));
     wikore::Redis::del("lr:llm:rate:tR");
+}
+
+TEST_CASE("LlmGate: rejects invalid limit configuration", "[llm-gate]")
+{
+    using wikore::rag::LlmGate;
+    using wikore::rag::LlmLimits;
+    const LlmLimits ok{.max_concurrency = 4, .rate_per_sec = 5.0, .burst = 15, .lease_ttl_ms = 120000};
+
+    CHECK_NOTHROW(LlmGate{ok});
+
+    auto bad = [&](auto mutate) {
+        LlmLimits l = ok; mutate(l);
+        CHECK_THROWS_AS(LlmGate{l}, std::invalid_argument);
+    };
+    bad([](LlmLimits& l){ l.max_concurrency = 0; });
+    bad([](LlmLimits& l){ l.max_concurrency = -1; });
+    bad([](LlmLimits& l){ l.rate_per_sec = 0.0; });
+    bad([](LlmLimits& l){ l.rate_per_sec = -0.5; });
+    bad([](LlmLimits& l){ l.burst = 0; });
+    bad([](LlmLimits& l){ l.lease_ttl_ms = 0; });
 }

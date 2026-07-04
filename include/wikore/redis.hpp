@@ -84,16 +84,17 @@ struct Redis {
     // --- Concurrency semaphore (lease-based, crash-safe) --------------------
 
     // Try to acquire one of at most `cap` slots on `key`. Implemented as a
-    // ZSET of lease tokens scored by their expiry (now_ms + lease_ttl_ms):
+    // ZSET of lease tokens scored by their expiry (server-now + lease_ttl_ms):
     // expired leases (from crashed holders) are pruned on every acquire, so a
-    // slot is never leaked permanently. `token` must be unique per holder and
-    // is passed back to sem_release. Returns:
+    // slot is never leaked permanently. The clock is read from redis.call
+    // ('TIME') inside the Lua script, so every app node shares ONE clock -
+    // client clock skew cannot mis-prune another node's active lease. `token`
+    // must be unique per holder and is passed back to sem_release. Returns:
     //   * 1  -> acquired (caller now holds a slot)
     //   * 0  -> at capacity
     //   * -1 -> Redis error / no pool (caller decides fail-open vs closed)
     static int sem_acquire(std::string_view key, int cap,
-                           long long lease_ttl_ms, std::string_view token,
-                           long long now_ms);
+                           long long lease_ttl_ms, std::string_view token);
 
     // Release the slot held under `token` (ZREM). Idempotent; safe if the
     // lease already expired.
@@ -102,12 +103,14 @@ struct Redis {
     // --- Token-bucket rate limiter ------------------------------------------
 
     // Atomically refill and take `cost` tokens from the bucket on `key`.
-    // The bucket refills at `refill_per_sec` up to `burst` capacity. Returns:
+    // The bucket refills at `refill_per_sec` up to `burst` capacity. The clock
+    // is read from redis.call('TIME') inside Lua (single shared clock), so
+    // skewed app nodes cannot repeatedly over-refill the bucket. Returns:
     //   * 1  -> allowed (tokens deducted)
     //   * 0  -> denied (insufficient tokens)
     //   * -1 -> Redis error / no pool
     static int token_bucket_take(std::string_view key, double refill_per_sec,
-                                 int burst, int cost, long long now_ms);
+                                 int burst, int cost);
 };
 
 } // namespace wikore

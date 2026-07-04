@@ -58,7 +58,12 @@ private:
 // Stateless; construct once from config and share across requests.
 class LlmGate {
 public:
-    explicit LlmGate(LlmLimits limits) : limits_(limits) {}
+    // Throws std::invalid_argument if any limit is out of range
+    // (max_concurrency >= 1, rate_per_sec > 0, burst >= 1, lease_ttl_ms >= 1):
+    // a zero/negative value would either disable protection or make the Lua
+    // arithmetic (e.g. burst/rate) fault, which fail-open would then silently
+    // ignore. Validate once at startup instead.
+    explicit LlmGate(LlmLimits limits);
 
     // Token-bucket check. true = within the tenant's rate (or Redis down).
     bool allow_rate(std::string_view company_id) const;
