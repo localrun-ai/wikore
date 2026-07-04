@@ -133,8 +133,24 @@ int main() {
         {drogon::Post, "wikore::AuthFilter"});
 
     drogon::app().registerHandler("/api/orgs/{1}",
+        [deps](Req req, CB cb, std::string org_unit_id) -> drogon::AsyncTask {
+            if (!deps->db) {   // before beginning advice populated it
+                auto r = drogon::HttpResponse::newHttpResponse();
+                r->setStatusCode(drogon::k503ServiceUnavailable);
+                r->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+                r->setBody(R"({"error":"service starting"})");
+                cb(r);
+                co_return;
+            }
+            auto resp = co_await wikore::api::org_get(deps->db, std::move(req),
+                                                      std::move(org_unit_id));
+            cb(resp);
+        },
+        {drogon::Get, "wikore::AuthFilter"});
+    // PATCH / DELETE of an org unit are not implemented yet.
+    drogon::app().registerHandler("/api/orgs/{1}",
         [](const Req&, CB&& cb, std::string) { cb(not_implemented()); },
-        {drogon::Get, drogon::HttpMethod::Patch, drogon::Delete, "wikore::AuthFilter"});
+        {drogon::HttpMethod::Patch, drogon::Delete, "wikore::AuthFilter"});
 
     // Members
     drogon::app().registerHandler("/api/orgs/{1}/members",
