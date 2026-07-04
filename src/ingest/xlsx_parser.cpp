@@ -373,16 +373,33 @@ ParseWorksheetResult parse_worksheet(const std::string&              xml,
         std::vector<std::pair<int, std::string>> col_vals;
         col_vals.reserve(32); // avoid small-count reallocations
         int  max_col        = 0;
+        int  next_col       = 1;  // sequential column for cells without r=
         int  cells_in_row   = 0;
         bool budget_exceeded = false;
 
         for (const auto& c : row.children()) {
             if (local_name(c.name()) != "c") continue;
 
-            const int col = col_from_ref(c.attribute("r").value());
-            // Skip cells with no valid column reference — they have nowhere to
-            // land in the output and must not consume the output budget.
-            if (col == 0) continue;
+            // Resolve column index.
+            // The r= attribute is optional (Open XML SDK models it as nullable).
+            // When absent, cells are sequential starting at 1 (or after the
+            // last seen column).  When present but malformed or overflowed,
+            // skip only that cell.
+            int col;
+            auto r_attr = c.attribute("r");
+            if (r_attr) {
+                col = col_from_ref(r_attr.value());
+                if (col == 0) {
+                    // Explicit but malformed/overflowed reference — skip cell,
+                    // but do NOT advance next_col so sequential order is kept.
+                    continue;
+                }
+            } else {
+                // r attribute absent: infer sequential column.
+                col = next_col;
+                if (col > kXlsxMaxCol) continue; // sequential overflow
+            }
+            next_col = col + 1; // advance for next sequential cell
 
             // Enforce per-row cell cap before any allocation.
             if (++cells_in_row > kXlsxMaxCellsPerRow)

@@ -1329,3 +1329,23 @@ TEST_CASE("XlsxParser: malformed worksheet alongside valid one returns corrupt e
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().message == "ingest.xlsx.corrupt");
 }
+
+TEST_CASE("XlsxParser: cells without r= attribute are read sequentially",
+          "[parser][xlsx]")
+{
+    // no_ref_attr.xlsx:
+    //   row 1: three <c> with no r= attribute -> inferred cols 1,2,3
+    //          expected: "10 | 20 | 30"
+    //   row 2: A2=1, then <c> (no r=, inferred B2)=2, then D2=4
+    //          expected: "1 | 2 |  | 4"  (C2 is empty)
+    XlsxParser p;
+    auto content = load_fixture("no_ref_attr.xlsx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "no_ref_attr.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    REQUIRE(r.has_value());
+    REQUIRE(r->sections.size() == 1);
+    const auto& body = r->sections[0].text;
+    CHECK(body.find("10 | 20 | 30") != std::string::npos);
+    CHECK(body.find("1 | 2 |  | 4") != std::string::npos);
+}
