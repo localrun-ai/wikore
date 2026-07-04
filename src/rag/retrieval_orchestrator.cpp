@@ -7,7 +7,7 @@
 
 namespace wikore::rag {
 
-drogon::Task<Result<std::vector<AllowedCandidate>>>
+drogon::Task<Result<std::vector<AllowedChunk>>>
 RetrievalOrchestrator::retrieve(const RequestContext& ctx,
                                 std::string           query,
                                 std::string_view      scope_org_unit_id,
@@ -73,8 +73,9 @@ RetrievalOrchestrator::retrieve(const RequestContext& ctx,
     if (!allowed) co_return std::unexpected(allowed.error());
 
     // Return up to `limit`, in the gate-preserved (retrieval score) order.
+    // erase() instead of resize(): AllowedChunk has no default constructor.
     if (static_cast<int>(allowed->size()) > limit)
-        allowed->resize(limit);
+        allowed->erase(allowed->begin() + limit, allowed->end());
     co_return std::move(*allowed);
 }
 

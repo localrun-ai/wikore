@@ -137,26 +137,59 @@ struct ChunkCandidate {
     ChunkPayload payload;
 };
 
+// Forward-declare TestGate so ConstructionToken can friend it.
+// TestGate is defined in tests/support/allowed_chunk_test_factory.hpp
+// which is never included by production targets.
+namespace test_support { class TestGate; }
+
 // ---------------------------------------------------------------------------
-// AllowedCandidate: a candidate that has passed EvidenceGate.
+// AllowedChunk: a chunk that has passed EvidenceGate.
 //
-// The type distinction enforces a convention boundary: the Reranker and
-// ContextBuilder accept only AllowedCandidate / AllowedEvidence, so a raw
-// ChunkCandidate cannot be forwarded without passing through the gate.
+// Construction requires an AllowedChunk::ConstructionToken, which has a
+// private constructor accessible only to EvidenceGate. This enforces at
+// compile time that AllowedChunk can only be produced by the gate —
+// synthesizing one without going through EvidenceGate requires an explicit
+// knowledge of the token type and a friend relationship with EvidenceGate,
+// which callers outside the rag:: module cannot obtain.
+//
+// Fields are public for read access. The gate is the production factory;
+// test code uses AllowedChunk::TestFactory (defined in
+// tests/support/allowed_chunk_test_factory.hpp, linked only in test targets).
 // ---------------------------------------------------------------------------
 
-struct AllowedCandidate {
+class AllowedChunk {
+public:
+    // PassKey — only EvidenceGate (production) and TestGate (tests) can
+    // default-construct this token.
+    class ConstructionToken {
+        ConstructionToken() = default;
+        friend class EvidenceGate;
+        friend class test_support::TestGate; // test targets only
+    };
+
+    AllowedChunk(ConstructionToken,
+                 std::string  chunk_id_,
+                 std::string  document_version_id_,
+                 float        score_,
+                 std::string  text_,
+                 std::optional<std::string> section_heading_)
+        : chunk_id(std::move(chunk_id_))
+        , document_version_id(std::move(document_version_id_))
+        , score(score_)
+        , text(std::move(text_))
+        , section_heading(std::move(section_heading_)) {}
+
+    AllowedChunk() = delete; // no default construction without token
+
     std::string  chunk_id;
     std::string  document_version_id;
     float        score   = 0.0f;
-    std::string  text;              // hydrated from Postgres
+    std::string  text;
     std::optional<std::string> section_heading;
 };
 
-// AllowedChunk is an alias for AllowedCandidate: the name used in the
-// BaryGraph Lite design for the chunk member of AllowedEvidence. The alias
-// avoids rename churn while introducing the AllowedEvidence variant.
-using AllowedChunk = AllowedCandidate;
+// AllowedCandidate: backward-compatible alias. New code should use AllowedChunk.
+using AllowedCandidate [[deprecated("use AllowedChunk")]] = AllowedChunk;
 
 // ---------------------------------------------------------------------------
 // AllowedEvidence — the variant type accepted by ContextBuilder.

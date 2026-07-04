@@ -103,7 +103,7 @@ struct Hydrated {
 
 } // namespace
 
-drogon::Task<Result<std::vector<AllowedCandidate>>>
+drogon::Task<Result<std::vector<AllowedChunk>>>
 EvidenceGate::evaluate(std::string_view                   company_id,
                        const AccessScope&                 scope,
                        const std::vector<std::string>&    allowed_sensitivity_labels,
@@ -115,7 +115,7 @@ EvidenceGate::evaluate(std::string_view                   company_id,
     // reader scope, no clearance, or no candidates nothing can be allowed.
     if (scope.org_unit_ids.empty() || allowed_sensitivity_labels.empty()
         || candidates.empty())
-        co_return std::vector<AllowedCandidate>{};
+        co_return std::vector<AllowedChunk>{};
 
     std::vector<std::string> chunk_ids;
     chunk_ids.reserve(candidates.size());
@@ -147,20 +147,20 @@ EvidenceGate::evaluate(std::string_view                   company_id,
     }
 
     // Emit survivors in the candidates' (score) order; drop the rest.
-    std::vector<AllowedCandidate> out;
+    std::vector<AllowedChunk> out;
     out.reserve(allowed.size());
     for (const auto& c : candidates) {
         auto it = allowed.find(c.chunk_id);
         if (it == allowed.end())
             continue;
-        out.push_back(AllowedCandidate{
-            .chunk_id            = c.chunk_id,
+        out.push_back(AllowedChunk{
+            AllowedChunk::ConstructionToken{},
+            c.chunk_id,
             // Authoritative version from PG, NOT the (possibly stale) candidate:
-            // Postgres is the evidence, so evidence attribution comes from PG.
-            .document_version_id = std::move(it->second.document_version_id),
-            .score               = c.score,
-            .text                = std::move(it->second.content),
-            .section_heading     = std::move(it->second.section_heading),
+            std::move(it->second.document_version_id),
+            c.score,
+            std::move(it->second.content),
+            std::move(it->second.section_heading),
         });
     }
     co_return out;

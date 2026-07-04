@@ -39,5 +39,8 @@ target_link_libraries(wikore_tests PRIVATE
 target_compile_definitions(wikore_tests PRIVATE
     TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
 )
+target_include_directories(wikore_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"  # enables #include "support/..."
+)
 include(Catch)
 catch_discover_tests(wikore_tests)

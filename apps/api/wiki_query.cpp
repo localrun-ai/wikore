@@ -2,7 +2,7 @@
 
 #include "wikore/auth.hpp"           // Identity
 #include "wikore/domain/types.hpp"   // RequestContext, Error, uuid_generate
-#include "wikore/rag/types.hpp"      // AllowedCandidate
+#include "wikore/rag/types.hpp"      // AllowedChunk
 #include "wikore/adapters/postgres/deadline_exec.hpp"  // exec_until
 #include "wikore/adapters/postgres/error_mapper.hpp"   // map_db_exception
 
