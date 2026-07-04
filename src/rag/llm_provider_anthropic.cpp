@@ -177,6 +177,7 @@ public:
         int input_tokens  = 0;
         int output_tokens = 0;
         std::string model_echo;
+        bool message_stop_received = false; // Anthropic signals completion via message_stop
 
         // Parse Anthropic SSE: "event: <type>\ndata: <json>\n\n"
         std::string_view raw = resp->getBody();
@@ -196,6 +197,8 @@ public:
                 current_event = line.substr(6);
                 if (!current_event.empty() && current_event[0] == ' ')
                     current_event = current_event.substr(1);
+                if (current_event == "message_stop")
+                    message_stop_received = true;
                 continue;
             }
             if (line.starts_with("data:")) {
@@ -203,6 +206,14 @@ public:
                 if (!payload.empty() && payload[0] == ' ')
                     payload.remove_prefix(1);
                 if (payload == "[DONE]") break;
+
+                // Anthropic error event: {"type":"error","error":{...}}
+                if (current_event == "error") {
+                    spdlog::warn("[llm-anthropic] upstream error event: {}",
+                                 std::string(payload));
+                    co_return std::unexpected(
+                        Error::unavailable("llm: upstream returned error in stream"));
+                }
 
                 AnthropicStreamEvent ev;
                 if (glz::read_json(ev, std::string(payload))) continue;
@@ -214,7 +225,6 @@ public:
                     on_chunk(ChatChunk{.content = ev.delta.text, .done = false});
                 } else if (current_event == "message_start") {
                     input_tokens = ev.message.usage.input_tokens;
-                    if (!model_echo.empty()) model_echo = ev.type; // not useful; skip
                 } else if (current_event == "message_delta") {
                     output_tokens = ev.usage.output_tokens;
                 }
@@ -224,13 +234,19 @@ public:
             if (line.empty()) current_event.clear();
         }
 
+        if (!message_stop_received) {
+            spdlog::warn("[llm-anthropic] stream ended without message_stop event");
+            co_return std::unexpected(
+                Error::unavailable("llm: incomplete stream (no message_stop received)"));
+        }
+
         on_chunk(ChatChunk{.done = true});
 
         co_return ChatResponse{
             .content       = std::move(accumulated),
             .input_tokens  = input_tokens,
             .output_tokens = output_tokens,
-            .model         = model_echo.empty() ? cfg_.model : model_echo,
+            .model         = cfg_.model,
             .provider_id   = cfg_.id,
         };
     }

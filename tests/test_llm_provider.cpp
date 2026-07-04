@@ -239,3 +239,14 @@ TEST_CASE("ChatRequest: zero max_tokens is sentinel for provider default",
     CHECK(cfg.max_tokens  == 4096);
     CHECK(cfg.temperature == Catch::Approx(0.3f).epsilon(0.001));
 }
+
+TEST_CASE("make_llm_provider: openai_compatible throws without base_url",
+          "[llm_provider][factory]")
+{
+    LlmProviderConfig cfg;
+    cfg.id       = "oai-bad";
+    cfg.provider = "openai_compatible";
+    cfg.model    = "llama3";
+    // base_url intentionally empty
+    CHECK_THROWS_AS(make_llm_provider(cfg), std::invalid_argument);
+}

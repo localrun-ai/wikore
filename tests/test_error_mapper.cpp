@@ -144,9 +144,6 @@ const std::unordered_set<std::string> k_allowlist = {
     "wps_wiki_page_version_same_company_fk",
 
     // V033: llm_providers
-    // The one-default-per-scope unique index fires as a programming bug
-    // (duplicate default for same company scope) -> database_error is correct.
-    "llm_providers_one_default_per_scope_idx",
     // The same-company trigger raises as foreign_key_violation with a named
     // constraint; treated as a programming bug -> database_error.
     "llm_providers_created_by_same_company_fk",

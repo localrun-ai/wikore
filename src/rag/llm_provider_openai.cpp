@@ -119,6 +119,8 @@ public:
     explicit OpenAiCompatibleAdapter(LlmProviderConfig cfg)
         : cfg_(std::move(cfg))
     {
+        if (cfg_.base_url.empty())
+            throw std::invalid_argument("openai_compatible: base_url required");
         client_ = drogon::HttpClient::newHttpClient(cfg_.base_url);
         client_->setPipeliningDepth(0); // chat completions are long; no pipelining
     }
@@ -216,6 +218,7 @@ public:
         int input_tokens  = 0;
         int output_tokens = 0;
         std::string model_echo;
+        bool stream_completed = false; // set true only on data: [DONE]
 
         // Parse SSE body: split on '\n', process each line.
         std::string_view raw = resp->getBody();
@@ -233,11 +236,25 @@ public:
             if (line.empty()) continue;
 
             std::string json_payload;
-            if (!parse_sse_line(line, json_payload)) break; // [DONE]
+            if (!parse_sse_line(line, json_payload)) {
+                // parse_sse_line returns false only for [DONE]
+                stream_completed = true;
+                break;
+            }
             if (json_payload.empty()) continue;
 
             OaiStreamChunk chunk;
-            if (glz::read_json(chunk, json_payload)) continue; // skip unparseable
+            if (glz::read_json(chunk, json_payload)) {
+                // Unparseable chunk — check if it looks like an error object
+                // {"error": {...}} — abort rather than silently skip.
+                if (json_payload.find("\"error\"") != std::string::npos) {
+                    spdlog::warn("[llm-openai] upstream error in stream: {}",
+                                 json_payload);
+                    co_return std::unexpected(Error::unavailable(
+                        "llm: upstream returned error in stream"));
+                }
+                continue; // genuinely unparseable (e.g. partial chunk) — skip
+            }
 
             if (!chunk.choices.empty()) {
                 const auto& delta = chunk.choices[0].delta;
@@ -253,6 +270,12 @@ public:
                 output_tokens = chunk.usage.completion_tokens;
             if (!chunk.model.empty() && model_echo.empty())
                 model_echo = chunk.model;
+        }
+
+        if (!stream_completed) {
+            spdlog::warn("[llm-openai] stream ended without [DONE] sentinel");
+            co_return std::unexpected(
+                Error::unavailable("llm: incomplete stream (no [DONE] received)"));
         }
 
         on_chunk(ChatChunk{.done = true});
@@ -402,9 +425,10 @@ public:
                 std::format("llm: HTTP {}", static_cast<int>(resp->getStatusCode()))));
         }
 
-        // SSE parsing identical to OpenAiCompatibleAdapter
+        // SSE parsing identical to OpenAiCompatibleAdapter — with completeness check
         std::string accumulated;
         int input_tokens = 0, output_tokens = 0;
+        bool stream_completed = false;
         std::string_view raw = resp->getBody();
         std::size_t pos = 0;
         while (pos < raw.size()) {
@@ -415,16 +439,31 @@ public:
             pos = (nl == std::string_view::npos) ? raw.size() : nl + 1;
             if (line.empty()) continue;
             std::string json_payload;
-            if (!parse_sse_line(line, json_payload)) break;
+            if (!parse_sse_line(line, json_payload)) {
+                stream_completed = true;
+                break;
+            }
             if (json_payload.empty()) continue;
             OaiStreamChunk chunk;
-            if (glz::read_json(chunk, json_payload)) continue;
+            if (glz::read_json(chunk, json_payload)) {
+                if (json_payload.find("\"error\"") != std::string::npos) {
+                    spdlog::warn("[llm-azure] upstream error in stream: {}", json_payload);
+                    co_return std::unexpected(
+                        Error::unavailable("llm: upstream returned error in stream"));
+                }
+                continue;
+            }
             if (!chunk.choices.empty() && !chunk.choices[0].delta.content.empty()) {
                 accumulated += chunk.choices[0].delta.content;
                 on_chunk(ChatChunk{.content = chunk.choices[0].delta.content});
             }
             if (chunk.usage.prompt_tokens > 0)     input_tokens  = chunk.usage.prompt_tokens;
             if (chunk.usage.completion_tokens > 0) output_tokens = chunk.usage.completion_tokens;
+        }
+        if (!stream_completed) {
+            spdlog::warn("[llm-azure] stream ended without [DONE] sentinel");
+            co_return std::unexpected(
+                Error::unavailable("llm: incomplete stream (no [DONE] received)"));
         }
         on_chunk(ChatChunk{.done = true});
         co_return ChatResponse{

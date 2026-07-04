@@ -60,6 +60,9 @@ CREATE TABLE llm_providers (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT llm_providers_credentials_key_id_consistent_chk
         CHECK ((credentials IS NULL) = (credentials_key_id IS NULL)),
+    -- openai_compatible rows require a base_url (the endpoint differs per deployment).
+    CONSTRAINT llm_providers_openai_compat_requires_base_url_chk
+        CHECK (provider <> 'openai_compatible' OR (base_url IS NOT NULL AND base_url <> '')),
     -- azure_openai rows must supply a deployment URL and api-version.
     CONSTRAINT llm_providers_azure_requires_base_url_chk
         CHECK (provider <> 'azure_openai' OR (base_url IS NOT NULL AND azure_api_version IS NOT NULL))
