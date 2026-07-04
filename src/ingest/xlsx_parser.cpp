@@ -302,13 +302,28 @@ std::string parse_worksheet(const std::string&              xml,
     pugi::xml_node sheet_data = bfs_find(doc, "sheetData");
     if (!sheet_data) return {};
 
+    // Helper: charge `n` bytes from the budget before materialising content.
+    // Returns true if the charge succeeds; sets remaining=0 and returns false
+    // if the budget would be exceeded.
+    auto charge = [&](std::size_t n) -> bool {
+        if (n > remaining) {
+            spdlog::error("[xlsx-parser] output budget exceeded; rejecting");
+            remaining = 0;
+            return false;
+        }
+        remaining -= n;
+        return true;
+    };
+
     std::string out;
     for (const auto& row : sheet_data.children()) {
         if (local_name(row.name()) != "row") continue;
 
         // Collect (col_index, value) pairs so sparse rows can be padded.
+        // Each value is budget-charged BEFORE it is copied into memory.
         std::vector<std::pair<int, std::string>> col_vals;
         int max_col = 0;
+        bool budget_exceeded = false;
 
         for (const auto& c : row.children()) {
             if (local_name(c.name()) != "c") continue;
@@ -323,39 +338,67 @@ std::string parse_worksheet(const std::string&              xml,
                 if (v) {
                     int idx = std::atoi(v.text().get());
                     if (idx >= 0 && static_cast<std::size_t>(idx)
-                                    < shared_strings.size())
-                        val = shared_strings[static_cast<std::size_t>(idx)];
+                                    < shared_strings.size()) {
+                        const auto& sv = shared_strings[
+                            static_cast<std::size_t>(idx)];
+                        if (!charge(sv.size())) { budget_exceeded = true; break; }
+                        val = sv;
+                    }
                 }
             } else if (type == "inlineStr") {
                 auto is = child_by_local(c, "is");
                 if (is)
-                    for (const auto& t : is.children())
-                        if (local_name(t.name()) == "t")
-                            val += t.text().get();
+                    for (const auto& t : is.children()) {
+                        if (local_name(t.name()) != "t") continue;
+                        std::string_view tv = t.text().get();
+                        if (!charge(tv.size())) { budget_exceeded = true; break; }
+                        val += tv;
+                    }
             } else if (type == "b") {
                 auto v = child_by_local(c, "v");
                 val = (v && std::string_view(v.text().get()) == "1")
                       ? "TRUE" : "FALSE";
+                if (!charge(val.size())) { budget_exceeded = true; break; }
             } else if (type == "e") {
                 auto v = child_by_local(c, "v");
-                if (v) val = v.text().get();
+                if (v) {
+                    std::string_view ev = v.text().get();
+                    if (!charge(ev.size())) { budget_exceeded = true; break; }
+                    val = ev;
+                }
             } else {
                 // Numeric or formula (t="str" or absent)
                 auto v = child_by_local(c, "v");
                 if (!v) {
                     auto is = child_by_local(c, "is");
                     if (is)
-                        for (const auto& t : is.children())
-                            if (local_name(t.name()) == "t")
-                                val += t.text().get();
+                        for (const auto& t : is.children()) {
+                            if (local_name(t.name()) != "t") continue;
+                            std::string_view tv = t.text().get();
+                            if (!charge(tv.size())) { budget_exceeded = true; break; }
+                            val += tv;
+                        }
                 } else {
-                    val = v.text().get();
+                    std::string_view nv = v.text().get();
+                    if (!charge(nv.size())) { budget_exceeded = true; break; }
+                    val = nv;
                 }
             }
+            if (budget_exceeded) break;
             col_vals.push_back({col, std::move(val)});
         }
+        if (budget_exceeded) return {};
 
         if (max_col == 0) continue; // entirely empty row
+
+        // Pre-charge separators: (max_col - 1) * 3 bytes for " | " between
+        // columns. This must happen before the dense expansion so that wide
+        // sparse rows (e.g. one cell at XFD) are budgeted before allocation.
+        const std::size_t sep_cost =
+            (max_col > 1) ? static_cast<std::size_t>(max_col - 1) * 3 : 0;
+        if (!charge(sep_cost)) return {};
+        // Also charge the newline between rows.
+        if (!out.empty() && !charge(1)) return {};
 
         // Expand sparse col_vals into a dense vector indexed [0..max_col-1].
         std::vector<std::string> cells(static_cast<std::size_t>(max_col));
@@ -366,22 +409,17 @@ std::string parse_worksheet(const std::string&              xml,
         // Skip rows where every cell is empty.
         bool has_content = false;
         for (const auto& cv : cells) if (!cv.empty()) { has_content = true; break; }
-        if (!has_content) continue;
+        if (!has_content) {
+            // Refund the pre-charged separators for this empty row.
+            remaining += sep_cost + (!out.empty() ? 1 : 0);
+            continue;
+        }
 
-        const std::size_t before = out.size();
         if (!out.empty()) out += '\n';
         for (std::size_t i = 0; i < cells.size(); ++i) {
             if (i) out += " | ";
             out += cells[i];
         }
-        // Charge the global output budget by the bytes just appended.
-        const std::size_t added = out.size() - before;
-        if (added > remaining) {
-            spdlog::error("[xlsx-parser] output budget exceeded; rejecting");
-            remaining = 0;
-            return {};
-        }
-        remaining -= added;
     }
     return out;
 }

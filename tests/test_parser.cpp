@@ -1277,3 +1277,19 @@ TEST_CASE("XlsxParser: output budget exhaustion returns explicit error, not giga
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().message == "ingest.xlsx.content_limit_exceeded");
 }
+
+TEST_CASE("XlsxParser: repeated large shared string hits budget before materialising",
+          "[parser][xlsx][security]")
+{
+    // repeated_big_string.xlsx: one shared string of 1 MiB, referenced in
+    // 20 cells.  Total uncapped output = 20 MiB.  The budget (16 MiB) must
+    // be charged BEFORE each shared-string copy; without pre-charging,
+    // 20 MiB would be allocated before any check fires.
+    XlsxParser p;
+    auto content = load_fixture("repeated_big_string.xlsx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "repeated_big_string.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.xlsx.content_limit_exceeded");
+}
