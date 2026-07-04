@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace wikore::rag {
@@ -136,21 +137,84 @@ struct ChunkCandidate {
     ChunkPayload payload;
 };
 
+#ifdef WIKORE_ENABLE_TEST_HOOKS
+// Test-only construction hook. Release/production targets never see this
+// declaration and therefore cannot define the friend to mint evidence.
+namespace test_support { class TestGate; }
+#endif
+
 // ---------------------------------------------------------------------------
-// AllowedCandidate: a candidate that has passed EvidenceGate.
+// AllowedChunk: a chunk that has passed EvidenceGate.
 //
-// The type distinction enforces the gate at compile time: the Reranker
-// accepts only AllowedCandidate, so a raw ChunkCandidate can never be
-// forwarded to reranking without going through the gate.
+// Construction requires an AllowedChunk::ConstructionToken, which has a
+// private constructor accessible only to EvidenceGate. This enforces at
+// compile time that AllowedChunk can only be produced by the gate —
+// synthesizing one without going through EvidenceGate requires an explicit
+// knowledge of the token type and a friend relationship with EvidenceGate,
+// which callers outside the rag:: module cannot obtain.
+//
+// Evidence fields are private and read-only: downstream code (Reranker,
+// ContextBuilder) cannot replace text or IDs with ungated data after
+// construction. The gate is the sole write path.
 // ---------------------------------------------------------------------------
 
-struct AllowedCandidate {
-    std::string  chunk_id;
-    std::string  document_version_id;
-    float        score   = 0.0f;
-    std::string  text;              // hydrated from Postgres
-    std::optional<std::string> section_heading;
+class AllowedChunk {
+public:
+    // PassKey — only EvidenceGate (production) and TestGate (tests) can
+    // default-construct this token.
+    class ConstructionToken {
+        ConstructionToken() = default;
+        friend class EvidenceGate;
+#ifdef WIKORE_ENABLE_TEST_HOOKS
+        friend class test_support::TestGate; // test targets only
+#endif
+    };
+
+    AllowedChunk(ConstructionToken,
+                 std::string  company_id,
+                 std::string  chunk_id,
+                 std::string  document_version_id,
+                 float        score,
+                 std::string  text,
+                 std::optional<std::string> section_heading)
+        : company_id_(std::move(company_id))
+        , chunk_id_(std::move(chunk_id))
+        , document_version_id_(std::move(document_version_id))
+        , score_(score)
+        , text_(std::move(text))
+        , section_heading_(std::move(section_heading)) {}
+
+    AllowedChunk() = delete;
+
+    [[nodiscard]] const std::string& company_id()         const noexcept { return company_id_; }
+    [[nodiscard]] const std::string& chunk_id()           const noexcept { return chunk_id_; }
+    [[nodiscard]] const std::string& document_version_id()const noexcept { return document_version_id_; }
+    [[nodiscard]] float              score()               const noexcept { return score_; }
+    [[nodiscard]] const std::string& text()                const noexcept { return text_; }
+    [[nodiscard]] const std::optional<std::string>& section_heading() const noexcept
+                                                                      { return section_heading_; }
+
+private:
+    std::string  company_id_;
+    std::string  chunk_id_;
+    std::string  document_version_id_;
+    float        score_   = 0.0f;
+    std::string  text_;
+    std::optional<std::string> section_heading_;
 };
+
+// ---------------------------------------------------------------------------
+// AllowedEvidence — the variant type accepted by ContextBuilder.
+//
+// Currently a single-member variant containing AllowedChunk (chunk-only
+// retrieval, Iteration 3). AllowedRelationship and AllowedPath will be added
+// as BaryGraph Lite edges become available (V034+).
+//
+// ContextBuilder must accept std::span<const AllowedEvidence> and must NOT
+// be overloaded for ChunkCandidate, raw Qdrant payloads, or diagnostic types.
+// ---------------------------------------------------------------------------
+
+using AllowedEvidence = std::variant<AllowedChunk>;
 
 // ---------------------------------------------------------------------------
 // QdrantFilter: access-controlled search filter for a Qdrant query.

@@ -106,14 +106,14 @@ TEST_CASE("NullEmbedder: embed_batch result matches individual embed", "[embedde
 
 // ---------------------------------------------------------------------------
 // EvidenceGate compile-time check:
-// ChunkCandidate and AllowedCandidate are distinct types (not aliases).
+// ChunkCandidate and AllowedChunk are distinct types (not aliases).
 // ---------------------------------------------------------------------------
-TEST_CASE("EvidenceGate: ChunkCandidate != AllowedCandidate at compile time", "[types]")
+TEST_CASE("EvidenceGate: ChunkCandidate != AllowedChunk at compile time", "[types]")
 {
-    static_assert(!std::is_same_v<ChunkCandidate, AllowedCandidate>,
+    static_assert(!std::is_same_v<ChunkCandidate, AllowedChunk>,
                   "EvidenceGate: types must be distinct");
-    // AllowedCandidate has 'text' field; ChunkCandidate has 'payload'
-    static_assert(requires(AllowedCandidate a) { a.text; });
+    // AllowedChunk has 'text' field; ChunkCandidate has 'payload'
+    static_assert(requires(AllowedChunk a) { a.text(); }, "AllowedChunk must have text() accessor");
     static_assert(requires(ChunkCandidate   c) { c.payload; });
     SUCCEED("compile-time gate verified");
 }

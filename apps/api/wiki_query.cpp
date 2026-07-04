@@ -2,7 +2,7 @@
 
 #include "wikore/auth.hpp"           // Identity
 #include "wikore/domain/types.hpp"   // RequestContext, Error, uuid_generate
-#include "wikore/rag/types.hpp"      // AllowedCandidate
+#include "wikore/rag/types.hpp"      // AllowedChunk
 #include "wikore/adapters/postgres/deadline_exec.hpp"  // exec_until
 #include "wikore/adapters/postgres/error_mapper.hpp"   // map_db_exception
 
@@ -223,11 +223,11 @@ wikore::api::wiki_query(std::shared_ptr<rag::RetrievalOrchestrator> orch,
         QueryResp resp;
         resp.results.reserve(result->size());
         for (const auto& c : *result)
-            resp.results.push_back(ResultDto{.chunk_id            = c.chunk_id,
-                                             .document_version_id = c.document_version_id,
-                                             .score               = c.score,
-                                             .text                = c.text,
-                                             .section_heading     = c.section_heading});
+            resp.results.push_back(ResultDto{.chunk_id            = c.chunk_id(),
+                                             .document_version_id = c.document_version_id(),
+                                             .score               = c.score(),
+                                             .text                = c.text(),
+                                             .section_heading     = c.section_heading()});
 
         std::string out;
         if (glz::write<glz::opts{.skip_null_members = false}>(resp, out))

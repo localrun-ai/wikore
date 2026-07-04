@@ -140,6 +140,7 @@ add_library(wikore_rag STATIC
     src/rag/embedder.cpp
     src/rag/retriever.cpp
     src/rag/reranker.cpp
+    src/rag/context_builder.cpp
     src/rag/generator.cpp
     src/rag/pipeline.cpp
     src/rag/qdrant_filter_builder.cpp

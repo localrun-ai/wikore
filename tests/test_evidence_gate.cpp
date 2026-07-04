@@ -122,11 +122,11 @@ TEST_CASE("EvidenceGate: returns only visible candidates, hydrated, in score ord
         CO, scope, kMember, {cand(visible, 0.9f), cand(denied, 0.8f)}));
     REQUIRE(r.has_value());
     REQUIRE(r->size() == 1);
-    CHECK((*r)[0].chunk_id == visible.chunk_id);
-    CHECK((*r)[0].score == 0.9f);                           // score carried
-    CHECK((*r)[0].text.find("body of") != std::string::npos); // hydrated from PG
-    REQUIRE((*r)[0].section_heading.has_value());
-    CHECK(*(*r)[0].section_heading == "Intro");             // section hydrated
+    CHECK((*r)[0].chunk_id() == visible.chunk_id);
+    CHECK((*r)[0].score() == 0.9f);                           // score carried
+    CHECK((*r)[0].text().find("body of") != std::string::npos); // hydrated from PG
+    REQUIRE((*r)[0].section_heading().has_value());
+    CHECK(*(*r)[0].section_heading() == "Intro");             // section hydrated
 }
 
 TEST_CASE("EvidenceGate: denies a chunk on a non-active version (lifecycle)",
@@ -215,7 +215,7 @@ TEST_CASE("EvidenceGate: document_version_id is taken from Postgres, not the can
     auto r = drogon::sync_wait(gate.evaluate(CO, scope, kMember, {bogus}));
     REQUIRE(r.has_value());
     REQUIRE(r->size() == 1);
-    CHECK((*r)[0].document_version_id == ref.version_id);   // PG value, not the bogus one
+    CHECK((*r)[0].document_version_id() == ref.version_id);   // PG value, not the bogus one
 }
 
 TEST_CASE("EvidenceGate: fail-closed on empty scope, empty clearance, or no candidates",

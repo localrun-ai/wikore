@@ -18,7 +18,7 @@ namespace wikore::rag {
 //
 //   query -> embed -> resolve reader scope -> derive clearance ->
 //            build Qdrant prefilter -> vector search -> EvidenceGate ->
-//            AllowedCandidates.
+//            AllowedChunks.
 //
 // Access control is enforced twice - the Qdrant prefilter (recall fast path)
 // and the EvidenceGate (authoritative boundary) - but both come from ONE
@@ -43,7 +43,7 @@ public:
 
     // scope_org_unit_id is the org_unit the query is scoped to (the tenant
     // root for a company-wide search).
-    drogon::Task<Result<std::vector<AllowedCandidate>>>
+    drogon::Task<Result<std::vector<AllowedChunk>>>
     retrieve(const RequestContext& ctx,
              std::string           query,
              std::string_view      scope_org_unit_id,

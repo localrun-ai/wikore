@@ -258,7 +258,7 @@ TEST_CASE("G1 property: EvidenceGate output equals authoritative PG truth across
             auto allowed = drogon::sync_wait(gate.evaluate(CO, scope, full_clearance, candidates));
             REQUIRE(allowed.has_value());
             std::set<std::string> gate_chunks;
-            for (const auto& a : *allowed) gate_chunks.insert(a.chunk_id);
+            for (const auto& a : *allowed) gate_chunks.insert(a.chunk_id());
 
             // ---- assert equality (safety + liveness) ----
             INFO("seed=" << seed << " user=" << user
