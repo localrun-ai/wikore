@@ -137,10 +137,11 @@ struct ChunkCandidate {
     ChunkPayload payload;
 };
 
-// Forward-declare TestGate so ConstructionToken can friend it.
-// TestGate is defined in tests/support/allowed_chunk_test_factory.hpp
-// which is never included by production targets.
+#ifdef WIKORE_ENABLE_TEST_HOOKS
+// Test-only construction hook. Release/production targets never see this
+// declaration and therefore cannot define the friend to mint evidence.
 namespace test_support { class TestGate; }
+#endif
 
 // ---------------------------------------------------------------------------
 // AllowedChunk: a chunk that has passed EvidenceGate.
@@ -164,7 +165,9 @@ public:
     class ConstructionToken {
         ConstructionToken() = default;
         friend class EvidenceGate;
+#ifdef WIKORE_ENABLE_TEST_HOOKS
         friend class test_support::TestGate; // test targets only
+#endif
     };
 
     AllowedChunk(ConstructionToken,
