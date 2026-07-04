@@ -81,6 +81,9 @@ public:
     // max_hold. Returns a held lease on success; nullopt when the tenant is at
     // max_concurrency. On Redis error the optional is engaged with a
     // non-releasing lease (fail-open).
+    //
+    // Throws std::invalid_argument if max_hold is outside (0, 24h] - clamping a
+    // longer declared hold would let the lease expire under a live call.
     std::optional<LlmLease> acquire(std::string_view       company_id,
                                     std::chrono::milliseconds max_hold) const;
 

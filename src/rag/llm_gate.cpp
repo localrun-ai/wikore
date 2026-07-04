@@ -4,7 +4,6 @@
 #include "wikore/domain/types.hpp"   // uuid_generate
 
 #include <spdlog/spdlog.h>
-#include <algorithm>
 #include <cmath>
 #include <format>
 #include <stdexcept>
@@ -88,10 +87,16 @@ std::optional<LlmLease> LlmGate::acquire(std::string_view          company_id,
     const std::string key   = sem_key(company_id);
     std::string       token = uuid_generate();
 
-    // Lease = clamped max_hold + margin, computed in int64 (no overflow): the
-    // slot's lease always outlives the call it guards.
+    // Lease = max_hold + margin, so the slot's lease always outlives the call
+    // it guards. Reject an out-of-range max_hold rather than clamp it: silently
+    // shortening a longer declared hold would let the lease expire under a live
+    // call and admit concurrency above the cap. (0, 24h] is validated in int64,
+    // so the +margin cannot overflow.
     constexpr long long kMaxHoldMs = 24LL * 60 * 60 * 1000;   // 24h ceiling
-    const long long hold_ms  = std::clamp<long long>(max_hold.count(), 0, kMaxHoldMs);
+    const long long hold_ms = max_hold.count();
+    if (hold_ms <= 0 || hold_ms > kMaxHoldMs)
+        throw std::invalid_argument(std::format(
+            "LlmGate::acquire: max_hold must be in (0, 24h], got {}ms", hold_ms));
     const long long lease_ms = hold_ms +
         std::chrono::duration_cast<std::chrono::milliseconds>(kLeaseMargin).count();
 

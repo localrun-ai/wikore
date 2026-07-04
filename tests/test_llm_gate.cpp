@@ -140,4 +140,11 @@ TEST_CASE("LlmGate: rejects invalid limit configuration", "[llm-gate]")
     bad([](LlmLimits& l){ l.rate_per_sec = std::numeric_limits<double>::quiet_NaN(); });
     bad([](LlmLimits& l){ l.rate_per_sec = std::numeric_limits<double>::infinity(); });
     bad([](LlmLimits& l){ l.burst = 0; });
+
+    // max_hold is validated in acquire() before any Redis call, so an
+    // out-of-range hold is rejected (never silently clamped).
+    LlmGate g{ok};
+    CHECK_THROWS_AS(g.acquire("c", std::chrono::milliseconds(0)), std::invalid_argument);
+    CHECK_THROWS_AS(g.acquire("c", std::chrono::seconds(-1)),     std::invalid_argument);
+    CHECK_THROWS_AS(g.acquire("c", std::chrono::hours(25)),       std::invalid_argument);
 }
