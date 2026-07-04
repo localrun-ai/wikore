@@ -197,8 +197,10 @@ public:
                 current_event = line.substr(6);
                 if (!current_event.empty() && current_event[0] == ' ')
                     current_event = current_event.substr(1);
-                if (current_event == "message_stop")
-                    message_stop_received = true;
+                // Do NOT set message_stop_received here: the event: header
+                // arrives before the data: payload. A stream truncated between
+                // them would mark completion prematurely. Set it only after
+                // the corresponding data: line is received and parsed below.
                 continue;
             }
             if (line.starts_with("data:")) {
@@ -221,7 +223,11 @@ public:
                         Error::unavailable("llm: malformed SSE chunk in stream"));
                 }
 
-                if (current_event == "content_block_delta"
+                if (current_event == "message_stop") {
+                    // Set only here — after the data: payload is received and
+                    // parsed, confirming the server sent a complete event.
+                    message_stop_received = true;
+                } else if (current_event == "content_block_delta"
                     && ev.delta.type == "text_delta"
                     && !ev.delta.text.empty()) {
                     accumulated += ev.delta.text;
@@ -237,11 +243,13 @@ public:
             if (line.empty()) current_event.clear();
         }
 
-        // message_stop is required by Anthropic spec; log a warning if absent
-        // but return the accumulated content rather than failing, consistent
-        // with the OpenAI-compatible [DONE] relaxation.
-        if (!message_stop_received)
+        // message_stop is required by Anthropic spec. Its absence signals an
+        // application-level interruption (server error after headers were sent).
+        if (!message_stop_received) {
             spdlog::warn("[llm-anthropic] stream ended without message_stop event");
+            co_return std::unexpected(
+                Error::unavailable("llm: incomplete stream (no message_stop received)"));
+        }
 
         on_chunk(ChatChunk{.done = true});
 

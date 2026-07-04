@@ -282,7 +282,13 @@ struct TestOaiResponse  { std::vector<TestOaiChoice> choices; TestOaiUsage usage
 struct TestOaiDelta     { std::string content; std::string role; };
 struct TestOaiSChoice   { TestOaiDelta delta; };
 struct TestOaiSUsage    { int prompt_tokens = 0; int completion_tokens = 0; };
-struct TestOaiSChunk    { std::vector<TestOaiSChoice> choices; TestOaiSUsage usage; std::string model; };
+struct TestOaiErrorDetail { std::string message; std::string type; std::string code; };
+struct TestOaiSChunk    {
+    std::vector<TestOaiSChoice>  choices;
+    std::optional<TestOaiSUsage> usage;
+    std::string                  model;
+    std::optional<TestOaiErrorDetail> error;
+};
 
 TEST_CASE("LlmProvider parsing: real OpenAI non-streaming response shape parses",
           "[llm_provider][parsing]")
@@ -324,10 +330,9 @@ TEST_CASE("LlmProvider parsing: real OpenAI non-streaming response shape parses"
 TEST_CASE("LlmProvider parsing: real OpenAI streaming SSE chunk shape parses",
           "[llm_provider][parsing]")
 {
-    // Realistic OpenAI streaming delta chunk with extra fields.
-    // Note: when usage is absent (mid-stream chunks), OpenAI omits the key
-    // entirely rather than sending null (null usage would require optional<> in
-    // the DTO, which adds complexity for no benefit).
+    // Realistic OpenAI mid-stream delta chunk with extra fields.
+    // When stream_options.include_usage=true, OpenAI sends "usage": null on
+    // every non-final chunk — this is the P1 case that required optional<>.
     const std::string chunk_json = R"({
         "id": "chatcmpl-xyz",
         "object": "chat.completion.chunk",
@@ -339,7 +344,8 @@ TEST_CASE("LlmProvider parsing: real OpenAI streaming SSE chunk shape parses",
             "delta": {"role": "assistant", "content": "Hi"},
             "logprobs": null,
             "finish_reason": null
-        }]
+        }],
+        "usage": null
     })";
 
     TestOaiSChunk chunk;
@@ -347,6 +353,7 @@ TEST_CASE("LlmProvider parsing: real OpenAI streaming SSE chunk shape parses",
     CHECK(!err);
     REQUIRE(chunk.choices.size() == 1);
     CHECK(chunk.choices[0].delta.content == "Hi");
+    CHECK(!chunk.usage.has_value()); // null usage on mid-stream chunk
 }
 
 TEST_CASE("LlmProvider parsing: real OpenAI final streaming chunk with usage parses",
@@ -373,8 +380,9 @@ TEST_CASE("LlmProvider parsing: real OpenAI final streaming chunk with usage par
     TestOaiSChunk chunk;
     auto err = glz::read<glz::opts{.error_on_unknown_keys = false}>(chunk, chunk_json);
     CHECK(!err);
-    CHECK(chunk.usage.prompt_tokens    == 12);
-    CHECK(chunk.usage.completion_tokens == 7);
+    REQUIRE(chunk.usage.has_value());
+    CHECK(chunk.usage->prompt_tokens    == 12);
+    CHECK(chunk.usage->completion_tokens == 7);
 }
 
 // Anthropic structs matching the adapter's internal types.
@@ -440,4 +448,26 @@ TEST_CASE("LlmProvider parsing: real Anthropic content_block_delta SSE event par
     CHECK(!err);
     CHECK(ev.delta.text == "Hello");
     CHECK(ev.delta.type == "text_delta");
+}
+
+TEST_CASE("LlmProvider parsing: error chunk is detected via parsed error field",
+          "[llm_provider][parsing]")
+{
+    // OpenAI sends {"error":{...}} in a data: line on rate-limit / quota errors.
+    // With error_on_unknown_keys=false, it parses as a chunk with empty choices
+    // and populated error field — NOT silently skipped.
+    const std::string error_json = R"({
+        "error": {
+            "message": "Rate limit exceeded",
+            "type": "requests",
+            "code": "rate_limit_exceeded"
+        }
+    })";
+
+    TestOaiSChunk chunk;
+    auto err = glz::read<glz::opts{.error_on_unknown_keys = false}>(chunk, error_json);
+    CHECK(!err);                          // parses without failure
+    CHECK(chunk.choices.empty());         // no delta content
+    CHECK(chunk.error.has_value());       // error field populated
+    CHECK(chunk.error->type == "requests");
 }
