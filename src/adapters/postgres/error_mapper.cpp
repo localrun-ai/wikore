@@ -128,6 +128,28 @@ const std::unordered_map<std::string, Error> k_constraint_map = {
     {"llm_providers_one_default_per_scope_idx",
         Error::conflict("an active default LLM provider is already configured for this scope")},
 
+    // V034: knowledge_edges (BaryGraph Lite)
+    {"knowledge_edges_direction_check",
+        Error::invalid_input("knowledge_edge direction must be 'directed' or 'symmetric'")},
+    {"knowledge_edges_confidence_check",
+        Error::invalid_input("knowledge_edge confidence must be between 0 and 1")},
+    {"knowledge_edges_origin_check",
+        Error::invalid_input("knowledge_edge origin must be 'parser', 'deterministic_rule', 'administrator', or 'llm_proposal'")},
+    {"knowledge_edges_review_state_check",
+        Error::invalid_input("knowledge_edge review_state must be 'accepted', 'proposed', 'rejected', or 'superseded'")},
+    {"knowledge_edges_edge_type_v1_chk",
+        Error::invalid_input("knowledge_edge edge_type not in V1 vocabulary (chunk-to-chunk types only)")},
+    {"knowledge_edges_check",
+        Error::invalid_input("knowledge_edge expires_at must be greater than created_at")},
+    {"knowledge_edge_endpoints_ordinal_check",
+        Error::invalid_input("knowledge_edge_endpoint ordinal must be 0 or 1")},
+    {"knowledge_edge_endpoints_role_check",
+        Error::invalid_input("knowledge_edge_endpoint role must be 'source', 'target', 'subject', 'object', 'a', or 'b'")},
+    {"knowledge_edges_history_change_kind_check",
+        Error::invalid_input("knowledge_edges_history change_kind must be 'insert', 'update', or 'delete'")},
+    {"knowledge_edges_exactly_two_endpoints_chk",
+        Error::invalid_state("knowledge_edge must have exactly two endpoints at COMMIT")},
+
     // -----------------------------------------------------------------------
     // Enum / domain CHECKs (input validation): PG-generated names from
     // `column ... CHECK (column = ANY (...))`. Each maps to invalid_input.
