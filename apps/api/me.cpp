@@ -1,6 +1,7 @@
 #include "handlers.hpp"
 
 #include "wikore/auth.hpp"           // Identity
+#include "wikore/adapters/postgres/error_mapper.hpp"  // map_db_exception
 
 #include <drogon/orm/Exception.h>
 #include <glaze/glaze.hpp>
@@ -68,8 +69,17 @@ wikore::api::me(drogon::orm::DbClientPtr db, drogon::HttpRequestPtr req)
                 co_return json_error(drogon::k403Forbidden, "user not found or deactivated");
             company_id = rows[0]["company_id"].as<std::string>();
         } catch (const drogon::orm::DrogonDbException& ex) {
-            spdlog::error("[me] tenant lookup failed: {}", ex.base().what());
-            co_return json_error(drogon::k500InternalServerError, "internal error");
+            // A DB timeout (the client's configured query timeout) maps to 503;
+            // every other DB failure to 500 - consistent with the read path.
+            const auto e    = postgres::map_db_exception(ex);
+            const auto code = e.kind == Error::Kind::ServiceUnavailable
+                                ? drogon::k503ServiceUnavailable
+                                : drogon::k500InternalServerError;
+            spdlog::error("[me] tenant lookup failed ({}): {}",
+                          static_cast<int>(code), ex.base().what());
+            co_return json_error(code,
+                code == drogon::k503ServiceUnavailable ? "service temporarily unavailable"
+                                                       : "internal error");
         }
 
         std::string out;

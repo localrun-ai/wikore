@@ -103,3 +103,27 @@ TEST_CASE("me: a deactivated user is rejected (403)", "[integration][api]")
     auto resp = drogon::sync_wait(wikore::api::me(db, req_with_identity(user)));
     CHECK(resp->getStatusCode() == drogon::k403Forbidden);
 }
+
+TEST_CASE("me: a database timeout maps to 503, not 500", "[integration][api]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db   = wikore::Db::get();
+    auto user = seed_user(db);
+
+    // Hold an ACCESS EXCLUSIVE lock on users in a background transaction so
+    // me()'s SELECT blocks; a short client timeout then fires a TimeoutError,
+    // which must map to 503 (not 500) - the same behavior as the read path.
+    const auto status = drogon::sync_wait(
+        [&]() -> drogon::Task<drogon::HttpStatusCode> {
+            auto locker = co_await db->newTransactionCoro();
+            co_await locker->execSqlCoro("LOCK TABLE users IN ACCESS EXCLUSIVE MODE");
+
+            db->setTimeout(0.5);   // client-wide; restored below
+            auto resp = co_await wikore::api::me(db, req_with_identity(user));
+            db->setTimeout(0);     // 0 = no limit (restore default)
+            // locker leaves scope here -> rollback releases the lock.
+            co_return resp->getStatusCode();
+        }());
+
+    CHECK(status == drogon::k503ServiceUnavailable);
+}
