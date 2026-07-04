@@ -39,6 +39,15 @@ public:
 // Heading detection: lines starting with one or more '#' followed by a space
 // (Markdown ATX headings). For plain text without any '#' headings the whole
 // document is a single section with depth=0 and an empty heading.
+//
+// Also used for structured text formats routed as text/plain:
+//   .json / .jsonl / .ndjson  — JSON data
+//   .csv / .tsv               — tabular text data
+//   .yaml / .yml              — YAML configuration / data
+//   .rst / .adoc / .asciidoc  — lightweight markup (headings not detected)
+//   .log / .conf / .ini / .toml / .env — operational text files
+// These all produce a single flat section; section structure is rarely
+// meaningful in these formats and the chunker handles length splitting.
 // ---------------------------------------------------------------------------
 
 class PlainTextParser : public ParserPort {
