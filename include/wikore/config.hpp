@@ -24,8 +24,6 @@ struct Config {
     int         llm_concurrency   = 4;      // max in-flight LLM calls per tenant
     double      llm_rate_per_sec  = 5.0;    // sustained request rate per tenant
     int         llm_rate_burst    = 15;     // token-bucket capacity (burst) per tenant
-    int         llm_lease_ttl_s   = 120;    // max time a concurrency slot is held
-                                            // (crash-safety reclaim window)
 
     // Embeddings
     std::string embed_base_url = "http://localhost:8081/v1";
@@ -76,7 +74,6 @@ struct Config {
         ei("LLM_MAX_TOKENS",   c.llm_max_tokens);
         ei("LLM_CONCURRENCY",  c.llm_concurrency);
         ei("LLM_RATE_BURST",   c.llm_rate_burst);
-        ei("LLM_LEASE_TTL_S",  c.llm_lease_ttl_s);
         ef("LLM_RATE_PER_SEC", c.llm_rate_per_sec);
         ei("EMBED_DIMS",       c.embed_dims);
         return c;

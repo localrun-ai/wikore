@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -25,8 +26,12 @@ struct LlmLimits {
     int    max_concurrency = 4;        // in-flight LLM calls per tenant
     double rate_per_sec    = 5.0;      // sustained request rate per tenant
     int    burst           = 15;       // token-bucket capacity per tenant
-    int    lease_ttl_ms    = 120000;   // max slot hold time (crash reclaim)
 };
+
+// Added to a slot's max hold time to form its lease TTL, so the lease always
+// outlives the LLM call it guards (covers the gap between call timeout and the
+// RAII release, plus clock jitter). Also bounds the crash-reclaim window.
+inline constexpr std::chrono::seconds kLeaseMargin{15};
 
 LlmLimits llm_limits_from_config(const wikore::Config& cfg);
 
@@ -68,10 +73,16 @@ public:
     // Token-bucket check. true = within the tenant's rate (or Redis down).
     bool allow_rate(std::string_view company_id) const;
 
-    // Take a concurrency slot. Returns a held lease on success; nullopt when
-    // the tenant is at max_concurrency. On Redis error the optional is engaged
-    // with a non-releasing lease (fail-open).
-    std::optional<LlmLease> acquire(std::string_view company_id) const;
+    // Take a concurrency slot for a call expected to hold it for at most
+    // `max_hold`. The lease TTL is derived as max_hold + kLeaseMargin, so a
+    // crashed holder's slot is reclaimed only AFTER the call could no longer be
+    // running - a lease can never expire under a live call, which would let
+    // concurrency exceed the cap. Callers pass their LLM request timeout as
+    // max_hold. Returns a held lease on success; nullopt when the tenant is at
+    // max_concurrency. On Redis error the optional is engaged with a
+    // non-releasing lease (fail-open).
+    std::optional<LlmLease> acquire(std::string_view       company_id,
+                                    std::chrono::milliseconds max_hold) const;
 
     const LlmLimits& limits() const noexcept { return limits_; }
 
