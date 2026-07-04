@@ -255,7 +255,9 @@ Configuration is read from environment variables. The checked-in
 | `LLM_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible generation endpoint |
 | `LLM_MODEL` | empty | Generation model name |
 | `LLM_MAX_TOKENS` | `2048` | Maximum generated tokens |
-| `LLM_CONCURRENCY` | `4` | Planned global in-flight generation cap |
+| `LLM_CONCURRENCY` | `4` | Max in-flight LLM calls **per tenant** (Redis lease semaphore) |
+| `LLM_RATE_PER_SEC` | `5.0` | Sustained LLM request rate per tenant (token-bucket refill) |
+| `LLM_RATE_BURST` | `15` | Per-tenant token-bucket capacity (burst) |
 | `OIDC_ISSUER` | empty | OIDC issuer used to load and validate JWKS |
 | `OIDC_AUDIENCE` | `wikore` | Expected token audience |
 | `CREDENTIALS_KEY` | empty | 64-character hex AES-256-GCM key for integration secrets |

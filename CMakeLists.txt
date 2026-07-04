@@ -146,6 +146,7 @@ add_library(wikore_rag STATIC
     src/rag/evidence_gate.cpp
     src/rag/clearance.cpp
     src/rag/retrieval_orchestrator.cpp
+    src/rag/llm_gate.cpp
     src/rag/llm_provider_openai.cpp
     src/rag/llm_provider_anthropic.cpp
     src/rag/llm_provider_factory.cpp

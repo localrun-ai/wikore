@@ -359,4 +359,117 @@ std::vector<std::string> Redis::scan_keys(std::string_view pattern, size_t limit
     return keys;
 }
 
+// ---------------------------------------------------------------------------
+// Concurrency semaphore (lease-based, crash-safe)
+// ---------------------------------------------------------------------------
+
+int Redis::sem_acquire(std::string_view key, int cap, long long lease_ttl_ms,
+                       std::string_view token)
+{
+    // Prune leases that expired at or before now (crashed holders never
+    // reclaimed their slot), then admit if under cap. ZADD stores the new
+    // lease scored by its expiry so it self-prunes on a future acquire; the
+    // key-level PEXPIRE is a backstop so an idle tenant's ZSET is reclaimed.
+    //
+    // `now` is read from redis.call('TIME') so all app nodes share ONE clock:
+    // a skewed client clock cannot prune another node's still-active lease.
+    // replicate_commands() makes the (non-deterministic) TIME read safe to
+    // follow with writes on Redis 5-6 (no-op on 7+).
+    // ARGV: [1]=lease_ttl_ms, [2]=cap, [3]=token.
+    static constexpr const char* kScript =
+        "redis.replicate_commands()\n"
+        "local t = redis.call('TIME')\n"
+        "local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)\n"
+        "redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)\n"
+        "if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[2]) then return 0 end\n"
+        "redis.call('ZADD', KEYS[1], now + tonumber(ARGV[1]), ARGV[3])\n"
+        "redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[1]) * 2)\n"
+        "return 1\n";
+
+    auto* slot = pick_slot();
+    if (!slot) return -1;
+    const std::string ttl_s = std::to_string(lease_ttl_ms);
+    const std::string cap_s = std::to_string(cap);
+    int outcome = -1;
+    auto* r = slot_exec(*slot, [&](redisContext* c) {
+        return static_cast<redisReply*>(
+            redisCommand(c, "EVAL %s 1 %b %s %s %b",
+                         kScript,
+                         key.data(),   key.size(),
+                         ttl_s.c_str(), cap_s.c_str(),
+                         token.data(), token.size()));
+    });
+    if (r) {
+        if (r->type == REDIS_REPLY_INTEGER) outcome = static_cast<int>(r->integer);
+        freeReplyObject(r);
+    }
+    return outcome;
+}
+
+void Redis::sem_release(std::string_view key, std::string_view token)
+{
+    auto* slot = pick_slot();
+    if (!slot) return;
+    auto* r = slot_exec(*slot, [&](redisContext* c) {
+        return static_cast<redisReply*>(
+            redisCommand(c, "ZREM %b %b",
+                         key.data(),   key.size(),
+                         token.data(), token.size()));
+    });
+    if (r) freeReplyObject(r);
+}
+
+// ---------------------------------------------------------------------------
+// Token-bucket rate limiter
+// ---------------------------------------------------------------------------
+
+int Redis::token_bucket_take(std::string_view key, double refill_per_sec,
+                             int burst, int cost)
+{
+    // Standard token bucket: refill (bounded by burst) based on elapsed time,
+    // then take `cost` if available. State is a hash {t: tokens, ts: last_ms}.
+    // `now` and the stored `ts` both come from redis.call('TIME'), so every app
+    // node meters against ONE clock; skewed client clocks cannot repeatedly
+    // over-refill. replicate_commands() keeps the TIME-then-write script valid
+    // on Redis 5-6 (no-op on 7+). ARGV: [1]=rate, [2]=burst, [3]=cost.
+    static constexpr const char* kScript =
+        "redis.replicate_commands()\n"
+        "local t = redis.call('TIME')\n"
+        "local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)\n"
+        "local rate = tonumber(ARGV[1])\n"
+        "local burst = tonumber(ARGV[2])\n"
+        "local cost = tonumber(ARGV[3])\n"
+        "local d = redis.call('HMGET', KEYS[1], 't', 'ts')\n"
+        "local tokens = tonumber(d[1])\n"
+        "local ts = tonumber(d[2])\n"
+        "if tokens == nil then tokens = burst; ts = now end\n"
+        "local delta = now - ts\n"
+        "if delta < 0 then delta = 0 end\n"
+        "tokens = math.min(burst, tokens + (delta / 1000.0) * rate)\n"
+        "local allowed = 0\n"
+        "if tokens >= cost then tokens = tokens - cost; allowed = 1 end\n"
+        "redis.call('HSET', KEYS[1], 't', tokens, 'ts', now)\n"
+        "redis.call('PEXPIRE', KEYS[1], math.ceil((burst / rate) * 1000) + 1000)\n"
+        "return allowed\n";
+
+    auto* slot = pick_slot();
+    if (!slot) return -1;
+    const std::string rate_s  = std::to_string(refill_per_sec);
+    const std::string burst_s = std::to_string(burst);
+    const std::string cost_s  = std::to_string(cost);
+    int outcome = -1;
+    auto* r = slot_exec(*slot, [&](redisContext* c) {
+        return static_cast<redisReply*>(
+            redisCommand(c, "EVAL %s 1 %b %s %s %s",
+                         kScript,
+                         key.data(), key.size(),
+                         rate_s.c_str(), burst_s.c_str(), cost_s.c_str()));
+    });
+    if (r) {
+        if (r->type == REDIS_REPLY_INTEGER) outcome = static_cast<int>(r->integer);
+        freeReplyObject(r);
+    }
+    return outcome;
+}
+
 } // namespace wikore

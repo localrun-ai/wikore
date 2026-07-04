@@ -20,7 +20,10 @@ struct Config {
     std::string llm_model;
     int         llm_max_tokens = 2048;
     float       llm_temperature = 0.1f;
-    int         llm_concurrency = 4;       // global in-flight cap (Redis semaphore)
+    // Per-tenant LLM guardrails (enforced in Redis; see rag::LlmGate).
+    int         llm_concurrency   = 4;      // max in-flight LLM calls per tenant
+    double      llm_rate_per_sec  = 5.0;    // sustained request rate per tenant
+    int         llm_rate_burst    = 15;     // token-bucket capacity (burst) per tenant
 
     // Embeddings
     std::string embed_base_url = "http://localhost:8081/v1";
@@ -50,6 +53,9 @@ struct Config {
         auto ei = [](const char* k, int& v) {
             if (const char* s = std::getenv(k)) v = std::stoi(s);
         };
+        auto ef = [](const char* k, double& v) {
+            if (const char* s = std::getenv(k)) v = std::stod(s);
+        };
         e("DATABASE_URL",      c.database_url);
         e("PARTITION_DATABASE_URL", c.partition_database_url);
         e("REDIS_URL",         c.redis_url);
@@ -67,6 +73,8 @@ struct Config {
         ei("PORT",             c.port);
         ei("LLM_MAX_TOKENS",   c.llm_max_tokens);
         ei("LLM_CONCURRENCY",  c.llm_concurrency);
+        ei("LLM_RATE_BURST",   c.llm_rate_burst);
+        ef("LLM_RATE_PER_SEC", c.llm_rate_per_sec);
         ei("EMBED_DIMS",       c.embed_dims);
         return c;
     }

@@ -101,12 +101,12 @@ and writing the Redis TTL. Acceptable for enterprise use.
 | `lr:rl:chat:{user_id}` | counter | 60 s | Sliding window; max N chat requests/min per user |
 | `lr:rl:ingest:{org_unit_id}` | counter | 60 s | Ingest rate per org_unit |
 
-## LLM concurrency (Lua semaphore, same pattern as Astraea)
+## LLM guardrails (per-tenant, Lua-atomic; see `rag::LlmGate`)
 
 | Key | Value | TTL | Notes |
 |-----|-------|-----|-------|
-| `lr:llm:sem` | integer | - | Global in-flight LLM requests; capped by LLM_CONCURRENCY env var |
-| `lr:llm:sem:{company_id}` | integer | - | Per-company cap (optional; prevents one tenant starving others) |
+| `lr:llm:sem:{company_id}` | ZSET of lease tokens, scored by expiry (server-clock ms) | key: 2x lease | Per-tenant concurrency semaphore, capped by `LLM_CONCURRENCY`. A lease token is added on `sem_acquire` scored `now + max_hold + margin` and removed on `sem_release`; expired leases (crashed holders) are pruned on the next acquire, so a slot is never leaked. Now is read from `redis.call('TIME')` so all app nodes share one clock. |
+| `lr:llm:rate:{company_id}` | HASH `{t: tokens, ts: last_ms}` | ~burst/rate | Per-tenant token-bucket rate limiter (`LLM_RATE_PER_SEC` refill, `LLM_RATE_BURST` capacity). Refill + take is one atomic `token_bucket_take` EVAL, also clocked by `redis.call('TIME')`. |
 
 ## Ingest queue
 
