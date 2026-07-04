@@ -180,6 +180,10 @@ const std::unordered_set<std::string> k_allowlist = {
     "group_capability_grants_check1",
     "org_unit_capability_grants_check",
     "org_unit_capability_grants_check1",
+    // Composite same-company FK for tenant_features.enabled_by raises as
+    // foreign_key_violation with a named constraint; a cross-tenant actor
+    // is a programming bug -> database_error.
+    "tenant_features_enabled_by_same_company_fk",
 };
 
 bool integration_db_available() {

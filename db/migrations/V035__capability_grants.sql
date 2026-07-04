@@ -34,10 +34,18 @@ CREATE TABLE tenant_features (
     company_id   UUID        NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
     feature      TEXT        NOT NULL,
     enabled      BOOLEAN     NOT NULL DEFAULT false,
-    enabled_by   UUID        REFERENCES users(id) ON DELETE SET NULL,
+    enabled_by   UUID,
     enabled_at   TIMESTAMPTZ,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (company_id, feature)
+    PRIMARY KEY (company_id, feature),
+    -- Composite same-company FK for the actor. NO ACTION (not SET NULL)
+    -- for consistency with V034's actor FKs and because PG17 does not
+    -- support per-column SET NULL, which is what a composite FK with a
+    -- nullable component would need to avoid nulling the PK column.
+    CONSTRAINT tenant_features_enabled_by_same_company_fk
+        FOREIGN KEY (company_id, enabled_by)
+        REFERENCES users(company_id, id) MATCH SIMPLE
+        ON DELETE NO ACTION
 );
 
 COMMENT ON TABLE tenant_features IS
@@ -49,9 +57,18 @@ CREATE TRIGGER tenant_features_updated_at
 
 -- ---------------------------------------------------------------------------
 -- user_capability_grants
+--
+-- Append-mostly: rows are INSERTed on grant, UPDATEd only to fill the
+-- (revoked_at, revoked_by, revocation_reason) triple, and never PK-collide
+-- across re-grants. Surrogate PK + partial unique index on active rows
+-- gives us: (1) one live grant per (company, user, capability) enforced by
+-- the DB, (2) full historical grant/revoke chain preserved, (3) re-grant is
+-- a plain INSERT after the prior row is revoked, (4) the check-side query
+-- reads the partial index directly (it filters to revoked_at IS NULL anyway).
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE user_capability_grants (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id   UUID        NOT NULL,
     user_id      UUID        NOT NULL,
     capability   TEXT        NOT NULL,
@@ -63,7 +80,6 @@ CREATE TABLE user_capability_grants (
     revoked_by   UUID,
     revocation_reason TEXT,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (company_id, user_id, capability),
     -- Composite FKs enforce same-company subject/actor.
     FOREIGN KEY (company_id, user_id)
         REFERENCES users(company_id, id) ON DELETE CASCADE,
@@ -77,18 +93,24 @@ CREATE TABLE user_capability_grants (
     CHECK ((revoked_at IS NULL) = (revoked_by IS NULL))
 );
 
-CREATE INDEX user_capability_grants_user_idx
-    ON user_capability_grants (company_id, user_id);
+-- One active (unrevoked) grant per (company, user, capability). Re-grant
+-- after revoke is a plain INSERT. Prior audit chain (granted_by, reason,
+-- revoked_by, revoked_at, revocation_reason) stays queryable.
+CREATE UNIQUE INDEX user_capability_grants_active_uidx
+    ON user_capability_grants (company_id, user_id, capability)
+    WHERE revoked_at IS NULL;
 
 CREATE TRIGGER user_capability_grants_updated_at
     BEFORE UPDATE ON user_capability_grants
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ---------------------------------------------------------------------------
--- group_capability_grants
+-- group_capability_grants — same append-mostly / active-uidx pattern as
+-- user_capability_grants (see rationale there).
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE group_capability_grants (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id   UUID        NOT NULL,
     group_id     UUID        NOT NULL,
     capability   TEXT        NOT NULL,
@@ -100,7 +122,6 @@ CREATE TABLE group_capability_grants (
     revoked_by   UUID,
     revocation_reason TEXT,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (company_id, group_id, capability),
     FOREIGN KEY (company_id, group_id)
         REFERENCES groups(company_id, id) ON DELETE CASCADE,
     FOREIGN KEY (company_id, granted_by)
@@ -111,21 +132,23 @@ CREATE TABLE group_capability_grants (
     CHECK ((revoked_at IS NULL) = (revoked_by IS NULL))
 );
 
-CREATE INDEX group_capability_grants_group_idx
-    ON group_capability_grants (company_id, group_id);
+CREATE UNIQUE INDEX group_capability_grants_active_uidx
+    ON group_capability_grants (company_id, group_id, capability)
+    WHERE revoked_at IS NULL;
 
 CREATE TRIGGER group_capability_grants_updated_at
     BEFORE UPDATE ON group_capability_grants
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ---------------------------------------------------------------------------
--- org_unit_capability_grants
+-- org_unit_capability_grants — same append-mostly / active-uidx pattern.
 -- ---------------------------------------------------------------------------
 -- Subtree membership is resolved via org_unit_closure at capability-check
 -- time (same pattern as memberships). 'self_and_descendants' grants apply
 -- to every descendant of the org_unit; 'self_only' applies to the unit alone.
 
 CREATE TABLE org_unit_capability_grants (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id   UUID        NOT NULL,
     org_unit_id  UUID        NOT NULL,
     capability   TEXT        NOT NULL,
@@ -139,7 +162,6 @@ CREATE TABLE org_unit_capability_grants (
     revoked_by   UUID,
     revocation_reason TEXT,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (company_id, org_unit_id, capability),
     FOREIGN KEY (company_id, org_unit_id)
         REFERENCES org_units(company_id, id) ON DELETE CASCADE,
     FOREIGN KEY (company_id, granted_by)
@@ -150,8 +172,13 @@ CREATE TABLE org_unit_capability_grants (
     CHECK ((revoked_at IS NULL) = (revoked_by IS NULL))
 );
 
-CREATE INDEX org_unit_capability_grants_ou_idx
-    ON org_unit_capability_grants (company_id, org_unit_id);
+-- Uniqueness on (company, org_unit, capability) is scope-agnostic: two
+-- overlapping applies_to values on the same (unit, capability) would be
+-- redundant. If callers need both 'self_only' and 'self_and_descendants'
+-- simultaneously, the second is a superset and the first should be revoked.
+CREATE UNIQUE INDEX org_unit_capability_grants_active_uidx
+    ON org_unit_capability_grants (company_id, org_unit_id, capability)
+    WHERE revoked_at IS NULL;
 
 CREATE TRIGGER org_unit_capability_grants_updated_at
     BEFORE UPDATE ON org_unit_capability_grants

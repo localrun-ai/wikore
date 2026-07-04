@@ -86,3 +86,77 @@ EXISTS=$(sql "SELECT count(*) FROM pg_constraint
 [ "$EXISTS" -ge "3" ] \
   && pass "V035.9" "user_capability_grants has 3 composite FKs (user, granted_by, revoked_by)" \
   || fail "V035.9" "user_capability_grants composite FKs missing (count=$EXISTS)"
+
+# V035.10: partial unique index rejects a second active grant for the
+# same (company, user, capability). At this point V035.3 inserted an
+# active grant that V035.6 revoked, so a new grant must succeed.
+sql "INSERT INTO user_capability_grants
+       (company_id, user_id, capability, granted_by, reason)
+     VALUES ('$CO_ACME', '$U_ALICE', 'relationship_search', '$U_ALICE',
+             're-engaged for Q3');" > /dev/null
+ERR=$(sql "INSERT INTO user_capability_grants
+             (company_id, user_id, capability, granted_by, reason)
+           VALUES ('$CO_ACME', '$U_ALICE', 'relationship_search', '$U_ALICE',
+                   'duplicate active');" 2>&1 || true)
+echo "$ERR" | grep -qi "user_capability_grants_active_uidx\|unique\|duplicate" \
+  && pass "V035.10" "duplicate active user grant rejected by active_uidx" \
+  || fail "V035.10" "duplicate active grant accepted: $ERR"
+
+# V035.11: full audit chain (revoked + new active) is preserved — 2 rows,
+# one revoked with the old audit fields, one active with the new ones.
+CHAIN=$(sql "SELECT count(*) FROM user_capability_grants
+             WHERE company_id='$CO_ACME' AND user_id='$U_ALICE'
+               AND capability='relationship_search';")
+ACTIVE=$(sql "SELECT count(*) FROM user_capability_grants
+              WHERE company_id='$CO_ACME' AND user_id='$U_ALICE'
+                AND capability='relationship_search' AND revoked_at IS NULL;")
+if [ "$CHAIN" = "2" ] && [ "$ACTIVE" = "1" ]; then
+  pass "V035.11" "re-grant preserves full audit chain (1 revoked + 1 active)"
+else
+  fail "V035.11" "audit chain broken (total=$CHAIN, active=$ACTIVE)"
+fi
+
+# V035.12: re-grant after a NULL revocation_reason is fine (revocation_reason
+# is optional; only revoked_at and revoked_by must move together).
+OLD_REASON=$(sql "SELECT reason FROM user_capability_grants
+                  WHERE company_id='$CO_ACME' AND user_id='$U_ALICE'
+                    AND capability='relationship_search' AND revoked_at IS NOT NULL;")
+[ "$OLD_REASON" = "approved by legal review" ] \
+  && pass "V035.12" "prior grant's reason survives re-grant untouched" \
+  || fail "V035.12" "prior grant reason overwritten (got '$OLD_REASON')"
+
+# V035.13: group_capability_grants_active_uidx behaves the same way.
+# (No group fixture exists, so just assert the partial unique index is present.)
+IDX=$(sql "SELECT count(*) FROM pg_indexes
+           WHERE indexname='group_capability_grants_active_uidx'
+             AND indexdef ILIKE '%WHERE (revoked_at IS NULL)%';")
+[ "$IDX" = "1" ] \
+  && pass "V035.13" "group_capability_grants_active_uidx exists as partial index on revoked_at IS NULL" \
+  || fail "V035.13" "group active_uidx missing or not partial"
+
+# V035.14: org_unit_capability_grants_active_uidx also present as partial.
+IDX=$(sql "SELECT count(*) FROM pg_indexes
+           WHERE indexname='org_unit_capability_grants_active_uidx'
+             AND indexdef ILIKE '%WHERE (revoked_at IS NULL)%';")
+[ "$IDX" = "1" ] \
+  && pass "V035.14" "org_unit_capability_grants_active_uidx exists as partial index" \
+  || fail "V035.14" "org_unit active_uidx missing or not partial"
+
+# V035.15: redundant plain prefix indexes are gone (they were dead weight
+# vs the PK; the P3 finding). Also assert the P2 surrogate PK is in place.
+COUNT=$(sql "SELECT count(*) FROM pg_indexes
+             WHERE indexname IN ('user_capability_grants_user_idx',
+                                 'group_capability_grants_group_idx',
+                                 'org_unit_capability_grants_ou_idx');")
+[ "$COUNT" = "0" ] \
+  && pass "V035.15" "redundant prefix indexes removed" \
+  || fail "V035.15" "prefix indexes still present (count=$COUNT)"
+
+# V035.16: tenant_features.enabled_by is now a composite same-company FK
+# (P3 consistency fix). Look for the named constraint.
+COUNT=$(sql "SELECT count(*) FROM pg_constraint
+             WHERE conname='tenant_features_enabled_by_same_company_fk'
+               AND contype='f';")
+[ "$COUNT" = "1" ] \
+  && pass "V035.16" "tenant_features.enabled_by is composite same-company FK" \
+  || fail "V035.16" "tenant_features.enabled_by composite FK missing (count=$COUNT)"
