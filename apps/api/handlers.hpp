@@ -40,4 +40,13 @@ wiki_query(std::shared_ptr<rag::RetrievalOrchestrator> orch,
 drogon::Task<drogon::HttpResponsePtr>
 me(drogon::orm::DbClientPtr db, drogon::HttpRequestPtr req);
 
+// GET /api/orgs/tree - the caller's company org-unit hierarchy.
+//
+// Behind AuthFilter. Resolves the tenant from the authenticated (active) user,
+// then returns the full org_units tree for that company as nested nodes
+// { id, type, slug, name, description, children }. Tenant-scoped; a deactivated
+// user is rejected.
+drogon::Task<drogon::HttpResponsePtr>
+orgs_tree(drogon::orm::DbClientPtr db, drogon::HttpRequestPtr req);
+
 } // namespace wikore::api

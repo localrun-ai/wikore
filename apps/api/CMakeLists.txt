@@ -4,6 +4,7 @@
 add_library(wikore_api_handlers STATIC
     wiki_query.cpp
     me.cpp
+    orgs_tree.cpp
 )
 target_include_directories(wikore_api_handlers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(wikore_api_handlers PUBLIC

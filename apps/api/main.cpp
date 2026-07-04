@@ -114,7 +114,18 @@ int main() {
     // Org tree
     // -----------------------------------------------------------------------
     drogon::app().registerHandler("/api/orgs/tree",
-        [](const Req&, CB&& cb) { cb(not_implemented()); },
+        [deps](Req req, CB cb) -> drogon::AsyncTask {
+            if (!deps->db) {   // before beginning advice populated it
+                auto r = drogon::HttpResponse::newHttpResponse();
+                r->setStatusCode(drogon::k503ServiceUnavailable);
+                r->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+                r->setBody(R"({"error":"service starting"})");
+                cb(r);
+                co_return;
+            }
+            auto resp = co_await wikore::api::orgs_tree(deps->db, std::move(req));
+            cb(resp);
+        },
         {drogon::Get, "wikore::AuthFilter"});
 
     drogon::app().registerHandler("/api/orgs",
