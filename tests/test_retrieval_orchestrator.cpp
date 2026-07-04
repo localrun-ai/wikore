@@ -139,7 +139,7 @@ TEST_CASE("RetrievalOrchestrator: gate overrides a stale prefilter and clearance
     REQUIRE(r.has_value());
 
     std::vector<std::string> got;
-    for (const auto& a : *r) got.push_back(a.chunk_id);
+    for (const auto& a : *r) got.push_back(a.chunk_id());
 
     // Only the genuinely-visible chunk survives:
     //  - `visible`    : prefilter pass + gate allow  -> IN
@@ -149,7 +149,7 @@ TEST_CASE("RetrievalOrchestrator: gate overrides a stale prefilter and clearance
     CHECK(got[0] == visible.chunk_id);
     CHECK(std::find(got.begin(), got.end(), stale.chunk_id)      == got.end());
     CHECK(std::find(got.begin(), got.end(), restricted.chunk_id) == got.end());
-    CHECK((*r)[0].text.find("body") != std::string::npos);  // hydrated by the gate
+    CHECK((*r)[0].text().find("body") != std::string::npos);  // hydrated by the gate
 
     // P2: a very large limit must not overflow limit * over_fetch; the result
     // stays bounded and correct.

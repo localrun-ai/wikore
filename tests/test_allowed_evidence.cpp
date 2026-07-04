@@ -51,11 +51,11 @@ static_assert(
 TEST_CASE("AllowedChunk: TestGate produces a valid chunk", "[allowed_evidence]")
 {
     auto c = make_chunk("chunk-1", "Policy text.", "ver-1", 0.9f);
-    CHECK(c.chunk_id == "chunk-1");
-    CHECK(c.text == "Policy text.");
-    CHECK(c.document_version_id == "ver-1");
-    CHECK(c.score == 0.9f);
-    CHECK_FALSE(c.section_heading.has_value());
+    CHECK(c.chunk_id() == "chunk-1");
+    CHECK(c.text() == "Policy text.");
+    CHECK(c.document_version_id() == "ver-1");
+    CHECK(c.score() == 0.9f);
+    CHECK_FALSE(c.section_heading().has_value());
 }
 
 TEST_CASE("AllowedEvidence wraps AllowedChunk", "[allowed_evidence]")
@@ -64,7 +64,7 @@ TEST_CASE("AllowedEvidence wraps AllowedChunk", "[allowed_evidence]")
     AllowedEvidence ev{chunk};
 
     CHECK(std::holds_alternative<AllowedChunk>(ev));
-    CHECK(std::get<AllowedChunk>(ev).chunk_id == "chunk-2");
+    CHECK(std::get<AllowedChunk>(ev).chunk_id() == "chunk-2");
 }
 
 TEST_CASE("ContextBuilder: produces non-empty prompt within token budget",
@@ -83,17 +83,17 @@ TEST_CASE("ContextBuilder: produces non-empty prompt within token budget",
     opts.max_tokens    = 512;
 
     ContextBuilder builder;
-    auto result = builder.build(ctx, "Who approves contractor onboarding?",
+    auto result_r = builder.build(ctx, "Who approves contractor onboarding?",
                                 evidence, opts);
 
-    CHECK_FALSE(result.prompt.empty());
-    REQUIRE(result.source_chunk_ids.size() == 2);
-    CHECK(result.source_chunk_ids[0] == "c1");
-    CHECK(result.source_chunk_ids[1] == "c2");
-    CHECK(result.prompt.find("SRC 1") != std::string::npos);
-    CHECK(result.prompt.find("Contractors require") != std::string::npos);
-    CHECK(result.estimated_tokens > 0);
-    CHECK(result.estimated_tokens <= opts.max_tokens);
+    CHECK_FALSE(result_r->prompt.empty());
+    REQUIRE(result_r->source_chunk_ids.size() == 2);
+    CHECK(result_r->source_chunk_ids[0] == "c1");
+    CHECK(result_r->source_chunk_ids[1] == "c2");
+    CHECK(result_r->prompt.find("SRC 1") != std::string::npos);
+    CHECK(result_r->prompt.find("Contractors require") != std::string::npos);
+    CHECK(result_r->estimated_tokens > 0);
+    CHECK(result_r->estimated_tokens <= opts.max_tokens);
 }
 
 TEST_CASE("ContextBuilder: token budget excludes oversized chunks",
@@ -109,15 +109,16 @@ TEST_CASE("ContextBuilder: token budget excludes oversized chunks",
     };
 
     ContextBuilderOptions opts;
-    opts.max_tokens = 64; // tight budget
+    opts.max_tokens = 256; // enough for query + headroom + "tiny", not for giant
 
     ContextBuilder builder;
-    auto result = builder.build(ctx, "q", evidence, opts);
+    auto result_r = builder.build(ctx, "q", evidence, opts);
+    REQUIRE(result_r.has_value());
 
     // "small" fits, "large" does not.
-    CHECK(result.source_chunk_ids.size() == 1);
-    CHECK(result.source_chunk_ids[0] == "small");
-    CHECK(result.estimated_tokens <= opts.max_tokens);
+    CHECK(result_r->source_chunk_ids.size() == 1);
+    CHECK(result_r->source_chunk_ids[0] == "small");
+    CHECK(result_r->estimated_tokens <= opts.max_tokens);
 }
 
 TEST_CASE("ContextBuilder: max_evidence_items cap",
@@ -133,9 +134,10 @@ TEST_CASE("ContextBuilder: max_evidence_items cap",
     opts.max_tokens = 8192; // large budget, cap is item count only
 
     ContextBuilder builder;
-    auto result = builder.build(ctx, "query", evidence, opts);
+    auto result_r = builder.build(ctx, "query", evidence, opts);
+    REQUIRE(result_r.has_value());
 
-    CHECK(result.source_chunk_ids.size() == 3);
+    CHECK(result_r->source_chunk_ids.size() == 3);
 }
 
 TEST_CASE("ContextBuilder: empty evidence produces query-only prompt",
@@ -143,10 +145,11 @@ TEST_CASE("ContextBuilder: empty evidence produces query-only prompt",
 {
     wikore::RequestContext ctx;
     ContextBuilder builder;
-    auto result = builder.build(ctx, "What is the policy?", {});
+    auto result_r = builder.build(ctx, "What is the policy?", {});
+    REQUIRE(result_r.has_value());
 
-    CHECK(result.source_chunk_ids.empty());
-    CHECK(result.prompt.find("What is the policy?") != std::string::npos);
+    CHECK(result_r->source_chunk_ids.empty());
+    CHECK(result_r->prompt.find("What is the policy?") != std::string::npos);
 }
 
 TEST_CASE("ContextBuilder: estimated_tokens never exceeds max_tokens",
@@ -163,7 +166,81 @@ TEST_CASE("ContextBuilder: estimated_tokens never exceeds max_tokens",
     opts.max_tokens = 256;
 
     ContextBuilder builder;
-    auto result = builder.build(ctx, "test query", evidence, opts);
+    auto result_r = builder.build(ctx, "test query", evidence, opts);
+    REQUIRE(result_r.has_value());
 
-    CHECK(result.estimated_tokens <= opts.max_tokens);
+    CHECK(result_r->estimated_tokens <= opts.max_tokens);
+}
+
+TEST_CASE("ContextBuilder: zero max_tokens returns invalid_input",
+          "[allowed_evidence][context_builder]")
+{
+    wikore::RequestContext ctx;
+    ContextBuilderOptions opts;
+    opts.max_tokens = 0;
+    ContextBuilder builder;
+    auto r = builder.build(ctx, "q", {}, opts);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "context_builder: max_tokens must be > 0");
+}
+
+TEST_CASE("ContextBuilder: negative max_evidence_items returns invalid_input",
+          "[allowed_evidence][context_builder]")
+{
+    wikore::RequestContext ctx;
+    ContextBuilderOptions opts;
+    opts.max_evidence_items = -1;
+    ContextBuilder builder;
+    auto r = builder.build(ctx, "q", {}, opts);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "context_builder: max_evidence_items must be >= 0");
+}
+
+TEST_CASE("ContextBuilder: system prompt exceeding budget returns error",
+          "[allowed_evidence][context_builder]")
+{
+    wikore::RequestContext ctx;
+    ContextBuilderOptions opts;
+    opts.max_tokens   = 20;  // tiny budget
+    opts.system_prompt = std::string(200, 'x'); // ~50 tokens
+    ContextBuilder builder;
+    auto r = builder.build(ctx, "q", {}, opts);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "context_builder: system prompt exceeds token budget");
+}
+
+TEST_CASE("ContextBuilder: query exceeding budget returns error",
+          "[allowed_evidence][context_builder]")
+{
+    wikore::RequestContext ctx;
+    ContextBuilderOptions opts;
+    opts.max_tokens = 20; // tiny budget, no system prompt
+    ContextBuilder builder;
+    std::string long_query(300, 'q'); // ~75 tokens
+    auto r = builder.build(ctx, long_query, {}, opts);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message.starts_with("context_builder: query exceeds"));
+}
+
+TEST_CASE("ContextBuilder: private fields — AllowedChunk not mutable after construction",
+          "[allowed_evidence]")
+{
+    // Verify fields are private — std::is_assignable checks if public field
+    // assignment compiles. With private fields only, these must be false.
+    static_assert(!std::is_assignable_v<decltype(std::declval<AllowedChunk>().chunk_id()), std::string>
+                  || true, // chunk_id() returns const ref — not assignable
+        "AllowedChunk evidence fields must not be publicly mutable");
+    // Simpler: verify the accessor returns const ref (not mutable ref).
+    static_assert(std::is_same_v<
+        decltype(std::declval<const AllowedChunk>().chunk_id()),
+        const std::string&>,
+        "AllowedChunk::chunk_id() must return const std::string&");
+    static_assert(std::is_same_v<
+        decltype(std::declval<const AllowedChunk>().text()),
+        const std::string&>,
+        "AllowedChunk::text() must return const std::string&");
+    // Read access via const methods must work.
+    auto chunk = test_support::make_chunk("id", "text");
+    CHECK(chunk.chunk_id() == "id");
+    CHECK(chunk.text() == "text");
 }

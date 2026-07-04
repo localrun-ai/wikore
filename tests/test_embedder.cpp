@@ -113,7 +113,7 @@ TEST_CASE("EvidenceGate: ChunkCandidate != AllowedChunk at compile time", "[type
     static_assert(!std::is_same_v<ChunkCandidate, AllowedChunk>,
                   "EvidenceGate: types must be distinct");
     // AllowedChunk has 'text' field; ChunkCandidate has 'payload'
-    static_assert(requires(AllowedChunk a) { a.text; });
+    static_assert(requires(AllowedChunk a) { a.text(); }, "AllowedChunk must have text() accessor");
     static_assert(requires(ChunkCandidate   c) { c.payload; });
     SUCCEED("compile-time gate verified");
 }

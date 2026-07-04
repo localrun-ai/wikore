@@ -152,9 +152,9 @@ namespace test_support { class TestGate; }
 // knowledge of the token type and a friend relationship with EvidenceGate,
 // which callers outside the rag:: module cannot obtain.
 //
-// Fields are public for read access. The gate is the production factory;
-// test code uses AllowedChunk::TestFactory (defined in
-// tests/support/allowed_chunk_test_factory.hpp, linked only in test targets).
+// Evidence fields are private and read-only: downstream code (Reranker,
+// ContextBuilder) cannot replace text or IDs with ungated data after
+// construction. The gate is the sole write path.
 // ---------------------------------------------------------------------------
 
 class AllowedChunk {
@@ -168,24 +168,32 @@ public:
     };
 
     AllowedChunk(ConstructionToken,
-                 std::string  chunk_id_,
-                 std::string  document_version_id_,
-                 float        score_,
-                 std::string  text_,
-                 std::optional<std::string> section_heading_)
-        : chunk_id(std::move(chunk_id_))
-        , document_version_id(std::move(document_version_id_))
-        , score(score_)
-        , text(std::move(text_))
-        , section_heading(std::move(section_heading_)) {}
+                 std::string  chunk_id,
+                 std::string  document_version_id,
+                 float        score,
+                 std::string  text,
+                 std::optional<std::string> section_heading)
+        : chunk_id_(std::move(chunk_id))
+        , document_version_id_(std::move(document_version_id))
+        , score_(score)
+        , text_(std::move(text))
+        , section_heading_(std::move(section_heading)) {}
 
-    AllowedChunk() = delete; // no default construction without token
+    AllowedChunk() = delete;
 
-    std::string  chunk_id;
-    std::string  document_version_id;
-    float        score   = 0.0f;
-    std::string  text;
-    std::optional<std::string> section_heading;
+    [[nodiscard]] const std::string& chunk_id()           const noexcept { return chunk_id_; }
+    [[nodiscard]] const std::string& document_version_id()const noexcept { return document_version_id_; }
+    [[nodiscard]] float              score()               const noexcept { return score_; }
+    [[nodiscard]] const std::string& text()                const noexcept { return text_; }
+    [[nodiscard]] const std::optional<std::string>& section_heading() const noexcept
+                                                                      { return section_heading_; }
+
+private:
+    std::string  chunk_id_;
+    std::string  document_version_id_;
+    float        score_   = 0.0f;
+    std::string  text_;
+    std::optional<std::string> section_heading_;
 };
 
 // AllowedCandidate: backward-compatible alias. New code should use AllowedChunk.

@@ -1,6 +1,7 @@
 #pragma once
 #include "wikore/rag/types.hpp"
 #include "wikore/domain/types.hpp"
+// Result<T> and Error come from wikore/domain/types.hpp (already included via rag/types.hpp)
 #include <span>
 #include <string>
 #include <vector>
@@ -9,15 +10,12 @@ namespace wikore::rag {
 
 // ---------------------------------------------------------------------------
 // PromptContext — the assembled prompt sent to the LLM.
-//
-// Carries the formatted prompt string, the ordered list of source citations
-// (for AnswerFinalizer), and the total token estimate used for budget enforcement.
 // ---------------------------------------------------------------------------
 
 struct PromptContext {
-    std::string prompt;                        // assembled prompt text
+    std::string prompt;
     std::vector<std::string> source_chunk_ids; // in citation order
-    int estimated_tokens = 0;
+    int estimated_tokens = 0;                  // always <= opts.max_tokens
 };
 
 // ---------------------------------------------------------------------------
@@ -25,33 +23,38 @@ struct PromptContext {
 // ---------------------------------------------------------------------------
 
 struct ContextBuilderOptions {
-    int max_tokens          = 4096;  // hard token budget for the prompt
-    int max_evidence_items  = 20;    // cap on evidence items to include
-    std::string system_prompt;       // injected before evidence
+    // Hard token budget for the entire prompt including evidence, system
+    // prompt, query, and answer headroom. Must be > 0.
+    int max_tokens          = 4096;
+    // Maximum evidence items to include (budget permitting). Must be >= 0.
+    int max_evidence_items  = 20;
+    std::string system_prompt;
 };
 
 // ---------------------------------------------------------------------------
-// ContextBuilder — assembles a PromptContext from allowed evidence.
+// ContextBuilder — assembles a token-budgeted prompt from AllowedEvidence.
 //
-// The function signature is intentionally strict:
-//   - Accepts std::span<const AllowedEvidence> only.
-//   - Must NOT be overloaded for ChunkCandidate, EdgeCandidate, raw Qdrant
-//     payloads, arbitrary chunk IDs, or RetrievalDiagnostics.
-//   - AllowedEvidence is a variant<AllowedChunk> today; adding
-//     AllowedRelationship/AllowedPath later does not require a new overload.
+// Returns Error::invalid_input if:
+//   - opts.max_tokens <= 0 or opts.max_evidence_items < 0
+//   - system_prompt + query boilerplate does not fit within the budget
+//     (mandatory content cannot be silently omitted)
 //
-// Thread safety: ContextBuilder is stateless.
+// Evidence items are included in supplied order until max_tokens or
+// max_evidence_items is exhausted. estimated_tokens is always <= max_tokens.
+//
+// Accepts only std::span<const AllowedEvidence>; not overloaded for
+// ChunkCandidate, raw payloads, or diagnostic types.
 // ---------------------------------------------------------------------------
 
 class ContextBuilder {
 public:
     ContextBuilder() = default;
 
-    [[nodiscard]] PromptContext build(
-        const wikore::RequestContext&  ctx,
-        std::string_view               query,
+    [[nodiscard]] Result<PromptContext> build(
+        const wikore::RequestContext&    ctx,
+        std::string_view                 query,
         std::span<const AllowedEvidence> evidence,
-        const ContextBuilderOptions&   opts = {}) const;
+        const ContextBuilderOptions&     opts = {}) const;
 };
 
 } // namespace wikore::rag
