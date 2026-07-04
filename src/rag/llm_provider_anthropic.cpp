@@ -237,11 +237,13 @@ public:
             if (line.empty()) current_event.clear();
         }
 
-        // message_stop is required by Anthropic spec; log a warning if absent
-        // but return the accumulated content rather than failing, consistent
-        // with the OpenAI-compatible [DONE] relaxation.
-        if (!message_stop_received)
+        // message_stop is required by Anthropic spec. Its absence signals an
+        // application-level interruption (server error after headers were sent).
+        if (!message_stop_received) {
             spdlog::warn("[llm-anthropic] stream ended without message_stop event");
+            co_return std::unexpected(
+                Error::unavailable("llm: incomplete stream (no message_stop received)"));
+        }
 
         on_chunk(ChatChunk{.done = true});
 

@@ -83,10 +83,20 @@ struct OaiStreamUsage {
     int prompt_tokens     = 0;
     int completion_tokens = 0;
 };
+// Error detail from providers that send {"error":{...}} in a data: line.
+struct OaiErrorDetail {
+    std::string message;
+    std::string type;
+    std::string code;
+};
 struct OaiStreamChunk {
-    std::vector<OaiStreamChoice> choices;
-    OaiStreamUsage               usage;
-    std::string                  model;
+    std::vector<OaiStreamChoice>  choices;
+    // usage is null on every non-final chunk when stream_options.include_usage=true
+    // (OpenAI API reference); must be optional.
+    std::optional<OaiStreamUsage> usage;
+    std::string                   model;
+    // Populated when the provider sends {"error":{...}} instead of a delta.
+    std::optional<OaiErrorDetail> error;
 };
 
 // ---------------------------------------------------------------------------
@@ -243,13 +253,19 @@ public:
 
             OaiStreamChunk chunk;
             if (glz::read<glz::opts{.error_on_unknown_keys = false}>(chunk, json_payload)) {
-                // Any non-empty data line that fails JSON parse is a corrupt
-                // stream — error objects and truncated chunks alike. Never skip
-                // silently: stream completion after a skip would return
-                // truncated content as success.
                 spdlog::warn("[llm-openai] malformed SSE chunk; aborting stream");
                 co_return std::unexpected(
                     Error::unavailable("llm: malformed SSE chunk in stream"));
+            }
+            // Explicit error-object check: providers send {"error":{...}} in a
+            // data: line on rate-limit, quota, or internal errors.  With
+            // error_on_unknown_keys=false the outer object parses cleanly
+            // (choices empty, error populated); without this check it would be
+            // silently treated as an empty delta.
+            if (chunk.error) {
+                spdlog::warn("[llm-openai] upstream returned error chunk in stream");
+                co_return std::unexpected(
+                    Error::unavailable("llm: upstream returned error in stream"));
             }
 
             if (!chunk.choices.empty()) {
@@ -259,21 +275,27 @@ public:
                     on_chunk(ChatChunk{.content = delta.content, .done = false});
                 }
             }
-            // Capture usage if provided (some providers send it on last chunk)
-            if (chunk.usage.prompt_tokens > 0)
-                input_tokens = chunk.usage.prompt_tokens;
-            if (chunk.usage.completion_tokens > 0)
-                output_tokens = chunk.usage.completion_tokens;
+            // Capture usage from the final chunk (null on all prior chunks).
+            if (chunk.usage) {
+                if (chunk.usage->prompt_tokens > 0)
+                    input_tokens = chunk.usage->prompt_tokens;
+                if (chunk.usage->completion_tokens > 0)
+                    output_tokens = chunk.usage->completion_tokens;
+            }
             if (!chunk.model.empty() && model_echo.empty())
                 model_echo = chunk.model;
         }
 
-        // [DONE] not required: sendRequestCoro guarantees a complete HTTP body.
-        // Some OpenAI-compatible backends (llama.cpp, Ollama) omit [DONE].
-        // Log a warning for visibility but treat the stream as complete.
-        if (!stream_completed)
-            spdlog::warn("[llm-openai] stream ended without [DONE] sentinel (provider quirk)");
-
+        // [DONE] is required: its absence after a complete HTTP body means the
+        // provider sent an application-level incomplete stream (e.g. truncated
+        // by a server-side error after the HTTP headers were sent).
+        // Note: llama.cpp, Ollama, and vLLM all emit [DONE]; if a specific
+        // backend is known to omit it, set a per-provider flag in LlmProviderConfig.
+        if (!stream_completed) {
+            spdlog::warn("[llm-openai] stream ended without [DONE] sentinel");
+            co_return std::unexpected(
+                Error::unavailable("llm: incomplete stream (no [DONE] received)"));
+        }
         on_chunk(ChatChunk{.done = true});
 
         co_return ChatResponse{
@@ -446,15 +468,25 @@ public:
                 co_return std::unexpected(
                     Error::unavailable("llm: malformed SSE chunk in stream"));
             }
+            if (chunk.error) {
+                spdlog::warn("[llm-azure] upstream returned error chunk in stream");
+                co_return std::unexpected(
+                    Error::unavailable("llm: upstream returned error in stream"));
+            }
             if (!chunk.choices.empty() && !chunk.choices[0].delta.content.empty()) {
                 accumulated += chunk.choices[0].delta.content;
                 on_chunk(ChatChunk{.content = chunk.choices[0].delta.content});
             }
-            if (chunk.usage.prompt_tokens > 0)     input_tokens  = chunk.usage.prompt_tokens;
-            if (chunk.usage.completion_tokens > 0) output_tokens = chunk.usage.completion_tokens;
+            if (chunk.usage) {
+                if (chunk.usage->prompt_tokens > 0)     input_tokens  = chunk.usage->prompt_tokens;
+                if (chunk.usage->completion_tokens > 0) output_tokens = chunk.usage->completion_tokens;
+            }
         }
-        if (!stream_completed)
-            spdlog::warn("[llm-azure] stream ended without [DONE] sentinel (provider quirk)");
+        if (!stream_completed) {
+            spdlog::warn("[llm-azure] stream ended without [DONE] sentinel");
+            co_return std::unexpected(
+                Error::unavailable("llm: incomplete stream (no [DONE] received)"));
+        }
         on_chunk(ChatChunk{.done = true});
         co_return ChatResponse{
             .content       = std::move(accumulated),
