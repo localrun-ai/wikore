@@ -62,6 +62,18 @@ struct MeResp {
     std::string company_id;
 };
 
+// Sets a client-wide query timeout for the scope and restores the configured
+// value on destruction (even on exception), so a test that shortens the shared
+// client's timeout cannot leak an unbounded/changed timeout to later tests.
+// The restore value mirrors Db::init's PostgresConfig.timeout (30s).
+struct ClientTimeoutGuard {
+    drogon::orm::DbClientPtr db;
+    ClientTimeoutGuard(drogon::orm::DbClientPtr d, double set) : db(std::move(d)) {
+        db->setTimeout(set);
+    }
+    ~ClientTimeoutGuard() { db->setTimeout(30.0); }
+};
+
 } // namespace
 
 TEST_CASE("me: returns the caller's identity and tenant (200)", "[integration][api]")
@@ -110,17 +122,17 @@ TEST_CASE("me: a database timeout maps to 503, not 500", "[integration][api]")
     auto db   = wikore::Db::get();
     auto user = seed_user(db);
 
-    // Hold an ACCESS EXCLUSIVE lock on users in a background transaction so
-    // me()'s SELECT blocks; a short client timeout then fires a TimeoutError,
-    // which must map to 503 (not 500) - the same behavior as the read path.
+    // Shorten the shared client's timeout for this scope only (RAII-restored),
+    // then hold an ACCESS EXCLUSIVE lock on users in a background transaction so
+    // me()'s SELECT blocks. The timeout fires a TimeoutError, which must map to
+    // 503 (not 500) - as on the read path.
+    ClientTimeoutGuard guard(db, /*set=*/0.5);
+
     const auto status = drogon::sync_wait(
         [&]() -> drogon::Task<drogon::HttpStatusCode> {
             auto locker = co_await db->newTransactionCoro();
             co_await locker->execSqlCoro("LOCK TABLE users IN ACCESS EXCLUSIVE MODE");
-
-            db->setTimeout(0.5);   // client-wide; restored below
             auto resp = co_await wikore::api::me(db, req_with_identity(user));
-            db->setTimeout(0);     // 0 = no limit (restore default)
             // locker leaves scope here -> rollback releases the lock.
             co_return resp->getStatusCode();
         }());
