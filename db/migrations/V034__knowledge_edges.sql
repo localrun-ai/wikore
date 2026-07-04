@@ -326,13 +326,36 @@ CREATE TRIGGER knowledge_edges_reject_uuid_reuse
 -- has a clean history slate.
 -- ---------------------------------------------------------------------------
 
+-- SECURITY DEFINER + explicit search_path so this trigger function runs as
+-- its owner (the migration role) rather than the invoking role.  The
+-- REVOKE EXECUTE ... FROM PUBLIC on knowledge_edges_snapshot_internal only
+-- keeps its teeth if the caller is not the function owner; making the
+-- trigger definers pins that guarantee independent of whether migration
+-- and app share a role today or get split tomorrow.
 CREATE OR REPLACE FUNCTION knowledge_edges_check_count_and_snapshot_fn()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
+RETURNS TRIGGER LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
 DECLARE
     v_count INT;
 BEGIN
     -- Skip if the edge was deleted in this transaction (cascade path).
     IF NOT EXISTS (SELECT 1 FROM knowledge_edges WHERE id = NEW.id) THEN
+        RETURN NEW;
+    END IF;
+
+    -- Same-transaction INSERT + DELETE + re-INSERT of one UUID queues two
+    -- deferred parent-trigger events.  Both fire at COMMIT against the
+    -- re-inserted row: without this guard event 1 snapshots, event 2 closes
+    -- that zero-length interval and snapshots again — correct final state
+    -- but a duplicate 'insert' marker in history.  If an open interval
+    -- already exists for this id, an earlier queued event has already
+    -- captured the initial snapshot; nothing to do.
+    IF EXISTS (
+        SELECT 1 FROM knowledge_edges_history
+        WHERE live_row_id = NEW.id AND valid_until IS NULL
+    ) THEN
         RETURN NEW;
     END IF;
 
@@ -391,7 +414,10 @@ CREATE CONSTRAINT TRIGGER knowledge_edges_exactly_two_endpoints_trg
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION knowledge_edges_history_update_fn()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
+RETURNS TRIGGER LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
 BEGIN
     -- Updates in the same transaction as the edge INSERT precede the deferred
     -- initial-history snapshot (parent CONSTRAINT TRIGGER, fired at COMMIT).
@@ -455,7 +481,16 @@ BEGIN
     -- job_type='qdrant_delete_edge_points' ships in a follow-up PR alongside
     -- the edge-vector indexing worker. Retrieval is safe in the interim
     -- because EvidenceGate revalidates on live PG state.
-    IF point_ids IS NOT NULL AND array_length(point_ids, 1) > 0 THEN
+    --
+    -- Guard against tenant offboarding: outbox_events has an FK to companies,
+    -- so during DELETE FROM companies (the intended tenant purge path) the
+    -- companies row is removed first and any downstream INSERT INTO
+    -- outbox_events(company_id, ...) would fail with 23503, aborting the
+    -- whole offboarding. Skipping the per-point cleanup here is correct:
+    -- tenant purges must sweep Qdrant by company filter separately anyway
+    -- (per-point deletion is the wrong tool for that scale).
+    IF point_ids IS NOT NULL AND array_length(point_ids, 1) > 0
+       AND EXISTS (SELECT 1 FROM companies WHERE id = OLD.company_id) THEN
         INSERT INTO outbox_events (
             company_id, aggregate_id, job_type, job_schema_version,
             payload, idempotency_key

@@ -319,3 +319,97 @@ COUNT=$(sql "SELECT count(*) FROM knowledge_edges WHERE id='$EDGE_INSDEL';")
 [ "$COUNT" = "1" ] \
   && pass "V034.22b" "UUID reusable after same-tx INSERT+DELETE (never existed)" \
   || fail "V034.22b" "UUID incorrectly burned by same-tx INSERT+DELETE"
+
+# V034.23 (P2 regression): DELETE FROM companies with an edge+embedding
+# must succeed. outbox_events.company_id FKs to companies; without the
+# guard in the BEFORE DELETE trigger the outbox INSERT fires against a
+# companies row that PG has already removed, aborting the entire
+# offboarding transaction with SQLSTATE 23503.
+V34_CO='6e6ccca0-0000-0000-0000-000000000001'
+V34_U='6e6ccca0-0000-0000-0000-0000000000a1'
+sql "INSERT INTO companies (id, name, slug)
+     VALUES ('$V34_CO', 'V034 Scratch', 'v034-scratch');" > /dev/null
+sql "INSERT INTO users (id, company_id, external_sub, email)
+     VALUES ('$V34_U', '$V34_CO', 'v34-sub', 'v34@scratch.example');" > /dev/null
+V34_CO_ROOT=$(sql "SELECT id FROM org_units WHERE company_id='$V34_CO' AND type='root';")
+V34_CO_DOC='6e6ccca0-0000-0000-0000-0000000000d1'
+V34_CO_VER='6e6ccca0-0000-0000-0000-0000000000e1'
+V34_CO_C1='6e6ccca0-0000-0000-0000-0000000000c1'
+V34_CO_C2='6e6ccca0-0000-0000-0000-0000000000c2'
+V34_CO_EDGE='6e6ccca0-0000-0000-0000-0000000000ed'
+V34_CO_POINT='6e6ccca0-0000-0000-0000-0000000000ff'
+sql "INSERT INTO documents (id, company_id, owner_org_unit_id, filename, title, mime_type)
+     VALUES ('$V34_CO_DOC', '$V34_CO', '$V34_CO_ROOT', 'x.txt', 'X', 'text/plain');" > /dev/null
+sql "INSERT INTO document_versions
+       (id, company_id, document_id, version_no, source_hash,
+        ingest_status, completed_at, activated_at, chunk_count, lifecycle_status)
+     VALUES ('$V34_CO_VER', '$V34_CO', '$V34_CO_DOC', 1, 'v34co-h1',
+             'done', now(), now(), 2, 'active');" > /dev/null
+sql "INSERT INTO document_chunks
+       (id, company_id, document_version_id, chunk_index, content, content_hash)
+     VALUES ('$V34_CO_C1', '$V34_CO', '$V34_CO_VER', 0, 'a', 'ha'),
+            ('$V34_CO_C2', '$V34_CO', '$V34_CO_VER', 1, 'b', 'hb');" > /dev/null
+sql "BEGIN;
+     INSERT INTO knowledge_edges
+       (id, company_id, edge_type, direction, confidence, origin)
+     VALUES ('$V34_CO_EDGE', '$V34_CO', 'implements', 'directed', 0.9,
+             'administrator');
+     INSERT INTO knowledge_edge_endpoints (company_id, edge_id, ordinal, chunk_id, role)
+     VALUES ('$V34_CO', '$V34_CO_EDGE', 0, '$V34_CO_C1', 'source'),
+            ('$V34_CO', '$V34_CO_EDGE', 1, '$V34_CO_C2', 'target');
+     COMMIT;" > /dev/null
+sql "INSERT INTO knowledge_edge_embeddings
+       (company_id, edge_id, embedding_model_id, qdrant_point_id,
+        formula_version, indexed_edge_version)
+     VALUES ('$V34_CO', '$V34_CO_EDGE', '$V34_MODEL', '$V34_CO_POINT', 1, 1);" > /dev/null
+
+# The tenant purge itself. Failure here means the offboarding trigger path
+# still hits the outbox FK.
+ERR=$(sql "DELETE FROM companies WHERE id='$V34_CO';" 2>&1 || true)
+if [ -z "$ERR" ] || echo "$ERR" | grep -qi "DELETE"; then
+  pass "V034.23" "DELETE FROM companies succeeds with edge+embedding (P2 regression)"
+else
+  fail "V034.23" "tenant offboarding aborted: $ERR"
+fi
+
+# V034.24 (P4 regression): same-transaction INSERT + DELETE + re-INSERT of
+# one UUID must produce exactly ONE 'insert' history row. Two deferred
+# parent-trigger events fire at COMMIT; the second must observe the open
+# interval left by the first and return without writing a duplicate.
+EDGE_REINS='6e6c0000-0000-0000-0000-0000000024a1'
+sql "BEGIN;
+     INSERT INTO knowledge_edges
+       (id, company_id, edge_type, direction, confidence, origin)
+     VALUES ('$EDGE_REINS', '$CO_ACME', 'implements', 'directed', 0.5,
+             'administrator');
+     INSERT INTO knowledge_edge_endpoints (company_id, edge_id, ordinal, chunk_id, role)
+     VALUES ('$CO_ACME', '$EDGE_REINS', 0, '$V34_CHK1', 'source'),
+            ('$CO_ACME', '$EDGE_REINS', 1, '$V34_CHK2', 'target');
+     DELETE FROM knowledge_edges WHERE id='$EDGE_REINS';
+     INSERT INTO knowledge_edges
+       (id, company_id, edge_type, direction, confidence, origin)
+     VALUES ('$EDGE_REINS', '$CO_ACME', 'depends_on', 'directed', 0.9,
+             'administrator');
+     INSERT INTO knowledge_edge_endpoints (company_id, edge_id, ordinal, chunk_id, role)
+     VALUES ('$CO_ACME', '$EDGE_REINS', 0, '$V34_CHK1', 'source'),
+            ('$CO_ACME', '$EDGE_REINS', 1, '$V34_CHK3', 'target');
+     COMMIT;" > /dev/null 2>&1
+COUNT=$(sql "SELECT count(*) FROM knowledge_edges_history
+             WHERE live_row_id='$EDGE_REINS' AND change_kind='insert';")
+[ "$COUNT" = "1" ] \
+  && pass "V034.24" "re-INSERT after same-tx DELETE emits exactly one 'insert' history row" \
+  || fail "V034.24" "duplicate 'insert' history rows (count=$COUNT)"
+
+# V034.25 (P3 sanity): both trigger functions that call snapshot_internal
+# are SECURITY DEFINER. Otherwise the REVOKE on snapshot_internal either
+# has no teeth (owner bypass) or hard-breaks the trigger path once
+# migration/app roles are split.
+COUNT=$(sql "SELECT count(*) FROM pg_proc p
+             JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = 'public'
+               AND p.proname IN ('knowledge_edges_check_count_and_snapshot_fn',
+                                 'knowledge_edges_history_update_fn')
+               AND p.prosecdef = true;")
+[ "$COUNT" = "2" ] \
+  && pass "V034.25" "trigger functions calling snapshot_internal are SECURITY DEFINER" \
+  || fail "V034.25" "SECURITY DEFINER count wrong (got $COUNT, expected 2)"
