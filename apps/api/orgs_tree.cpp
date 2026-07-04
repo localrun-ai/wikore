@@ -107,59 +107,63 @@ wikore::api::orgs_tree(drogon::orm::DbClientPtr db, drogon::HttpRequestPtr req)
             co_return json_error(drogon::k401Unauthorized, "unauthenticated");
         const auto id = req->getAttributes()->get<Identity>("identity");
 
-        // Tenant + company root + total org-unit count, all in one indexed
-        // read. A deactivated user is rejected. The count is the memory bound:
-        // it caps the whole request (scope resolution, fetch, and build) BEFORE
-        // any subtree expansion happens.
-        std::string company_id, root_id;
-        try {
-            auto rows = co_await db->execSqlCoro(
-                "SELECT u.company_id::text AS company_id, r.id::text AS root_id, "
-                "       (SELECT count(*) FROM org_units o WHERE o.company_id = u.company_id) "
-                "         AS n "
-                "FROM users u "
-                "JOIN org_units r ON r.company_id = u.company_id AND r.type = 'root' "
-                "WHERE u.id = $1::uuid AND u.deactivated_at IS NULL", id.user_id);
-            if (rows.empty())
-                co_return json_error(drogon::k403Forbidden, "user not found or deactivated");
-            company_id = rows[0]["company_id"].as<std::string>();
-            root_id    = rows[0]["root_id"].as<std::string>();
-            if (rows[0]["n"].as<long>() > kMaxNodes) {
-                spdlog::error("[orgs_tree] company {} exceeds {} org units",
-                              company_id, kMaxNodes);
-                co_return json_error(drogon::k500InternalServerError, "org tree too large");
-            }
-        } catch (const drogon::orm::DrogonDbException& ex) {
-            co_return db_error("tenant lookup", ex);
-        }
-
-        // Access model is default-closed: without membership a user sees
-        // nothing. Non-admins are scoped to the org units their memberships
-        // (and group memberships / grants) grant read access to. We use
-        // PostgresAccessResolver::resolve (NOT AccessService::effective_read_orgs,
-        // which swallows DB errors as an empty scope): resolve SURFACES a DB
-        // timeout/outage as an error so it becomes 503 rather than a false 200
-        // empty tree. Admins get the full company chart.
+        // The node-count gate, scope resolution, and the fetch all run in ONE
+        // REPEATABLE READ transaction, so they share a single snapshot. That
+        // closes the TOCTOU gap where rows inserted between a separate count and
+        // fetch could bypass the cap, and bounds scope resolution against the
+        // very snapshot the count measured. drogon's Transaction is a DbClient,
+        // so PostgresAccessResolver runs on it (reused, not re-implemented).
         const bool full_chart = id.is_admin;
         std::unordered_set<std::string> accessible;
-        if (!full_chart) {
-            auto scope = co_await PostgresAccessResolver(db).resolve(
-                company_id, id.user_id, root_id);
-            if (!scope) {
-                const auto code = status_for(scope.error().kind);
-                spdlog::warn("[orgs_tree] scope resolution failed ({}): {}",
-                             static_cast<int>(code), scope.error().message);
-                co_return json_error(code, client_msg(code));
-            }
-            accessible.insert(scope->org_unit_ids.begin(), scope->org_unit_ids.end());
-            if (accessible.empty())     // no membership -> empty forest
-                co_return json(drogon::k200OK, R"({"orgs":[]})");
-        }
-
-        // Company org units (bounded by the count gate above), filtered to the
-        // visible set, then assembled into a forest from parent_id.
         try {
-            auto rows = co_await db->execSqlCoro(
+            auto tx = co_await db->newTransactionCoro();
+            co_await tx->execSqlCoro("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+
+            // Tenant + company root + total org-unit count. A deactivated user
+            // is rejected; the count is the memory bound for everything below,
+            // and (in this snapshot) exactly what the fetch will return.
+            std::string company_id, root_id;
+            {
+                auto trows = co_await tx->execSqlCoro(
+                    "SELECT u.company_id::text AS company_id, r.id::text AS root_id, "
+                    "       (SELECT count(*) FROM org_units o WHERE o.company_id = u.company_id) "
+                    "         AS n "
+                    "FROM users u "
+                    "JOIN org_units r ON r.company_id = u.company_id AND r.type = 'root' "
+                    "WHERE u.id = $1::uuid AND u.deactivated_at IS NULL", id.user_id);
+                if (trows.empty())
+                    co_return json_error(drogon::k403Forbidden, "user not found or deactivated");
+                company_id = trows[0]["company_id"].as<std::string>();
+                root_id    = trows[0]["root_id"].as<std::string>();
+                if (trows[0]["n"].as<long>() > kMaxNodes) {
+                    spdlog::error("[orgs_tree] company {} exceeds {} org units",
+                                  company_id, kMaxNodes);
+                    co_return json_error(drogon::k500InternalServerError, "org tree too large");
+                }
+            }
+
+            // Default-closed scope for non-admins, resolved on the SAME snapshot
+            // (so it is bounded by the count above). PostgresAccessResolver
+            // (not AccessService::effective_read_orgs, which swallows DB errors
+            // as an empty scope) SURFACES a timeout/outage, so it becomes 503
+            // rather than a false 200 empty tree. Admins get the full chart.
+            if (!full_chart) {
+                auto scope = co_await PostgresAccessResolver(tx).resolve(
+                    company_id, id.user_id, root_id);
+                if (!scope) {
+                    const auto code = status_for(scope.error().kind);
+                    spdlog::warn("[orgs_tree] scope resolution failed ({}): {}",
+                                 static_cast<int>(code), scope.error().message);
+                    co_return json_error(code, client_msg(code));
+                }
+                accessible.insert(scope->org_unit_ids.begin(), scope->org_unit_ids.end());
+                if (accessible.empty())     // no membership -> empty forest
+                    co_return json(drogon::k200OK, R"({"orgs":[]})");
+            }
+
+            // Company org units (same snapshot -> exactly the counted rows),
+            // filtered to the visible set, then assembled into a forest.
+            auto rows = co_await tx->execSqlCoro(
                 "SELECT id::text AS id, parent_id::text AS parent_id, type, slug, "
                 "       name, description "
                 "FROM org_units WHERE company_id = $1::uuid "
@@ -230,7 +234,7 @@ wikore::api::orgs_tree(drogon::orm::DbClientPtr db, drogon::HttpRequestPtr req)
                 co_return json_error(drogon::k500InternalServerError, "internal error");
             co_return json(drogon::k200OK, std::move(out));
         } catch (const drogon::orm::DrogonDbException& ex) {
-            co_return db_error("org_units query", ex);
+            co_return db_error("org tree query", ex);
         }
 
     } catch (const std::exception& ex) {
