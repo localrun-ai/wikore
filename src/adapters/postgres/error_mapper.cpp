@@ -147,8 +147,14 @@ const std::unordered_map<std::string, Error> k_constraint_map = {
         Error::invalid_input("knowledge_edge_endpoint role must be 'source', 'target', 'subject', 'object', 'a', or 'b'")},
     {"knowledge_edges_history_change_kind_check",
         Error::invalid_input("knowledge_edges_history change_kind must be 'insert', 'update', or 'delete'")},
+    {"knowledge_edges_history_check",
+        Error::invalid_input("knowledge_edges_history valid_until must be greater than or equal to valid_from")},
     {"knowledge_edges_exactly_two_endpoints_chk",
         Error::invalid_state("knowledge_edge must have exactly two endpoints at COMMIT")},
+    // Endpoint immutability trigger surfaces as insufficient_privilege with
+    // a named constraint; treated as invalid_state (programming bug).
+    {"knowledge_edge_endpoints_immutable",
+        Error::invalid_state("knowledge_edge_endpoints is immutable; delete the edge and recreate it instead")},
 
     // -----------------------------------------------------------------------
     // Enum / domain CHECKs (input validation): PG-generated names from

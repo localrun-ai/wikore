@@ -1,35 +1,42 @@
 -- V034: BaryGraph Lite knowledge edges (chunk-to-chunk semantic relationships)
 --
--- First phase of BaryGraph Lite (see docs/barygraph_features.md). V034 adds
--- only the edge data model. Capabilities/entitlements ship in V035;
--- privileged-access sessions ship in V036. The three tables are independent
--- and can be reviewed/rolled back separately.
+-- First of three BaryGraph Lite migrations (see docs/barygraph_features.md).
+-- V035 adds capability grants; V036 adds privileged access sessions.
 --
--- V1 scope:
---   * Chunk-to-chunk edges only. Non-chunk endpoints (section, version,
---     org_unit) are V2 and blocked by knowledge_edges_edge_type_v1_chk.
---   * Explicit admin-authored edges. No automated parser/LLM edge creation
---     in this migration; those arrive in later phases.
+-- Correctness invariants enforced at the database level:
 --
--- Design invariants:
---   * Directed multigraph. cycle detection is the caller's responsibility;
---     acyclicity is not enforced at the schema level (contradicts is
---     symmetric, procedure dependency chains can be circular in practice).
---   * Tenant boundary is enforced at the database level via composite FKs
---     (company_id, id) — see UNIQUE(company_id, id) below.
---   * Exactly-two-endpoints enforced by a DEFERRABLE INITIALLY DEFERRED
---     CONSTRAINT TRIGGER that fires at COMMIT (not per-INSERT), so the
---     repository can insert both endpoints in one transaction without
---     tripping the check on the first insert.
---   * Every hard-delete of a knowledge_edges row emits an outbox event
---     carrying the Qdrant point IDs BEFORE cascade removes the embedding
---     rows. This makes direct-DELETE from psql safe (DBA incident response,
---     repair jobs) without relying on application-layer discipline.
---   * knowledge_edges_history captures every INSERT and DELETE with an
---     endpoint snapshot (both chunk UUIDs). UPDATE snapshots are the
---     repository's responsibility via knowledge_edges_snapshot(...) — no
---     AFTER UPDATE trigger, because trigger composition across two tables
---     produces unpredictable ordering that is difficult to reason about.
+--   * Zero-endpoint edges cannot commit.  Two DEFERRABLE INITIALLY DEFERRED
+--     CONSTRAINT TRIGGERs — one on the parent table, one on the endpoints
+--     table — both verify count(*)=2 at COMMIT.
+--
+--   * Endpoints are immutable.  UPDATE on knowledge_edge_endpoints is
+--     rejected by trigger.  Endpoint identity changes require deleting the
+--     edge and recreating it, matching the "edges are superseded not
+--     modified" design principle.
+--
+--   * Same-company actors enforced by composite foreign keys (not a BEFORE
+--     trigger, which had a concurrency race under a user company_id
+--     UPDATE).  ON DELETE NO ACTION because Wikore soft-deletes users via
+--     deactivated_at; hard-delete of a user referenced by an edge requires
+--     explicit cleanup by the caller.
+--
+--   * History is written by triggers, not by convention.  AFTER UPDATE ON
+--     knowledge_edges fires the shared snapshot procedure automatically,
+--     so direct SQL and repair scripts cannot silently lose history.
+--
+--   * knowledge_edges_snapshot() locks the parent edge FOR UPDATE, generates
+--     clock_timestamp() internally (not from caller), and enforces
+--     valid_from < valid_until.
+--
+--   * DELETE trigger uses SELECT INTO STRICT — an edge whose endpoints have
+--     been removed independently (which is only possible via the endpoint
+--     table, and only if constraint trigger was disabled) fails closed
+--     rather than fabricating a zero-UUID history record.
+--
+--   * The BEFORE DELETE trigger emits a qdrant_delete_edge_points outbox
+--     event carrying the point ID array before cascade removes embedding
+--     rows.  A scheduler consumer for this job type ships in a follow-up
+--     PR alongside the edge-vector indexing worker.
 
 -- ---------------------------------------------------------------------------
 -- knowledge_edges
@@ -57,20 +64,32 @@ CREATE TABLE knowledge_edges (
     provenance          JSONB NOT NULL DEFAULT '{}',
     formula_version     INT NOT NULL DEFAULT 1,
     edge_version        BIGINT NOT NULL DEFAULT 1,
-    created_by          UUID REFERENCES users(id) ON DELETE SET NULL,
-    reviewed_by         UUID REFERENCES users(id) ON DELETE SET NULL,
+    -- Actor same-company enforced by composite FKs below (not by trigger,
+    -- which had a concurrency race under a users.company_id UPDATE).
+    created_by          UUID,
+    reviewed_by         UUID,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     reviewed_at         TIMESTAMPTZ,
     expires_at          TIMESTAMPTZ,
     superseded_at       TIMESTAMPTZ,
     CHECK (expires_at IS NULL OR expires_at > created_at),
-    -- Required as composite-FK target for child tables (endpoints, embeddings).
-    UNIQUE (company_id, id)
+    -- Required as composite-FK target for endpoints/embeddings child tables.
+    UNIQUE (company_id, id),
+    -- Composite FKs for actor same-company (PG17: NO ACTION so a user
+    -- hard-delete surfaces as a FK violation the caller must resolve;
+    -- deactivate_at is the normal user-removal path in Wikore).
+    CONSTRAINT knowledge_edges_created_by_same_company_fk
+        FOREIGN KEY (company_id, created_by)
+        REFERENCES users(company_id, id) MATCH SIMPLE
+        ON DELETE NO ACTION,
+    CONSTRAINT knowledge_edges_reviewed_by_same_company_fk
+        FOREIGN KEY (company_id, reviewed_by)
+        REFERENCES users(company_id, id) MATCH SIMPLE
+        ON DELETE NO ACTION
 );
 
--- V1 chunk-to-chunk edge types only.
--- supersedes, section_parent_of, section_contains, responsible_team require
--- non-chunk endpoints and are not insertable until V2 typed endpoints land.
+-- V1 chunk-to-chunk edge types only. supersedes, section_parent_of,
+-- section_contains, responsible_team require non-chunk endpoints (V2).
 ALTER TABLE knowledge_edges
     ADD CONSTRAINT knowledge_edges_edge_type_v1_chk
     CHECK (edge_type IN (
@@ -90,41 +109,13 @@ CREATE INDEX knowledge_edges_edge_type_idx   ON knowledge_edges (company_id, edg
 CREATE INDEX knowledge_edges_review_state_idx
     ON knowledge_edges (company_id, review_state)
     WHERE review_state = 'accepted';
-
--- Enforce same-company created_by / reviewed_by. Composite FKs on the users
--- table are not usable here because ON DELETE SET NULL requires a single-column
--- FK (Wikore uses this pattern in documents, wiki_page_versions, etc.).
-CREATE OR REPLACE FUNCTION knowledge_edges_actors_same_company()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-    IF NEW.created_by IS NOT NULL AND NOT EXISTS (
-        SELECT 1 FROM users
-        WHERE id = NEW.created_by AND company_id = NEW.company_id
-    ) THEN
-        RAISE EXCEPTION 'knowledge_edges.created_by must belong to company %',
-            NEW.company_id
-            USING ERRCODE = 'foreign_key_violation',
-                  CONSTRAINT = 'knowledge_edges_created_by_same_company_fk';
-    END IF;
-    IF NEW.reviewed_by IS NOT NULL AND NOT EXISTS (
-        SELECT 1 FROM users
-        WHERE id = NEW.reviewed_by AND company_id = NEW.company_id
-    ) THEN
-        RAISE EXCEPTION 'knowledge_edges.reviewed_by must belong to company %',
-            NEW.company_id
-            USING ERRCODE = 'foreign_key_violation',
-                  CONSTRAINT = 'knowledge_edges_reviewed_by_same_company_fk';
-    END IF;
-    RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER knowledge_edges_actors_same_company_trg
-    BEFORE INSERT OR UPDATE ON knowledge_edges
-    FOR EACH ROW EXECUTE FUNCTION knowledge_edges_actors_same_company();
+CREATE INDEX knowledge_edges_created_by_idx  ON knowledge_edges (created_by)
+    WHERE created_by IS NOT NULL;
+CREATE INDEX knowledge_edges_reviewed_by_idx ON knowledge_edges (reviewed_by)
+    WHERE reviewed_by IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
--- knowledge_edge_endpoints (chunk-to-chunk only in V1)
+-- knowledge_edge_endpoints (chunk-to-chunk only; endpoints immutable)
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE knowledge_edge_endpoints (
@@ -136,48 +127,31 @@ CREATE TABLE knowledge_edge_endpoints (
                     CHECK (role IN ('source','target','subject','object','a','b')),
     PRIMARY KEY (edge_id, ordinal),
     UNIQUE (edge_id, chunk_id),
-    -- Composite FK enforces company_id matches the parent edge.
     FOREIGN KEY (company_id, edge_id)
         REFERENCES knowledge_edges(company_id, id) ON DELETE CASCADE,
     FOREIGN KEY (company_id, chunk_id)
         REFERENCES document_chunks(company_id, id) ON DELETE RESTRICT
 );
 
--- Required for "find all edges referencing this chunk" queries: deletion
--- workflow, resync worker, impact analysis. Without this index,
--- WHERE chunk_id = $1 is a full table scan on every chunk delete.
 CREATE INDEX knowledge_edge_endpoints_chunk_idx
     ON knowledge_edge_endpoints (company_id, chunk_id);
 
--- Two-endpoint CONSTRAINT TRIGGER. A regular CREATE TRIGGER cannot be
--- deferred; only CREATE CONSTRAINT TRIGGER DEFERRABLE INITIALLY DEFERRED
--- can. Fires at COMMIT (not per-INSERT), so the repository can insert both
--- endpoints in one transaction before the count is checked.
-CREATE OR REPLACE FUNCTION knowledge_edges_check_endpoint_count_fn()
+-- Endpoints are immutable. Changing an endpoint requires deleting the edge
+-- and recreating it — matching the "edges are superseded not modified"
+-- design principle. Reject UPDATE entirely.
+CREATE OR REPLACE FUNCTION knowledge_edge_endpoints_immutable_fn()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
-DECLARE
-    v_edge_id UUID;
 BEGIN
-    -- NEW is unassigned in a DELETE trigger; dispatch on TG_OP.
-    v_edge_id := CASE TG_OP WHEN 'DELETE' THEN OLD.edge_id ELSE NEW.edge_id END;
-
-    -- Skip edges deleted in this same transaction (cascade case).
-    IF NOT EXISTS (SELECT 1 FROM knowledge_edges WHERE id = v_edge_id) THEN
-        RETURN COALESCE(NEW, OLD);
-    END IF;
-    IF (SELECT count(*) FROM knowledge_edge_endpoints WHERE edge_id = v_edge_id) <> 2 THEN
-        RAISE EXCEPTION 'edge % must have exactly two endpoints', v_edge_id
-            USING ERRCODE = 'check_violation',
-                  CONSTRAINT = 'knowledge_edges_exactly_two_endpoints_chk';
-    END IF;
-    RETURN COALESCE(NEW, OLD);
+    RAISE EXCEPTION
+        'knowledge_edge_endpoints is immutable; UPDATE rejected. Delete and recreate the edge instead.'
+        USING ERRCODE = 'insufficient_privilege',
+              CONSTRAINT = 'knowledge_edge_endpoints_immutable';
 END;
 $$;
 
-CREATE CONSTRAINT TRIGGER knowledge_edges_exactly_two_endpoints_trg
-    AFTER INSERT OR DELETE ON knowledge_edge_endpoints
-    DEFERRABLE INITIALLY DEFERRED
-    FOR EACH ROW EXECUTE FUNCTION knowledge_edges_check_endpoint_count_fn();
+CREATE TRIGGER knowledge_edge_endpoints_no_update
+    BEFORE UPDATE ON knowledge_edge_endpoints
+    FOR EACH ROW EXECUTE FUNCTION knowledge_edge_endpoints_immutable_fn();
 
 -- ---------------------------------------------------------------------------
 -- knowledge_edge_embeddings
@@ -199,12 +173,10 @@ CREATE TABLE knowledge_edge_embeddings (
 );
 
 -- ---------------------------------------------------------------------------
--- knowledge_edges_history — temporal audit trail
+-- knowledge_edges_history — temporal audit trail with full lifecycle snapshot
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE knowledge_edges_history (
-    -- Plain UUID, no FK — live_row_id becomes stale after the knowledge_edges
-    -- row is deleted, matching memberships_history (V024).
     live_row_id     UUID        NOT NULL,
     edge_id         UUID        NOT NULL,
     company_id      UUID        NOT NULL,
@@ -218,9 +190,14 @@ CREATE TABLE knowledge_edges_history (
     edge_version    BIGINT      NOT NULL,
     created_by      UUID,
     reviewed_by     UUID,
+    -- Lifecycle timestamps — required for as-of EvidenceGate reconstruction
+    -- (was this edge usable at time T?). Captured from the parent row.
+    edge_created_at    TIMESTAMPTZ NOT NULL,
+    edge_reviewed_at   TIMESTAMPTZ,
+    edge_expires_at    TIMESTAMPTZ,
+    edge_superseded_at TIMESTAMPTZ,
     -- Endpoint snapshot: captured from knowledge_edge_endpoints BEFORE
-    -- CASCADE deletes them. Both chunk UUIDs are required — without them
-    -- the history record cannot answer "which chunks were connected."
+    -- CASCADE deletes them. Both chunk UUIDs are required.
     endpoint_0_chunk_id  UUID   NOT NULL,
     endpoint_1_chunk_id  UUID   NOT NULL,
     endpoint_0_role      TEXT   NOT NULL,
@@ -229,10 +206,11 @@ CREATE TABLE knowledge_edges_history (
                         CHECK (change_kind IN ('insert','update','delete')),
     valid_from      TIMESTAMPTZ NOT NULL,
     valid_until     TIMESTAMPTZ,
+    CHECK (valid_until IS NULL OR valid_until >= valid_from),
     UNIQUE (live_row_id, valid_from)
 );
 
--- One open interval per edge at most — matches memberships_history pattern.
+-- One open interval per edge at most.
 CREATE UNIQUE INDEX knowledge_edges_history_open_uidx
     ON knowledge_edges_history (live_row_id)
     WHERE valid_until IS NULL;
@@ -245,24 +223,32 @@ CREATE INDEX knowledge_edges_history_endpoint_1_idx
     ON knowledge_edges_history (company_id, endpoint_1_chunk_id);
 
 -- ---------------------------------------------------------------------------
--- Shared history snapshot procedure — called by the repository after any
--- edge/endpoint update. Not a trigger function. AFTER UPDATE triggers on
--- knowledge_edges / knowledge_edge_endpoints are NOT installed because
--- trigger composition across the two tables produces ordering that is
--- difficult to reason about; explicit repository control is preferred.
+-- Shared history snapshot procedure — used by INSERT (CONSTRAINT TRIGGER at
+-- COMMIT) and UPDATE (AFTER UPDATE trigger) paths.
+--
+-- Locks the parent edge FOR UPDATE to serialize concurrent snapshot calls.
+-- Generates the timestamp internally (not from caller) so audit records
+-- always reflect the actual DB clock at commit time.
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE PROCEDURE knowledge_edges_snapshot(
+CREATE OR REPLACE PROCEDURE knowledge_edges_snapshot_at(
     p_edge_id UUID,
-    p_kind    TEXT,
-    p_ts      TIMESTAMPTZ
+    p_kind    TEXT
 ) LANGUAGE plpgsql AS $$
 DECLARE
     edge knowledge_edges%ROWTYPE;
     ep0  knowledge_edge_endpoints%ROWTYPE;
     ep1  knowledge_edge_endpoints%ROWTYPE;
+    ts   TIMESTAMPTZ := clock_timestamp();
 BEGIN
-    SELECT * INTO STRICT edge FROM knowledge_edges WHERE id = p_edge_id;
+    IF p_kind NOT IN ('insert','update') THEN
+        RAISE EXCEPTION 'knowledge_edges_snapshot_at: kind must be insert or update, got %',
+            p_kind USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+
+    -- Lock the parent edge to serialize concurrent snapshot calls.
+    SELECT * INTO STRICT edge FROM knowledge_edges
+        WHERE id = p_edge_id FOR UPDATE;
     SELECT * INTO STRICT ep0  FROM knowledge_edge_endpoints
         WHERE edge_id = p_edge_id AND ordinal = 0;
     SELECT * INTO STRICT ep1  FROM knowledge_edge_endpoints
@@ -270,13 +256,14 @@ BEGIN
 
     -- Close the currently-open interval, then insert a new open row.
     UPDATE knowledge_edges_history
-        SET valid_until = p_ts
+        SET valid_until = ts
         WHERE live_row_id = p_edge_id AND valid_until IS NULL;
 
     INSERT INTO knowledge_edges_history (
         live_row_id, edge_id, company_id, edge_type, direction,
         confidence, origin, review_state, provenance,
         formula_version, edge_version, created_by, reviewed_by,
+        edge_created_at, edge_reviewed_at, edge_expires_at, edge_superseded_at,
         endpoint_0_chunk_id, endpoint_1_chunk_id,
         endpoint_0_role, endpoint_1_role,
         change_kind, valid_from, valid_until
@@ -284,61 +271,118 @@ BEGIN
         edge.id, edge.id, edge.company_id, edge.edge_type, edge.direction,
         edge.confidence, edge.origin, edge.review_state, edge.provenance,
         edge.formula_version, edge.edge_version, edge.created_by, edge.reviewed_by,
+        edge.created_at, edge.reviewed_at, edge.expires_at, edge.superseded_at,
         ep0.chunk_id, ep1.chunk_id,
         ep0.role, ep1.role,
-        p_kind, p_ts, NULL
+        p_kind, ts, NULL
     );
 END;
 $$;
 
 -- ---------------------------------------------------------------------------
--- AFTER INSERT ordinal=1 — snapshot the new edge to history.
--- Fires only on ordinal=1 because by the repository invariant ordinal=0 is
--- inserted first. SELECT INTO STRICT surfaces the ordering violation with a
--- clean error message rather than silently NULLing endpoint_0_chunk_id.
+-- CONSTRAINT TRIGGER: exactly two endpoints at COMMIT + initial history row.
+--
+-- Fires at COMMIT (not per-INSERT), so:
+--   * The two-endpoint invariant catches BOTH the "zero endpoints" case
+--     (edge inserted with no endpoint rows at all) AND the "one endpoint"
+--     case, via a single check.
+--   * The history "insert" row is written after both endpoints are known,
+--     eliminating the insertion-order dependency (ordinal=1 before ordinal=0
+--     is fine — both must be present at COMMIT).
+--
+-- Two triggers point to this function: one on the parent (catches the
+-- zero-endpoint case), one on the endpoints table (catches the one-endpoint
+-- case).  Both DEFERRABLE INITIALLY DEFERRED so the check runs once at COMMIT.
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION knowledge_edge_endpoints_history_insert_fn()
+CREATE OR REPLACE FUNCTION knowledge_edges_check_endpoint_count_fn()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
-    edge knowledge_edges%ROWTYPE;
-    ep0  knowledge_edge_endpoints%ROWTYPE;
-    ts   TIMESTAMPTZ := clock_timestamp();
+    v_edge_id UUID;
+    v_count   INT;
+    v_has_history BOOLEAN;
 BEGIN
-    IF NEW.ordinal <> 1 THEN RETURN NEW; END IF;
-
-    SELECT * INTO STRICT edge FROM knowledge_edges WHERE id = NEW.edge_id;
-    SELECT * INTO STRICT ep0  FROM knowledge_edge_endpoints
-        WHERE edge_id = NEW.edge_id AND ordinal = 0;
-
-    INSERT INTO knowledge_edges_history (
-        live_row_id, edge_id, company_id, edge_type, direction,
-        confidence, origin, review_state, provenance,
-        formula_version, edge_version, created_by, reviewed_by,
-        endpoint_0_chunk_id, endpoint_1_chunk_id,
-        endpoint_0_role, endpoint_1_role,
-        change_kind, valid_from, valid_until
-    ) VALUES (
-        edge.id, edge.id, edge.company_id, edge.edge_type, edge.direction,
-        edge.confidence, edge.origin, edge.review_state, edge.provenance,
-        edge.formula_version, edge.edge_version, edge.created_by, edge.reviewed_by,
-        ep0.chunk_id, NEW.chunk_id,
-        ep0.role, NEW.role,
-        'insert', ts, NULL
+    -- Locate the edge id from either NEW (parent INSERT) or OLD (endpoint DELETE).
+    v_edge_id := COALESCE(
+        (TG_TABLE_NAME = 'knowledge_edges' AND TG_OP <> 'DELETE') :: INT * 0 + NULL,
+        NULL
     );
+    IF TG_TABLE_NAME = 'knowledge_edges' THEN
+        v_edge_id := CASE TG_OP WHEN 'DELETE' THEN OLD.id ELSE NEW.id END;
+    ELSE
+        v_edge_id := CASE TG_OP WHEN 'DELETE' THEN OLD.edge_id ELSE NEW.edge_id END;
+    END IF;
+
+    -- Skip if the parent edge was deleted in this transaction (cascade case).
+    IF NOT EXISTS (SELECT 1 FROM knowledge_edges WHERE id = v_edge_id) THEN
+        RETURN COALESCE(NEW, OLD);
+    END IF;
+
+    SELECT count(*) INTO v_count
+        FROM knowledge_edge_endpoints WHERE edge_id = v_edge_id;
+
+    IF v_count <> 2 THEN
+        RAISE EXCEPTION
+            'knowledge_edges % must have exactly two endpoints at COMMIT (got %)',
+            v_edge_id, v_count
+            USING ERRCODE = 'check_violation',
+                  CONSTRAINT = 'knowledge_edges_exactly_two_endpoints_chk';
+    END IF;
+
+    -- Write the initial history row exactly once per edge.
+    -- Called from BOTH triggers; the second call finds the row already
+    -- present via the open-interval partial unique index and skips.
+    SELECT EXISTS (
+        SELECT 1 FROM knowledge_edges_history
+        WHERE live_row_id = v_edge_id
+    ) INTO v_has_history;
+
+    IF NOT v_has_history THEN
+        CALL knowledge_edges_snapshot_at(v_edge_id, 'insert');
+    END IF;
+
+    RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+-- Parent-table trigger: catches the "zero endpoints" case (edge inserted
+-- with no endpoint rows). Fires AFTER INSERT so knowledge_edges row exists
+-- when the check runs at COMMIT.
+CREATE CONSTRAINT TRIGGER knowledge_edges_exactly_two_endpoints_parent_trg
+    AFTER INSERT ON knowledge_edges
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION knowledge_edges_check_endpoint_count_fn();
+
+-- Endpoints-table trigger: catches all other transitions (one endpoint,
+-- endpoint delete without cascade, etc.)
+CREATE CONSTRAINT TRIGGER knowledge_edges_exactly_two_endpoints_trg
+    AFTER INSERT OR DELETE ON knowledge_edge_endpoints
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION knowledge_edges_check_endpoint_count_fn();
+
+-- ---------------------------------------------------------------------------
+-- AFTER UPDATE ON knowledge_edges — automatic history snapshot.
+--
+-- Fires on every UPDATE (application, psql, repair scripts). Missing a
+-- history call is not possible with this trigger installed.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION knowledge_edges_history_update_fn()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    CALL knowledge_edges_snapshot_at(NEW.id, 'update');
     RETURN NEW;
 END;
 $$;
 
-CREATE TRIGGER knowledge_edge_endpoints_history_after_insert
-    AFTER INSERT ON knowledge_edge_endpoints
-    FOR EACH ROW EXECUTE FUNCTION knowledge_edge_endpoints_history_insert_fn();
+CREATE TRIGGER knowledge_edges_history_after_update
+    AFTER UPDATE ON knowledge_edges
+    FOR EACH ROW EXECUTE FUNCTION knowledge_edges_history_update_fn();
 
 -- ---------------------------------------------------------------------------
--- BEFORE DELETE on knowledge_edges — captures endpoints and Qdrant point IDs
--- BEFORE cascade removes them, emits outbox event for Qdrant cleanup, and
--- writes the delete marker to history. Safe from any caller: application,
--- psql, repair jobs.
+-- BEFORE DELETE ON knowledge_edges — capture endpoints, Qdrant point IDs,
+-- and delete marker before CASCADE fires. SELECT INTO STRICT fails closed
+-- if endpoints have already been removed (fabricating audit is not allowed).
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION knowledge_edges_history_delete_fn()
@@ -349,18 +393,23 @@ DECLARE
     point_ids UUID[];
     ts        TIMESTAMPTZ := clock_timestamp();
 BEGIN
-    -- Capture endpoints BEFORE cascade removes them.
-    SELECT * INTO ep0 FROM knowledge_edge_endpoints
+    -- Capture endpoints BEFORE cascade removes them. STRICT: fail closed
+    -- if either endpoint is missing (do not fabricate a zero-UUID history).
+    SELECT * INTO STRICT ep0 FROM knowledge_edge_endpoints
         WHERE edge_id = OLD.id AND ordinal = 0;
-    SELECT * INTO ep1 FROM knowledge_edge_endpoints
+    SELECT * INTO STRICT ep1 FROM knowledge_edge_endpoints
         WHERE edge_id = OLD.id AND ordinal = 1;
 
     -- Capture Qdrant point IDs BEFORE cascade removes embedding rows.
     SELECT array_agg(qdrant_point_id) INTO point_ids
         FROM knowledge_edge_embeddings WHERE edge_id = OLD.id;
 
-    -- Emit outbox event for Qdrant cleanup. Column names from V015:
-    -- job_type (not event_type), idempotency_key NOT NULL.
+    -- Emit outbox event for Qdrant cleanup. A scheduler consumer for job_type
+    -- = 'qdrant_delete_edge_points' ships in a follow-up PR alongside the
+    -- edge-vector indexing worker; until then, deleted edge points remain
+    -- in Qdrant. That is safe because retrieval always passes through
+    -- EvidenceGate on the live PG state — an orphan Qdrant point cannot
+    -- surface as evidence.
     IF point_ids IS NOT NULL AND array_length(point_ids, 1) > 0 THEN
         INSERT INTO outbox_events (
             company_id, aggregate_id, job_type, job_schema_version,
@@ -379,11 +428,12 @@ BEGIN
         SET valid_until = ts
         WHERE live_row_id = OLD.id AND valid_until IS NULL;
 
-    -- Insert the delete marker (valid_until = valid_from = zero-width interval).
+    -- Insert the delete marker (zero-width interval, valid_from = valid_until).
     INSERT INTO knowledge_edges_history (
         live_row_id, edge_id, company_id, edge_type, direction,
         confidence, origin, review_state, provenance,
         formula_version, edge_version, created_by, reviewed_by,
+        edge_created_at, edge_reviewed_at, edge_expires_at, edge_superseded_at,
         endpoint_0_chunk_id, endpoint_1_chunk_id,
         endpoint_0_role, endpoint_1_role,
         change_kind, valid_from, valid_until
@@ -391,10 +441,9 @@ BEGIN
         OLD.id, OLD.id, OLD.company_id, OLD.edge_type, OLD.direction,
         OLD.confidence, OLD.origin, OLD.review_state, OLD.provenance,
         OLD.formula_version, OLD.edge_version, OLD.created_by, OLD.reviewed_by,
-        COALESCE(ep0.chunk_id, '00000000-0000-0000-0000-000000000000'::uuid),
-        COALESCE(ep1.chunk_id, '00000000-0000-0000-0000-000000000000'::uuid),
-        COALESCE(ep0.role, ''),
-        COALESCE(ep1.role, ''),
+        OLD.created_at, OLD.reviewed_at, OLD.expires_at, OLD.superseded_at,
+        ep0.chunk_id, ep1.chunk_id,
+        ep0.role, ep1.role,
         'delete', ts, ts
     );
     RETURN OLD;
