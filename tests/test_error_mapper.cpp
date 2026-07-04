@@ -147,6 +147,27 @@ const std::unordered_set<std::string> k_allowlist = {
     // The same-company trigger raises as foreign_key_violation with a named
     // constraint; treated as a programming bug -> database_error.
     "llm_providers_created_by_same_company_fk",
+
+    // V034: knowledge_edges (BaryGraph Lite)
+    // Composite-FK target UNIQUE key (programming bug -> database_error).
+    "knowledge_edges_company_id_id_key",
+    // Endpoint (edge_id, chunk_id) UNIQUE — a duplicate chunk endpoint on
+    // the same edge is a programming bug.
+    "knowledge_edge_endpoints_edge_id_chunk_id_key",
+    // (embedding_model_id, qdrant_point_id) UNIQUE — a duplicate Qdrant
+    // point ID for the same model is a programming bug (uuid_v5 collision).
+    // Explicit name because PG truncates auto-generated names at 63 chars.
+    "knowledge_edge_embeddings_point_uniq",
+    // History (live_row_id, valid_from) UNIQUE — clock_timestamp collision
+    // is a programming bug.
+    "knowledge_edges_history_live_row_id_valid_from_key",
+    // Partial unique index on open history intervals — a duplicate open
+    // interval indicates a snapshot ordering bug.
+    "knowledge_edges_history_open_uidx",
+    // Same-company triggers raise as foreign_key_violation with named
+    // constraints; treated as programming bugs.
+    "knowledge_edges_created_by_same_company_fk",
+    "knowledge_edges_reviewed_by_same_company_fk",
 };
 
 bool integration_db_available() {
