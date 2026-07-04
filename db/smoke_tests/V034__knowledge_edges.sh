@@ -263,3 +263,59 @@ ERR=$(sql "INSERT INTO knowledge_edges_history
 echo "$ERR" | grep -qi "check\|violates" \
   && pass "V034.20" "interval order CHECK rejects valid_until < valid_from" \
   || fail "V034.20" "reversed interval accepted: $ERR"
+
+# V034.21: same-transaction INSERT+UPDATE+endpoints commits with exactly one
+# 'insert' history row that carries the post-update values (regression for
+# the mid-tx AFTER UPDATE snapshot ordering bug).
+EDGE_SAMETX='6e6c0000-0000-0000-0000-0000000021a1'
+sql "BEGIN;
+     INSERT INTO knowledge_edges
+       (id, company_id, edge_type, direction, confidence, origin)
+     VALUES ('$EDGE_SAMETX', '$CO_ACME', 'implements', 'directed', 0.6,
+             'administrator');
+     UPDATE knowledge_edges
+        SET confidence = 0.95, edge_version = edge_version + 1
+        WHERE id = '$EDGE_SAMETX';
+     INSERT INTO knowledge_edge_endpoints (company_id, edge_id, ordinal, chunk_id, role)
+     VALUES ('$CO_ACME', '$EDGE_SAMETX', 0, '$V34_CHK1', 'source'),
+            ('$CO_ACME', '$EDGE_SAMETX', 1, '$V34_CHK2', 'target');
+     COMMIT;" > /dev/null 2>&1
+COUNT=$(sql "SELECT count(*) FROM knowledge_edges_history WHERE live_row_id='$EDGE_SAMETX';")
+KIND=$(sql "SELECT change_kind FROM knowledge_edges_history WHERE live_row_id='$EDGE_SAMETX';")
+CONF=$(sql "SELECT confidence FROM knowledge_edges_history WHERE live_row_id='$EDGE_SAMETX';")
+if [ "$COUNT" = "1" ] && [ "$KIND" = "insert" ] && [ "$CONF" = "0.95" ]; then
+  pass "V034.21" "same-tx INSERT+UPDATE folds into single 'insert' with post-update values"
+else
+  fail "V034.21" "same-tx UPDATE created stray history (count=$COUNT, kind=$KIND, conf=$CONF)"
+fi
+
+# V034.22: same-transaction INSERT+DELETE leaves no history and UUID remains
+# reusable (regression for the delete-path STRICT sharp edge that burned UUIDs).
+EDGE_INSDEL='6e6c0000-0000-0000-0000-0000000022a1'
+sql "BEGIN;
+     INSERT INTO knowledge_edges
+       (id, company_id, edge_type, direction, confidence, origin)
+     VALUES ('$EDGE_INSDEL', '$CO_ACME', 'implements', 'directed', 0.5,
+             'administrator');
+     DELETE FROM knowledge_edges WHERE id = '$EDGE_INSDEL';
+     COMMIT;" > /dev/null 2>&1
+COUNT=$(sql "SELECT count(*) FROM knowledge_edges_history WHERE live_row_id='$EDGE_INSDEL';")
+[ "$COUNT" = "0" ] \
+  && pass "V034.22a" "same-tx INSERT+DELETE leaves no history rows" \
+  || fail "V034.22a" "same-tx INSERT+DELETE created history (count=$COUNT)"
+
+# Re-inserting the same UUID must be allowed (edge never existed as far as
+# history is concerned).
+sql "BEGIN;
+     INSERT INTO knowledge_edges
+       (id, company_id, edge_type, direction, confidence, origin)
+     VALUES ('$EDGE_INSDEL', '$CO_ACME', 'implements', 'directed', 0.7,
+             'administrator');
+     INSERT INTO knowledge_edge_endpoints (company_id, edge_id, ordinal, chunk_id, role)
+     VALUES ('$CO_ACME', '$EDGE_INSDEL', 0, '$V34_CHK1', 'source'),
+            ('$CO_ACME', '$EDGE_INSDEL', 1, '$V34_CHK2', 'target');
+     COMMIT;" > /dev/null 2>&1
+COUNT=$(sql "SELECT count(*) FROM knowledge_edges WHERE id='$EDGE_INSDEL';")
+[ "$COUNT" = "1" ] \
+  && pass "V034.22b" "UUID reusable after same-tx INSERT+DELETE (never existed)" \
+  || fail "V034.22b" "UUID incorrectly burned by same-tx INSERT+DELETE"

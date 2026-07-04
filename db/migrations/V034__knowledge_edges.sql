@@ -393,6 +393,22 @@ CREATE CONSTRAINT TRIGGER knowledge_edges_exactly_two_endpoints_trg
 CREATE OR REPLACE FUNCTION knowledge_edges_history_update_fn()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
+    -- Updates in the same transaction as the edge INSERT precede the deferred
+    -- initial-history snapshot (parent CONSTRAINT TRIGGER, fired at COMMIT).
+    -- Two problems if we snapshot here in that case:
+    --   1. endpoints may not exist yet -> snapshot_internal raises no_data_found.
+    --   2. even if they do, history ends up ordered 'update' (mid-tx ts) then
+    --      'insert' (COMMIT ts), so the first row is not 'insert', breaking
+    --      the as-of reconstruction and reuse-guard invariants.
+    -- Fold same-transaction updates into the deferred initial snapshot: it
+    -- captures the final NEW row state at COMMIT.  Safe because a committed
+    -- edge always has at least the 'insert' row (trigger-owned, sole path),
+    -- and UUID reuse is blocked at INSERT.
+    IF NOT EXISTS (
+        SELECT 1 FROM knowledge_edges_history WHERE live_row_id = NEW.id
+    ) THEN
+        RETURN NEW;
+    END IF;
     PERFORM knowledge_edges_snapshot_internal(NEW.id, 'update');
     RETURN NEW;
 END;
@@ -413,8 +429,20 @@ DECLARE
     ep0       knowledge_edge_endpoints%ROWTYPE;
     ep1       knowledge_edge_endpoints%ROWTYPE;
     point_ids UUID[];
-    ts        TIMESTAMPTZ := clock_timestamp();
+    ts        TIMESTAMPTZ;
 BEGIN
+    -- Edge inserted and deleted in the same transaction: no committed
+    -- history exists, no Qdrant indexing has happened (that is post-commit),
+    -- and endpoints may not exist. Nothing to record; leave the UUID
+    -- reusable (the reuse guard keys on history rows).
+    IF NOT EXISTS (
+        SELECT 1 FROM knowledge_edges_history WHERE live_row_id = OLD.id
+    ) THEN
+        RETURN OLD;
+    END IF;
+
+    ts := clock_timestamp();
+
     SELECT * INTO STRICT ep0 FROM knowledge_edge_endpoints
         WHERE edge_id = OLD.id AND ordinal = 0;
     SELECT * INTO STRICT ep1 FROM knowledge_edge_endpoints
