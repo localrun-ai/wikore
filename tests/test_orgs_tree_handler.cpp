@@ -126,6 +126,17 @@ const Node* find(const std::vector<Node>& forest, const std::string& slug)
     return nullptr;
 }
 
+// Shortens the shared client's query timeout for the scope and restores the
+// configured value (30s, from Db::init) on destruction - so no later test in
+// the process inherits a changed timeout.
+struct ClientTimeoutGuard {
+    drogon::orm::DbClientPtr db;
+    ClientTimeoutGuard(drogon::orm::DbClientPtr d, double set) : db(std::move(d)) {
+        db->setTimeout(set);
+    }
+    ~ClientTimeoutGuard() { db->setTimeout(30.0); }
+};
+
 } // namespace
 
 TEST_CASE("orgs_tree: a member sees only their scoped subtree", "[integration][api]")
@@ -219,4 +230,47 @@ TEST_CASE("orgs_tree: a deactivated user is rejected (403)", "[integration][api]
 
     auto resp = drogon::sync_wait(wikore::api::orgs_tree(db, req_as(user)));
     CHECK(resp->getStatusCode() == drogon::k403Forbidden);
+}
+
+TEST_CASE("orgs_tree: a scope-resolution DB timeout is 503, not a false empty tree",
+          "[integration][api]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    auto f  = seed(db);
+    auto user = make_user(db, CO, "eng-timeout");
+    grant(db, CO, user, f.eng, "self_and_descendants");   // would resolve non-empty
+
+    // Lock `memberships` so the scope-resolution query blocks (the tenant lookup
+    // touches only users/org_units and still succeeds); a short client timeout
+    // then fires. The resolver SURFACES the timeout, so the handler must answer
+    // 503 - not a false 200 {"orgs":[]} from a swallowed error.
+    ClientTimeoutGuard guard(db, 0.5);
+    const auto status = drogon::sync_wait(
+        [&]() -> drogon::Task<drogon::HttpStatusCode> {
+            auto locker = co_await db->newTransactionCoro();
+            co_await locker->execSqlCoro("LOCK TABLE memberships IN ACCESS EXCLUSIVE MODE");
+            auto resp = co_await wikore::api::orgs_tree(db, req_as(user));
+            co_return resp->getStatusCode();
+        }());
+
+    CHECK(status == drogon::k503ServiceUnavailable);
+}
+
+TEST_CASE("orgs_tree: a hierarchy deeper than the cap is an explicit error",
+          "[integration][api]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    auto f  = seed(db);
+
+    // A chain deeper than the builder's depth cap (64). It must surface as an
+    // explicit error, not a silently truncated tree presented as complete.
+    std::string parent = f.root;
+    for (int i = 0; i < 70; ++i)
+        parent = make_ou(db, CO, parent, "deep" + std::to_string(i));
+
+    auto user = make_user(db, CO, "deep-admin");   // admin sees the full chart
+    auto resp = drogon::sync_wait(wikore::api::orgs_tree(db, req_as(user, /*admin=*/true)));
+    CHECK(resp->getStatusCode() == drogon::k500InternalServerError);
 }
