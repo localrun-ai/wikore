@@ -184,6 +184,14 @@ const std::unordered_set<std::string> k_allowlist = {
     // foreign_key_violation with a named constraint; a cross-tenant actor
     // is a programming bug -> database_error.
     "tenant_features_enabled_by_same_company_fk",
+
+    // V036: privileged access sessions
+    // Inline CHECKs (expires_at > starts_at, revoked_at/revoked_by pair
+    // consistency) get PG-generated names. Allowed-listed because
+    // inserting an inconsistent session is a programming bug in the
+    // session-management service.
+    "privileged_access_sessions_check",
+    "privileged_access_sessions_check1",
 };
 
 bool integration_db_available() {

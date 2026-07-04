@@ -161,6 +161,28 @@ const std::unordered_map<std::string, Error> k_constraint_map = {
     // Edge UUID reuse rejection — recreating an edge with a previously-deleted UUID.
     {"knowledge_edges_no_uuid_reuse",
         Error::conflict("knowledge_edges UUID has prior history; UUIDs cannot be reused after delete")},
+    // V036: privileged access sessions (BaryGraph Lite)
+    {"privileged_access_sessions_purpose_check",
+        Error::invalid_input("privileged_access_session purpose must be at least 10 characters")},
+    {"privileged_access_sessions_access_kind_check",
+        Error::invalid_input("privileged_access_session access_kind must be 'temporary_engagement', 'sensitive_analysis', 'retrieval_diagnostics', or 'break_glass'")},
+    {"privileged_access_sessions_status_check",
+        Error::invalid_input("privileged_access_session status must be 'pending', 'approved', 'active', 'expired', 'revoked', or 'rejected'")},
+    {"privileged_access_approvals_decision_check",
+        Error::invalid_input("privileged_access_approval decision must be 'approved' or 'rejected'")},
+    {"privileged_access_approvals_reason_check",
+        Error::invalid_input("privileged_access_approval reason must be at least 5 characters")},
+    {"privileged_access_scopes_applies_to_check",
+        Error::invalid_input("privileged_access_scope applies_to must be 'self_only' or 'self_and_descendants'")},
+    {"privileged_access_scopes_maximum_sensitivity_check",
+        Error::invalid_input("privileged_access_scope maximum_sensitivity must be 'public', 'internal', 'confidential', or 'restricted'")},
+    // Append-only enforcement + separation-of-duties triggers.
+    {"privileged_access_approvals_append_only",
+        Error::conflict("privileged_access_approvals is append-only; decisions cannot be modified")},
+    {"privileged_access_approvals_no_self_approval",
+        Error::forbidden("approver cannot be the subject of the privileged access session")},
+    {"privileged_access_approvals_dual_approval_requires_two",
+        Error::forbidden("requester cannot be sole approver of a dual-approval session")},
 
     // V035: capability grants (BaryGraph Lite)
     // Empty reason is caller input, not a programming bug.
