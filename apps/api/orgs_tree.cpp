@@ -1,6 +1,7 @@
 #include "handlers.hpp"
 
 #include "wikore/auth.hpp"           // Identity
+#include "wikore/access.hpp"         // AccessService::effective_read_orgs
 #include "wikore/adapters/postgres/error_mapper.hpp"  // map_db_exception
 
 #include <drogon/orm/Exception.h>
@@ -11,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace wikore;
@@ -18,6 +20,13 @@ using drogon::HttpResponse;
 using drogon::HttpResponsePtr;
 
 namespace {
+
+// Bounds (P2): the recursive builder is capped so a pathologically deep tenant
+// hierarchy cannot exhaust the request thread's stack, and the query is capped
+// so an enormous tenant cannot exhaust memory. Real org charts are shallow and
+// small; these are defensive ceilings, not expected sizes.
+constexpr int         kMaxDepth = 64;
+constexpr std::size_t kMaxNodes = 10000;
 
 // Recursive node; glaze reflects the member names into JSON keys and handles
 // the self-referential children vector.
@@ -30,8 +39,10 @@ struct OrgNode {
     std::vector<OrgNode> children;
 };
 
+// A forest: the caller may have several disjoint accessible subtrees (or, for a
+// full-chart admin, a single tree rooted at the company root).
 struct TreeResp {
-    OrgNode tree;
+    std::vector<OrgNode> orgs;
 };
 
 struct ErrDto {
@@ -81,63 +92,107 @@ wikore::api::orgs_tree(drogon::orm::DbClientPtr db, drogon::HttpRequestPtr req)
             co_return json_error(drogon::k401Unauthorized, "unauthenticated");
         const auto id = req->getAttributes()->get<Identity>("identity");
 
-        // Tenant from the authenticated (active) user - never from the request.
-        std::string company_id;
+        // Tenant + company root from the authenticated (active) user - never
+        // from the request. A deactivated user is rejected.
+        std::string company_id, root_id;
         try {
             auto rows = co_await db->execSqlCoro(
-                "SELECT company_id FROM users "
-                "WHERE id=$1::uuid AND deactivated_at IS NULL", id.user_id);
+                "SELECT u.company_id::text AS company_id, r.id::text AS root_id "
+                "FROM users u "
+                "JOIN org_units r ON r.company_id = u.company_id AND r.type = 'root' "
+                "WHERE u.id = $1::uuid AND u.deactivated_at IS NULL", id.user_id);
             if (rows.empty())
                 co_return json_error(drogon::k403Forbidden, "user not found or deactivated");
             company_id = rows[0]["company_id"].as<std::string>();
+            root_id    = rows[0]["root_id"].as<std::string>();
         } catch (const drogon::orm::DrogonDbException& ex) {
             co_return db_error("tenant lookup", ex);
         }
 
-        // All org units for the company in one indexed read, assembled into a
-        // nested tree in memory from parent_id. Returning the whole company
-        // structure (org chart) is company-visible metadata, so it is not
-        // per-caller access-scoped (only tenant-scoped).
+        // Access model is default-closed: without membership a user sees
+        // nothing. Non-admins are scoped to the org units their memberships
+        // (and group memberships / grants) grant read access to, via the
+        // canonical AccessService primitive. Admins get the full company chart.
+        const bool full_chart = id.is_admin;
+        std::unordered_set<std::string> accessible;
+        if (!full_chart) {
+            try {
+                AccessService access(db);
+                auto ids = co_await access.effective_read_orgs(
+                    company_id, id.user_id, root_id);   // fail-closed (empty)
+                accessible.insert(ids.begin(), ids.end());
+            } catch (const drogon::orm::DrogonDbException& ex) {
+                co_return db_error("scope resolution", ex);
+            }
+            if (accessible.empty())     // no membership -> empty forest
+                co_return json(drogon::k200OK, R"({"orgs":[]})");
+        }
+
+        // All company org units (bounded), filtered to the visible set, then
+        // assembled into a forest from parent_id.
         try {
             auto rows = co_await db->execSqlCoro(
                 "SELECT id::text AS id, parent_id::text AS parent_id, type, slug, "
                 "       name, description "
-                "FROM org_units WHERE company_id=$1::uuid "
-                "ORDER BY name, slug", company_id);
+                "FROM org_units WHERE company_id = $1::uuid "
+                "ORDER BY name, slug LIMIT $2", company_id,
+                static_cast<long>(kMaxNodes + 1));
 
-            // Flat node data + a parent -> child-ids index; then materialize the
-            // nested tree from the root (parent_id IS NULL).
-            std::unordered_map<std::string, OrgNode>                  nodes;
-            std::unordered_map<std::string, std::vector<std::string>> kids;
-            std::string root_id;
+            if (rows.size() > kMaxNodes) {
+                spdlog::error("[orgs_tree] company {} exceeds {} org units",
+                              company_id, kMaxNodes);
+                co_return json_error(drogon::k500InternalServerError, "org tree too large");
+            }
+
+            std::unordered_map<std::string, OrgNode>    nodes;
+            std::unordered_map<std::string, std::string> parent_of;
+            std::vector<std::string>                    order;   // name-sorted
             for (const auto& r : rows) {
+                std::string oid = r["id"].as<std::string>();
+                if (!full_chart && !accessible.contains(oid))
+                    continue;   // default-closed: skip units the caller cannot see
                 OrgNode n;
-                n.id          = r["id"].as<std::string>();
+                n.id          = oid;
                 n.type        = r["type"].as<std::string>();
                 n.slug        = r["slug"].as<std::string>();
                 n.name        = r["name"].as<std::string>();
                 n.description = r["description"].isNull() ? "" : r["description"].as<std::string>();
-                if (r["parent_id"].isNull())
-                    root_id = n.id;
-                else
-                    kids[r["parent_id"].as<std::string>()].push_back(n.id);
-                nodes.emplace(n.id, std::move(n));
+                if (!r["parent_id"].isNull())
+                    parent_of.emplace(oid, r["parent_id"].as<std::string>());
+                nodes.emplace(oid, std::move(n));
+                order.push_back(std::move(oid));
             }
 
-            if (root_id.empty())   // every company has a root (DB trigger); defensive
-                co_return json_error(drogon::k500InternalServerError, "internal error");
+            // A visible node is a forest root when it has no parent, or its
+            // parent is not itself visible (so the caller sees a subtree
+            // starting where their access begins).
+            std::unordered_map<std::string, std::vector<std::string>> kids;
+            std::vector<std::string> roots;
+            for (const auto& oid : order) {
+                auto pit = parent_of.find(oid);
+                if (pit == parent_of.end() || !nodes.contains(pit->second))
+                    roots.push_back(oid);
+                else
+                    kids[pit->second].push_back(oid);
+            }
 
-            std::function<OrgNode(const std::string&)> build =
-                [&](const std::string& node_id) -> OrgNode {
-                    OrgNode n = nodes[node_id];          // copy without children
-                    if (auto it = kids.find(node_id); it != kids.end())
-                        for (const auto& child_id : it->second)
-                            n.children.push_back(build(child_id));
+            std::function<OrgNode(const std::string&, int)> build =
+                [&](const std::string& nid, int depth) -> OrgNode {
+                    OrgNode n = nodes[nid];               // copy without children
+                    if (depth < kMaxDepth)                // bound recursion/stack
+                        if (auto it = kids.find(nid); it != kids.end())
+                            for (const auto& child_id : it->second)
+                                n.children.push_back(build(child_id, depth + 1));
                     return n;
                 };
 
+            TreeResp resp;
+            resp.orgs.reserve(roots.size());
+            for (const auto& r : roots)
+                resp.orgs.push_back(build(r, 0));
+
             std::string out;
-            if (glz::write_json(TreeResp{build(root_id)}, out))
+            if (glz::write_json(resp, out))
                 co_return json_error(drogon::k500InternalServerError, "internal error");
             co_return json(drogon::k200OK, std::move(out));
         } catch (const drogon::orm::DrogonDbException& ex) {
