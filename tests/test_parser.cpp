@@ -1312,3 +1312,20 @@ TEST_CASE("XlsxParser: rich inline strings collect all <r><t> runs",
     CHECK(text.find("Hello World") != std::string::npos);
     CHECK(text.find("Plain") != std::string::npos);
 }
+
+TEST_CASE("XlsxParser: malformed worksheet alongside valid one returns corrupt error",
+          "[parser][xlsx][security]")
+{
+    // corrupt_sheet.xlsx: sheet1 is valid XML, sheet2 is non-XML garbage.
+    // Without the fix, sheet2 would be silently skipped and the parse would
+    // succeed with partial content (only sheet1).
+    // With the fix, parse_worksheet returns Error status for sheet2 and the
+    // parser returns ingest.xlsx.corrupt rather than partial success.
+    XlsxParser p;
+    auto content = load_fixture("corrupt_sheet.xlsx");
+    REQUIRE_FALSE(content.empty());
+    auto r = p.parse(content, "corrupt_sheet.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message == "ingest.xlsx.corrupt");
+}

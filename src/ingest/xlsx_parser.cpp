@@ -42,6 +42,7 @@
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <queue>
 #include <string>
@@ -64,8 +65,12 @@ static constexpr std::size_t kXlsxMaxTotalXmlBytes  = 128UL * 1024UL * 1024UL;
 static constexpr std::size_t kXlsxMaxOutputBytes    = 16UL  * 1024UL * 1024UL;
 static constexpr std::size_t kXlsxMaxSheets         = 500;
 static constexpr int         kXlsxXmlMaxDepth       = 64;
-// XLSX column limit: XFD = 16384 (ECMA-376 §18.3.1.4)
+// XLSX column/row limits (ECMA-376 §18.3.1.4 / §18.3.1.73)
 static constexpr int         kXlsxMaxCol            = 16384;
+// Per-row cell cap: at most one <c> element per column.  Protects col_vals
+// from O(XML_size / 3) entries (each a pair<int,string> ≈ 36 bytes on 64-bit)
+// which would amplify a 16 MiB XML entry to ~190 MiB of vector overhead.
+static constexpr int         kXlsxMaxCellsPerRow    = 16384;
 
 // ---------------------------------------------------------------------------
 // In-memory ZIP backend (same pattern as docx/pptx/odt parsers).
@@ -320,18 +325,29 @@ int col_from_ref(std::string_view r)
 // empty strings to preserve column alignment.
 //
 // remaining: shared global output-byte budget (across all worksheets).
-// Returns empty string and sets remaining=0 if the budget is exceeded;
-// the caller must treat remaining==0 as a content_limit_exceeded error.
+//   Sets remaining=0 if the budget is exceeded; caller treats that as
+//   content_limit_exceeded.
+//
+// Returns XlsxExtractStatus::Error if the XML fails to parse or sheetData
+// is absent (corrupt worksheet) — distinguishable from a legitimately
+// empty sheet (Ok + empty body) and budget exhaustion (remaining==0).
 // ---------------------------------------------------------------------------
-std::string parse_worksheet(const std::string&              xml,
-                             const std::vector<std::string>& shared_strings,
-                             std::size_t&                    remaining)
+struct ParseWorksheetResult {
+    std::string       body;
+    XlsxExtractStatus status = XlsxExtractStatus::Ok;
+};
+
+ParseWorksheetResult parse_worksheet(const std::string&              xml,
+                                      const std::vector<std::string>& shared_strings,
+                                      std::size_t&                    remaining)
 {
     pugi::xml_document doc;
-    if (!doc.load_buffer(xml.data(), xml.size())) return {};
+    if (!doc.load_buffer(xml.data(), xml.size()))
+        return {{}, XlsxExtractStatus::Error};
 
     pugi::xml_node sheet_data = bfs_find(doc, "sheetData");
-    if (!sheet_data) return {};
+    if (!sheet_data)
+        return {{}, XlsxExtractStatus::Error};
 
     // Helper: charge `n` bytes from the budget before materialising content.
     // Returns true if the charge succeeds; sets remaining=0 and returns false
@@ -352,13 +368,26 @@ std::string parse_worksheet(const std::string&              xml,
 
         // Collect (col_index, value) pairs so sparse rows can be padded.
         // Each value is budget-charged BEFORE it is copied into memory.
+        // Per-row cell cap: at most kXlsxMaxCellsPerRow entries (XLSX spec
+        // allows at most one <c> per column; more = corrupt).
         std::vector<std::pair<int, std::string>> col_vals;
-        int max_col = 0;
+        col_vals.reserve(32); // avoid small-count reallocations
+        int  max_col        = 0;
+        int  cells_in_row   = 0;
         bool budget_exceeded = false;
 
         for (const auto& c : row.children()) {
             if (local_name(c.name()) != "c") continue;
+
             const int col = col_from_ref(c.attribute("r").value());
+            // Skip cells with no valid column reference — they have nowhere to
+            // land in the output and must not consume the output budget.
+            if (col == 0) continue;
+
+            // Enforce per-row cell cap before any allocation.
+            if (++cells_in_row > kXlsxMaxCellsPerRow)
+                return {{}, XlsxExtractStatus::Error};
+
             if (col > max_col) max_col = col;
 
             std::string_view type = c.attribute("t").value();
@@ -367,11 +396,15 @@ std::string parse_worksheet(const std::string&              xml,
             if (type == "s") {
                 auto v = child_by_local(c, "v");
                 if (v) {
-                    int idx = std::atoi(v.text().get());
-                    if (idx >= 0 && static_cast<std::size_t>(idx)
-                                    < shared_strings.size()) {
+                    // Use strtol — std::atoi has undefined behaviour on
+                    // overflow (e.g. the string "9999999999").
+                    char* end = nullptr;
+                    long idx_l = std::strtol(v.text().get(), &end, 10);
+                    if (end != v.text().get()        // consumed at least one digit
+                        && idx_l >= 0
+                        && static_cast<std::size_t>(idx_l) < shared_strings.size()) {
                         const auto& sv = shared_strings[
-                            static_cast<std::size_t>(idx)];
+                            static_cast<std::size_t>(idx_l)];
                         if (!charge(sv.size())) { budget_exceeded = true; break; }
                         val = sv;
                     }
@@ -439,7 +472,7 @@ std::string parse_worksheet(const std::string&              xml,
             if (budget_exceeded) break;
             col_vals.push_back({col, std::move(val)});
         }
-        if (budget_exceeded) return {};
+        if (budget_exceeded) return {{}, XlsxExtractStatus::Ok}; // remaining==0, caller detects
 
         if (max_col == 0) continue; // entirely empty row
 
@@ -448,9 +481,9 @@ std::string parse_worksheet(const std::string&              xml,
         // sparse rows (e.g. one cell at XFD) are budgeted before allocation.
         const std::size_t sep_cost =
             (max_col > 1) ? static_cast<std::size_t>(max_col - 1) * 3 : 0;
-        if (!charge(sep_cost)) return {};
+        if (!charge(sep_cost)) return {{}, XlsxExtractStatus::Ok};
         // Also charge the newline between rows.
-        if (!out.empty() && !charge(1)) return {};
+        if (!out.empty() && !charge(1)) return {{}, XlsxExtractStatus::Ok};
 
         // Expand sparse col_vals into a dense vector indexed [0..max_col-1].
         std::vector<std::string> cells(static_cast<std::size_t>(max_col));
@@ -473,7 +506,7 @@ std::string parse_worksheet(const std::string&              xml,
             out += cells[i];
         }
     }
-    return out;
+    return {std::move(out), XlsxExtractStatus::Ok};
 }
 
 } // namespace
@@ -555,20 +588,25 @@ Result<ParsedDocument> XlsxParser::parse(const std::string& content,
                 Error::invalid_input("ingest.xlsx.content_limit_exceeded"));
         }
 
-        auto body = parse_worksheet(xml_res.content, shared_strings,
-                                    output_remaining);
+        auto ws_result = parse_worksheet(xml_res.content, shared_strings,
+                                          output_remaining);
+        if (ws_result.status == XlsxExtractStatus::Error) {
+            spdlog::error("[xlsx-parser] '{}' worksheet '{}' XML malformed",
+                          filename, sheet.path);
+            return std::unexpected(Error::invalid_input("ingest.xlsx.corrupt"));
+        }
         if (output_remaining == 0) {
             spdlog::error("[xlsx-parser] '{}' output budget exceeded; rejecting",
                           filename);
             return std::unexpected(
                 Error::invalid_input("ingest.xlsx.content_limit_exceeded"));
         }
-        if (body.empty()) continue;
+        if (ws_result.body.empty()) continue;
 
         ParsedSection sec;
         sec.heading = sheet.name;
         sec.depth   = 1;
-        sec.text    = std::move(body);
+        sec.text    = std::move(ws_result.body);
         out.sections.push_back(std::move(sec));
     }
 
