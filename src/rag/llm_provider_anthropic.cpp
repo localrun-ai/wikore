@@ -125,7 +125,7 @@ public:
         }
 
         AnthropicResponse ar;
-        if (glz::read_json(ar, resp->getBody())) {
+        if (glz::read<glz::opts{.error_on_unknown_keys = false}>(ar, resp->getBody())) {
             spdlog::warn("[llm-anthropic] JSON parse error");
             co_return std::unexpected(Error::unavailable("llm: invalid response JSON"));
         }
@@ -215,7 +215,7 @@ public:
                 }
 
                 AnthropicStreamEvent ev;
-                if (glz::read_json(ev, std::string(payload))) {
+                if (glz::read<glz::opts{.error_on_unknown_keys = false}>(ev, std::string(payload))) {
                     spdlog::warn("[llm-anthropic] malformed SSE chunk; aborting stream");
                     co_return std::unexpected(
                         Error::unavailable("llm: malformed SSE chunk in stream"));
@@ -237,11 +237,11 @@ public:
             if (line.empty()) current_event.clear();
         }
 
-        if (!message_stop_received) {
+        // message_stop is required by Anthropic spec; log a warning if absent
+        // but return the accumulated content rather than failing, consistent
+        // with the OpenAI-compatible [DONE] relaxation.
+        if (!message_stop_received)
             spdlog::warn("[llm-anthropic] stream ended without message_stop event");
-            co_return std::unexpected(
-                Error::unavailable("llm: incomplete stream (no message_stop received)"));
-        }
 
         on_chunk(ChatChunk{.done = true});
 

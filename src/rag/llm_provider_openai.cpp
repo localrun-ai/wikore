@@ -156,7 +156,7 @@ public:
         }
 
         OaiResponse oai_resp;
-        auto parse_err = glz::read_json(oai_resp, resp->getBody());
+        auto parse_err = glz::read<glz::opts{.error_on_unknown_keys = false}>(oai_resp, resp->getBody());
         if (parse_err) {
             spdlog::warn("[llm-openai] response JSON parse failed");
             co_return std::unexpected(Error::unavailable("llm: invalid response JSON"));
@@ -242,7 +242,7 @@ public:
             if (json_payload.empty()) continue;
 
             OaiStreamChunk chunk;
-            if (glz::read_json(chunk, json_payload)) {
+            if (glz::read<glz::opts{.error_on_unknown_keys = false}>(chunk, json_payload)) {
                 // Any non-empty data line that fails JSON parse is a corrupt
                 // stream — error objects and truncated chunks alike. Never skip
                 // silently: stream completion after a skip would return
@@ -268,11 +268,11 @@ public:
                 model_echo = chunk.model;
         }
 
-        if (!stream_completed) {
-            spdlog::warn("[llm-openai] stream ended without [DONE] sentinel");
-            co_return std::unexpected(
-                Error::unavailable("llm: incomplete stream (no [DONE] received)"));
-        }
+        // [DONE] not required: sendRequestCoro guarantees a complete HTTP body.
+        // Some OpenAI-compatible backends (llama.cpp, Ollama) omit [DONE].
+        // Log a warning for visibility but treat the stream as complete.
+        if (!stream_completed)
+            spdlog::warn("[llm-openai] stream ended without [DONE] sentinel (provider quirk)");
 
         on_chunk(ChatChunk{.done = true});
 
@@ -386,7 +386,7 @@ public:
                 std::format("llm: HTTP {}", static_cast<int>(resp->getStatusCode()))));
         }
         OaiResponse oai_resp;
-        if (glz::read_json(oai_resp, resp->getBody()))
+        if (glz::read<glz::opts{.error_on_unknown_keys = false}>(oai_resp, resp->getBody()))
             co_return std::unexpected(Error::unavailable("llm: invalid response JSON"));
         if (oai_resp.choices.empty())
             co_return std::unexpected(Error::unavailable("llm: empty choices"));
@@ -441,7 +441,7 @@ public:
             }
             if (json_payload.empty()) continue;
             OaiStreamChunk chunk;
-            if (glz::read_json(chunk, json_payload)) {
+            if (glz::read<glz::opts{.error_on_unknown_keys = false}>(chunk, json_payload)) {
                 spdlog::warn("[llm-azure] malformed SSE chunk; aborting stream");
                 co_return std::unexpected(
                     Error::unavailable("llm: malformed SSE chunk in stream"));
@@ -453,11 +453,8 @@ public:
             if (chunk.usage.prompt_tokens > 0)     input_tokens  = chunk.usage.prompt_tokens;
             if (chunk.usage.completion_tokens > 0) output_tokens = chunk.usage.completion_tokens;
         }
-        if (!stream_completed) {
-            spdlog::warn("[llm-azure] stream ended without [DONE] sentinel");
-            co_return std::unexpected(
-                Error::unavailable("llm: incomplete stream (no [DONE] received)"));
-        }
+        if (!stream_completed)
+            spdlog::warn("[llm-azure] stream ended without [DONE] sentinel (provider quirk)");
         on_chunk(ChatChunk{.done = true});
         co_return ChatResponse{
             .content       = std::move(accumulated),
