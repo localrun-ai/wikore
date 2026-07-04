@@ -200,9 +200,6 @@ private:
     std::optional<std::string> section_heading_;
 };
 
-// AllowedCandidate: backward-compatible alias. New code should use AllowedChunk.
-using AllowedCandidate [[deprecated("use AllowedChunk")]] = AllowedChunk;
-
 // ---------------------------------------------------------------------------
 // AllowedEvidence — the variant type accepted by ContextBuilder.
 //

@@ -137,7 +137,7 @@ tree at query time rather than trusting denormalized index payloads:
 4. The `EvidenceGate` re-validates each retrieved candidate against live
    PostgreSQL - resolving resource visibility from `resource_grants` and
    `org_unit_closure`, not the index payload - and hydrates the survivors. Only
-   the gate can produce an `AllowedCandidate`, so nothing reaches the reranker
+   the gate can produce an immutable, tenant-bound `AllowedChunk`, so nothing reaches the reranker
    without passing it.
 5. `RetrievalOrchestrator` composes the above: embed, resolve, derive clearance,
    prefilter, search, gate.

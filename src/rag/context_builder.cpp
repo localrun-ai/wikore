@@ -1,24 +1,81 @@
 #include "wikore/rag/context_builder.hpp"
 #include <format>
+#include <limits>
+#include <stdexcept>
 #include <spdlog/spdlog.h>
 
 namespace wikore::rag {
 
-// Fraction of the budget reserved for the model's answer.
-static constexpr std::size_t kAnswerHeadroomFraction = 4; // max_prompt_bytes / 4
-static constexpr std::size_t kMinAnswerHeadroom      = 256;   // bytes
-static constexpr std::size_t kMaxAnswerHeadroom      = 8192;  // bytes
+namespace {
+
+constexpr std::size_t kChatTemplateAllowance = 32;
+
+bool add_overflows(std::size_t a, std::size_t b) noexcept
+{
+    return b > std::numeric_limits<std::size_t>::max() - a;
+}
+
+std::size_t prompt_bytes(std::string_view system_message,
+                         std::string_view user_message)
+{
+    if (add_overflows(system_message.size(), user_message.size()))
+        return std::numeric_limits<std::size_t>::max();
+    return system_message.size() + user_message.size();
+}
+
+std::string escape_source_text(std::string_view text)
+{
+    std::string escaped;
+    escaped.reserve(text.size());
+    for (const char c : text) {
+        switch (c) {
+        case '&': escaped += "&amp;";  break;
+        case '<': escaped += "&lt;";   break;
+        case '>': escaped += "&gt;";   break;
+        default:  escaped += c;        break;
+        }
+    }
+    return escaped;
+}
+
+} // namespace
+
+Result<std::size_t> ByteUpperBoundTokenCounter::count(
+    std::string_view system_message,
+    std::string_view user_message) const
+{
+    const auto bytes = prompt_bytes(system_message, user_message);
+    if (bytes == std::numeric_limits<std::size_t>::max()
+        || add_overflows(bytes, kChatTemplateAllowance))
+        return std::unexpected(Error::invalid_input(
+            "context_builder: prompt size overflow"));
+    return bytes + kChatTemplateAllowance;
+}
+
+ContextBuilder::ContextBuilder(
+    std::shared_ptr<const PromptTokenCounterPort> token_counter)
+    : token_counter_(std::move(token_counter))
+{
+    if (!token_counter_)
+        throw std::invalid_argument("ContextBuilder: token_counter is required");
+}
 
 Result<PromptContext> ContextBuilder::build(
-    const wikore::RequestContext& ctx,
-    std::string_view               query,
+    const wikore::RequestContext&    ctx,
+    std::string_view                 query,
     std::span<const AllowedEvidence> evidence,
-    const ContextBuilderOptions&   opts) const
+    const ContextBuilderOptions&     opts) const
 {
-    // -----------------------------------------------------------------------
-    // 1. Validate options.
-    // -----------------------------------------------------------------------
-    if (opts.max_prompt_bytes == 0 || opts.max_prompt_bytes > kContextBuilderMaxBytes)
+    if (opts.max_context_tokens == 0
+        || opts.max_context_tokens > kContextBuilderMaxTokens)
+        return std::unexpected(Error::invalid_input(std::format(
+            "context_builder: max_context_tokens must be in [1, {}]",
+            kContextBuilderMaxTokens)));
+    if (opts.reserved_output_tokens >= opts.max_context_tokens)
+        return std::unexpected(Error::invalid_input(
+            "context_builder: reserved_output_tokens must be smaller than max_context_tokens"));
+    if (opts.max_prompt_bytes == 0
+        || opts.max_prompt_bytes > kContextBuilderMaxBytes)
         return std::unexpected(Error::invalid_input(std::format(
             "context_builder: max_prompt_bytes must be in [1, {}]",
             kContextBuilderMaxBytes)));
@@ -26,81 +83,97 @@ Result<PromptContext> ContextBuilder::build(
         return std::unexpected(Error::invalid_input(
             "context_builder: max_evidence_items must be >= 0"));
 
-    // -----------------------------------------------------------------------
-    // 2. Reserve answer headroom, then check mandatory content fits.
-    //    All arithmetic uses std::size_t to prevent signed overflow.
-    // -----------------------------------------------------------------------
-    const std::size_t headroom = std::clamp(
-        opts.max_prompt_bytes / kAnswerHeadroomFraction,
-        kMinAnswerHeadroom, kMaxAnswerHeadroom);
-    std::size_t remaining = opts.max_prompt_bytes - headroom;
-
-    const auto charge = [&](std::size_t n) -> bool {
-        if (n > remaining) return false;
-        remaining -= n;
-        return true;
-    };
-
-    if (!opts.system_prompt.empty()) {
-        const std::size_t sys_bytes = opts.system_prompt.size() + 2; // +2 for \n\n
-        if (!charge(sys_bytes))
-            return std::unexpected(Error::invalid_input(
-                "context_builder: system_prompt exceeds byte budget"));
-    }
-
-    const std::string query_block = std::format("Question: {}\n\nAnswer:", query);
-    if (!charge(query_block.size()))
-        return std::unexpected(Error::invalid_input(
-            "context_builder: query exceeds remaining byte budget "
-            "(increase max_prompt_bytes or shorten the query)"));
-
-    // -----------------------------------------------------------------------
-    // 3. Build prompt — tenant-check each evidence item before inclusion.
-    // -----------------------------------------------------------------------
-    // reserve() capped: max_prompt_bytes validated <= 4 MiB above, so
-    // max_prompt_bytes * 1 (no multiplier) is safe. We already have space
-    // for the headroom fraction, so the actual prompt fits within the reserve.
-    PromptContext out;
-    out.prompt.reserve(opts.max_prompt_bytes);
-
-    if (!opts.system_prompt.empty()) {
-        out.prompt += opts.system_prompt;
-        out.prompt += "\n\n";
-    }
-
-    int n = 0, truncated = 0;
+    // Validate every supplied item before applying item or size caps. A
+    // cross-tenant object is an evidence-routing bug even when it would not
+    // have been selected for the prompt.
     for (const auto& ev : evidence) {
-        if (n >= opts.max_evidence_items) { ++truncated; continue; }
-
-        // Tenant check — fail closed on mismatch; do not silently skip.
-        const std::string* ev_company = std::visit(
-            [](const AllowedChunk& c) -> const std::string* { return &c.company_id(); },
-            ev);
-        if (*ev_company != ctx.tenant.company_id) {
+        const auto& company_id = std::visit(
+            [](const AllowedChunk& c) -> const std::string& {
+                return c.company_id();
+            }, ev);
+        if (company_id != ctx.tenant.company_id) {
             spdlog::error("[context-builder] cross-tenant evidence: "
                           "evidence company={} request company={}",
-                          *ev_company, ctx.tenant.company_id);
+                          company_id, ctx.tenant.company_id);
             return std::unexpected(Error::invalid_state(
                 "context_builder: evidence company_id does not match request tenant"));
         }
-
-        std::visit([&](const AllowedChunk& chunk) {
-            // Byte cost: header "[SRC N]\n" + text + "\n\n"
-            const std::size_t cost = 8 + chunk.text().size() + 2;
-            if (!charge(cost)) { ++truncated; return; }
-            out.prompt += std::format("[SRC {}]\n{}\n\n", ++n, chunk.text());
-            out.source_chunk_ids.push_back(chunk.chunk_id());
-        }, ev);
     }
 
-    out.prompt += query_block;
-    out.prompt_bytes = opts.max_prompt_bytes - headroom - remaining;
+    const std::size_t input_token_budget =
+        opts.max_context_tokens - opts.reserved_output_tokens;
+    const std::string query_block = std::format("Question: {}\n\nAnswer:", query);
 
-    if (truncated > 0)
-        spdlog::debug("[context-builder] {}/{} items included, {} excluded by budget",
-                      n, static_cast<int>(evidence.size()), truncated);
+    auto mandatory_tokens = token_counter_->count(opts.system_prompt, query_block);
+    if (!mandatory_tokens)
+        return std::unexpected(mandatory_tokens.error());
+    if (*mandatory_tokens > input_token_budget)
+        return std::unexpected(Error::invalid_input(
+            "context_builder: system prompt and query exceed input token budget"));
+    if (prompt_bytes(opts.system_prompt, query_block) > opts.max_prompt_bytes)
+        return std::unexpected(Error::invalid_input(
+            "context_builder: system prompt and query exceed byte budget"));
+
+    PromptContext out;
+    out.system_message = opts.system_prompt;
+    out.user_message.reserve(opts.max_prompt_bytes);
+
+    std::string evidence_blocks;
+    int included = 0;
+    int excluded = 0;
+    std::optional<Error> counter_error;
+    for (const auto& ev : evidence) {
+        if (included >= opts.max_evidence_items) {
+            ++excluded;
+            continue;
+        }
+
+        bool accepted = false;
+        std::visit([&](const AllowedChunk& chunk) {
+            const std::string escaped_text = escape_source_text(chunk.text());
+            const std::string block = std::format(
+                "[SRC {}]\n<source>\n{}\n</source>\n\n",
+                included + 1, escaped_text);
+            const std::string candidate_user = evidence_blocks + block + query_block;
+            if (prompt_bytes(opts.system_prompt, candidate_user)
+                    > opts.max_prompt_bytes) {
+                return;
+            }
+            auto tokens = token_counter_->count(opts.system_prompt, candidate_user);
+            if (!tokens) {
+                counter_error = tokens.error();
+                return;
+            }
+            if (*tokens > input_token_budget)
+                return;
+            evidence_blocks += block;
+            out.source_chunk_ids.push_back(chunk.chunk_id());
+            accepted = true;
+        }, ev);
+
+        if (counter_error)
+            return std::unexpected(std::move(*counter_error));
+
+        if (accepted)
+            ++included;
+        else
+            ++excluded;
+    }
+
+    out.user_message = std::move(evidence_blocks);
+    out.user_message += query_block;
+    out.prompt_bytes = prompt_bytes(out.system_message, out.user_message);
+    auto final_tokens = token_counter_->count(out.system_message, out.user_message);
+    if (!final_tokens)
+        return std::unexpected(final_tokens.error());
+    out.prompt_tokens = *final_tokens;
+
+    if (excluded > 0)
+        spdlog::debug("[context-builder] {}/{} items included, {} excluded",
+                      included, static_cast<int>(evidence.size()), excluded);
     else
-        spdlog::debug("[context-builder] {} items, {} bytes", n, out.prompt_bytes);
+        spdlog::debug("[context-builder] {} items, {} tokens, {} bytes",
+                      included, out.prompt_tokens, out.prompt_bytes);
     return out;
 }
 
