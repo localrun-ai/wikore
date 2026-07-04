@@ -175,7 +175,8 @@ CREATE TABLE knowledge_edge_embeddings (
     PRIMARY KEY (edge_id, embedding_model_id),
     FOREIGN KEY (company_id, edge_id)
         REFERENCES knowledge_edges(company_id, id) ON DELETE CASCADE,
-    UNIQUE (embedding_model_id, qdrant_point_id)
+    CONSTRAINT knowledge_edge_embeddings_point_uniq
+        UNIQUE (embedding_model_id, qdrant_point_id)
 );
 
 -- ---------------------------------------------------------------------------

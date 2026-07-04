@@ -156,7 +156,8 @@ const std::unordered_set<std::string> k_allowlist = {
     "knowledge_edge_endpoints_edge_id_chunk_id_key",
     // (embedding_model_id, qdrant_point_id) UNIQUE — a duplicate Qdrant
     // point ID for the same model is a programming bug (uuid_v5 collision).
-    "knowledge_edge_embeddings_embedding_model_id_qdrant_point_id_key",
+    // Explicit name because PG truncates auto-generated names at 63 chars.
+    "knowledge_edge_embeddings_point_uniq",
     // History (live_row_id, valid_from) UNIQUE — clock_timestamp collision
     // is a programming bug.
     "knowledge_edges_history_live_row_id_valid_from_key",
