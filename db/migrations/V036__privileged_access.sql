@@ -161,6 +161,20 @@ BEGIN
         -- snapshot has already preserved this decision.
         RETURN OLD;
     END IF;
+    IF TG_OP = 'DELETE'
+       AND NOT EXISTS (SELECT 1 FROM users
+                       WHERE company_id = OLD.company_id
+                         AND id = OLD.approver_user_id) THEN
+        -- A hard user DELETE reached us through the approver FK's CASCADE.
+        -- Keep the immutable decision and report the operation as the
+        -- referential-integrity failure it is, rather than as a direct
+        -- attempt to mutate the approval row.
+        RAISE EXCEPTION
+            'user % is referenced by privileged_access_approvals',
+            OLD.approver_user_id
+            USING ERRCODE = 'foreign_key_violation',
+                  CONSTRAINT = 'privileged_access_approvals_company_id_approver_user_id_fkey';
+    END IF;
     RAISE EXCEPTION 'privileged_access_approvals is append-only; % rejected', TG_OP
         USING ERRCODE = 'insufficient_privilege',
               CONSTRAINT = 'privileged_access_approvals_append_only';
@@ -392,6 +406,19 @@ $$;
 CREATE TRIGGER privileged_access_scopes_mutability
     BEFORE INSERT OR UPDATE OR DELETE ON privileged_access_scopes
     FOR EACH ROW EXECUTE FUNCTION privileged_access_scopes_mutable_only_before_decision();
+
+CREATE OR REPLACE FUNCTION privileged_access_scopes_reject_truncate()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'privileged_access_scopes cannot be truncated'
+        USING ERRCODE = 'insufficient_privilege',
+              CONSTRAINT = 'privileged_access_scopes_immutable_after_decision';
+END;
+$$;
+
+CREATE TRIGGER privileged_access_scopes_no_truncate
+    BEFORE TRUNCATE ON privileged_access_scopes
+    FOR EACH STATEMENT EXECUTE FUNCTION privileged_access_scopes_reject_truncate();
 
 -- ---------------------------------------------------------------------------
 -- Database-enforced workflow state machine.

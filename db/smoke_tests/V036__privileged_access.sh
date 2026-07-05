@@ -386,3 +386,18 @@ ERR=$(sql "TRUNCATE privileged_access_approvals;" 2>&1 || true)
 echo "$ERR" | grep -qi "append-only\|append_only" \
   && pass "V036.32" "approval TRUNCATE rejected" \
   || fail "V036.32" "approval TRUNCATE accepted: $ERR"
+
+# V036.33: TRUNCATE cannot bypass scope immutability/history semantics.
+ERR=$(sql "TRUNCATE privileged_access_scopes;" 2>&1 || true)
+echo "$ERR" | grep -qi "scopes_immutable_after_decision\|cannot be truncated" \
+  && pass "V036.33" "scope TRUNCATE rejected" \
+  || fail "V036.33" "scope TRUNCATE accepted: $ERR"
+
+# V036.34: hard-deleting an approver reports referential integrity, while
+# normal company/session cascades remain covered by V036.26.
+ERR=$(sql "DELETE FROM users WHERE id='$U_DAVE';" 2>&1 || true)
+COUNT=$(sql "SELECT count(*) FROM users WHERE id='$U_DAVE';")
+echo "$ERR" | grep -qi "foreign key\|referenced by privileged_access_approvals" \
+  && [ "$COUNT" = "1" ] \
+  && pass "V036.34" "hard approver delete rejected as FK violation" \
+  || fail "V036.34" "hard approver delete result wrong (count=$COUNT err=$ERR)"
