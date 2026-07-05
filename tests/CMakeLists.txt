@@ -17,6 +17,7 @@ add_executable(wikore_tests
     test_evidence_gate.cpp
     test_clearance.cpp
     test_retrieval_orchestrator.cpp
+    test_retrieval_orchestrator_bridge.cpp
     test_resync_worker.cpp
     test_edge_vector_cleanup_worker.cpp
     test_knowledge_edge_repo.cpp
