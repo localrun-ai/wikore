@@ -119,6 +119,12 @@ private:
         std::string  ep1_chunk_id;
         int          auth0 = 50;
         int          auth1 = 50;
+        // Set to true when the SELECT returned zero rows. Kept as an
+        // in-struct sentinel rather than wrapping in std::optional so
+        // helper return types stay Result<void> (nested
+        // std::expected<std::optional<T>, Error> combos trip GCC 14's
+        // coroutine-frame emitter — see the flatten note on process()).
+        bool         missing = false;
     };
 
     drogon::Task<std::vector<ClaimedEvent>> claim_batch();
@@ -127,31 +133,32 @@ private:
     drogon::Task<void>                      mark_failed(const std::string& event_id,
                                                         std::string_view  reason);
 
-    // Helper coroutines split out of process() to keep each coroutine
-    // frame small — GCC 14 hits an ICE (build_special_member_call at
-    // cp/call.cc:11096) when a single coroutine frame contains too many
-    // co_awaits + non-trivial locals inside try blocks. Splitting also
-    // makes the process() control flow linear and easy to reason about.
-    drogon::Task<Result<std::optional<LiveEdge>>>
-    load_live_edge(const ClaimedEvent& ev);
+    // Helper coroutines — all return Result<void> and write results
+    // through mutable out-params. GCC 14's coroutine-frame emitter
+    // ICEs on heavier return types (nested Result<optional<T>>,
+    // Result<pair<...>>) even when the surrounding function is small;
+    // Result<void> keeps every helper's frame minimal.
+    drogon::Task<Result<void>>
+    load_live_edge(const ClaimedEvent& ev, LiveEdge& out);
 
     drogon::Task<Result<std::int64_t>>
     load_indexed_edge_version(const ClaimedEvent& ev);
 
-    drogon::Task<Result<std::optional<std::string>>>
-    load_model_collection(const std::string& model_id);
+    // out_collection is set to the empty string when the model exists
+    // but is disabled — caller maps that to Outcome::ModelDisabled.
+    drogon::Task<Result<void>>
+    load_model_collection(const std::string& model_id, std::string& out_collection);
 
-    drogon::Task<Result<std::pair<std::string, std::string>>>
-    load_endpoint_point_ids(const ClaimedEvent& ev, const LiveEdge& edge);
+    drogon::Task<Result<void>>
+    load_endpoint_point_ids(const ClaimedEvent& ev, const LiveEdge& edge,
+                            std::string& out_ep0_pid, std::string& out_ep1_pid);
 
-    drogon::Task<Result<rag::Embedding>>
-    load_type_vector(const ClaimedEvent& ev);
+    drogon::Task<Result<void>>
+    load_type_vector(const ClaimedEvent& ev, rag::Embedding& out_v_type);
 
-    // Final phase: read endpoint chunk vectors from Qdrant, compute
-    // formula v1, upsert the edge point, and update the bookkeeping
-    // row. Extracted so process() itself is a short flat sequence of
-    // co_awaits — GCC 14's coroutine emitter chokes on process()
-    // otherwise (see load_live_edge comment).
+    // Terminal phase: read endpoint chunk vectors from Qdrant, compute
+    // formula v1, upsert edge point, and update bookkeeping. Split out
+    // so process() itself has a tiny frame GCC 14 can emit.
     drogon::Task<Result<Outcome>>
     write_edge_vector(const ClaimedEvent& ev,
                       const LiveEdge&     live,

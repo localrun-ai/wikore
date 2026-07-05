@@ -216,25 +216,15 @@ drogon::Task<int> EmbedEdgeWorker::release_my_claims()
 }
 
 // ---------------------------------------------------------------------------
-// Helpers split out of process() so each coroutine frame stays small.
-// GCC 14 ICEs (build_special_member_call at cp/call.cc:11096) on the
-// original monolithic process() — same class of bug the
-// KnowledgeEdgeRepo::get()/list() workaround comments in #54 document.
-// Each helper does exactly one DB or Qdrant round-trip, keeps the
-// try/catch tight around it, and returns a Result the orchestrator
-// consumes at the outermost frame.
+// Helpers — every one returns Result<void> and writes results through
+// out-params. Return types like Result<optional<T>> or Result<pair<...>>
+// trip GCC 14's coroutine-frame emitter (ICE: build_special_member_call
+// at cp/call.cc:11096); Result<void> keeps each helper frame minimal.
 // ---------------------------------------------------------------------------
 
-drogon::Task<Result<std::optional<EmbedEdgeWorker::LiveEdge>>>
-EmbedEdgeWorker::load_live_edge(const ClaimedEvent& ev)
+drogon::Task<Result<void>>
+EmbedEdgeWorker::load_live_edge(const ClaimedEvent& ev, LiveEdge& out)
 {
-    // Read the live edge state — critically INCLUDING edge_type,
-    // review_state, and edge_version — so the payload we write to
-    // Qdrant reflects newest-known truth, not the (possibly stale)
-    // event payload. Without this, a v2 event processed after v3
-    // could overwrite the point with v2's review_state, over-recalling
-    // rejected edges past when the retrieval prefilter starts trusting
-    // this key.
     drogon::orm::Result rows{nullptr};
     try {
         rows = co_await db_->execSqlCoro(R"(
@@ -261,17 +251,19 @@ EmbedEdgeWorker::load_live_edge(const ClaimedEvent& ev)
     } catch (const drogon::orm::DrogonDbException& ex) {
         co_return std::unexpected(postgres::map_db_exception(ex));
     }
-    if (rows.empty())
-        co_return std::optional<LiveEdge>{};
-    co_return std::optional<LiveEdge>{LiveEdge{
-        .edge_type    = rows[0]["edge_type"].as<std::string>(),
-        .review_state = rows[0]["review_state"].as<std::string>(),
-        .edge_version = rows[0]["edge_version"].as<std::int64_t>(),
-        .ep0_chunk_id = rows[0]["ep0_chunk_id"].as<std::string>(),
-        .ep1_chunk_id = rows[0]["ep1_chunk_id"].as<std::string>(),
-        .auth0        = rows[0]["auth0"].as<int>(),
-        .auth1        = rows[0]["auth1"].as<int>(),
-    }};
+    if (rows.empty()) {
+        out.missing = true;
+        co_return Result<void>{};
+    }
+    out.missing      = false;
+    out.edge_type    = rows[0]["edge_type"].as<std::string>();
+    out.review_state = rows[0]["review_state"].as<std::string>();
+    out.edge_version = rows[0]["edge_version"].as<std::int64_t>();
+    out.ep0_chunk_id = rows[0]["ep0_chunk_id"].as<std::string>();
+    out.ep1_chunk_id = rows[0]["ep1_chunk_id"].as<std::string>();
+    out.auth0        = rows[0]["auth0"].as<int>();
+    out.auth1        = rows[0]["auth1"].as<int>();
+    co_return Result<void>{};
 }
 
 drogon::Task<Result<std::int64_t>>
@@ -291,12 +283,9 @@ EmbedEdgeWorker::load_indexed_edge_version(const ClaimedEvent& ev)
     co_return rows[0]["iev"].as<std::int64_t>();
 }
 
-// Returns std::nullopt when the model is disabled — the caller treats
-// that as ModelDisabled (complete-and-no-op), not as a failure to
-// retry. A disable is a legitimate operator action; burning the retry
-// budget on it would produce alert noise.
-drogon::Task<Result<std::optional<std::string>>>
-EmbedEdgeWorker::load_model_collection(const std::string& model_id)
+drogon::Task<Result<void>>
+EmbedEdgeWorker::load_model_collection(const std::string& model_id,
+                                       std::string&       out_collection)
 {
     drogon::orm::Result rows{nullptr};
     try {
@@ -307,16 +296,23 @@ EmbedEdgeWorker::load_model_collection(const std::string& model_id)
     } catch (const drogon::orm::DrogonDbException& ex) {
         co_return std::unexpected(postgres::map_db_exception(ex));
     }
+    // Empty out means model exists but is disabled (or the model row
+    // is absent altogether). The caller distinguishes based on caller
+    // context — for the worker, either case is Outcome::ModelDisabled
+    // (both are legitimate operator actions).
     if (rows.empty())
-        co_return std::optional<std::string>{};
-    co_return std::optional<std::string>{rows[0]["qdrant_collection"].as<std::string>()};
+        out_collection.clear();
+    else
+        out_collection = rows[0]["qdrant_collection"].as<std::string>();
+    co_return Result<void>{};
 }
 
-drogon::Task<Result<std::pair<std::string, std::string>>>
-EmbedEdgeWorker::load_endpoint_point_ids(const ClaimedEvent& ev, const LiveEdge& edge)
+drogon::Task<Result<void>>
+EmbedEdgeWorker::load_endpoint_point_ids(const ClaimedEvent& ev,
+                                         const LiveEdge&     edge,
+                                         std::string&        out_ep0_pid,
+                                         std::string&        out_ep1_pid)
 {
-    // ANY($1::uuid[]) expects '{a,b}' text; the chunk ids came out of
-    // Postgres so they are already valid UUID text.
     std::string arr = std::format("{{{},{}}}", edge.ep0_chunk_id, edge.ep1_chunk_id);
     std::string mid = ev.embedding_model_id;
     drogon::orm::Result rows{nullptr};
@@ -329,23 +325,22 @@ EmbedEdgeWorker::load_endpoint_point_ids(const ClaimedEvent& ev, const LiveEdge&
     } catch (const drogon::orm::DrogonDbException& ex) {
         co_return std::unexpected(postgres::map_db_exception(ex));
     }
-    std::string ep0_point_id, ep1_point_id;
     for (const auto& r : rows) {
         const auto cid = r["chunk_id"].as<std::string>();
         const auto pid = r["pid"].as<std::string>();
-        if (cid == edge.ep0_chunk_id) ep0_point_id = pid;
-        if (cid == edge.ep1_chunk_id) ep1_point_id = pid;
+        if (cid == edge.ep0_chunk_id) out_ep0_pid = pid;
+        if (cid == edge.ep1_chunk_id) out_ep1_pid = pid;
     }
-    if (ep0_point_id.empty() || ep1_point_id.empty())
+    if (out_ep0_pid.empty() || out_ep1_pid.empty())
         co_return std::unexpected(Error::unavailable(std::format(
             "endpoint chunk vectors not yet embedded for model {} "
             "(ep0='{}' ep1='{}'); retry",
-            ev.embedding_model_id, ep0_point_id, ep1_point_id)));
-    co_return std::pair{ep0_point_id, ep1_point_id};
+            ev.embedding_model_id, out_ep0_pid, out_ep1_pid)));
+    co_return Result<void>{};
 }
 
-drogon::Task<Result<rag::Embedding>>
-EmbedEdgeWorker::load_type_vector(const ClaimedEvent& ev)
+drogon::Task<Result<void>>
+EmbedEdgeWorker::load_type_vector(const ClaimedEvent& ev, rag::Embedding& out_v_type)
 {
     std::string type_arg{ev.edge_type};
     std::string mid_arg{ev.embedding_model_id};
@@ -364,27 +359,25 @@ EmbedEdgeWorker::load_type_vector(const ClaimedEvent& ev)
             "edge_type_vectors row missing for (formula_version={}, "
             "edge_type='{}', model={}); run EmbedTypeVectorsUseCase",
             ev.formula_version, ev.edge_type, ev.embedding_model_id)));
-    // Postgres text-protocol for real[] arrives as '{a,b,c}'. Parse
-    // once and return.
-    rag::Embedding v_type;
+    // Postgres text-protocol for real[] arrives as '{a,b,c}'.
     try {
         const std::string s = rows[0]["vector"].as<std::string>();
         std::string body = s.substr(1, s.size() - 2);
         std::string tok;
         for (char c : body) {
             if (c == ',') {
-                if (!tok.empty()) v_type.push_back(std::stof(tok));
+                if (!tok.empty()) out_v_type.push_back(std::stof(tok));
                 tok.clear();
             } else {
                 tok.push_back(c);
             }
         }
-        if (!tok.empty()) v_type.push_back(std::stof(tok));
+        if (!tok.empty()) out_v_type.push_back(std::stof(tok));
     } catch (const std::exception& ex) {
         co_return std::unexpected(Error::database_error(std::format(
             "edge_type_vectors vector parse error: {}", ex.what())));
     }
-    co_return v_type;
+    co_return Result<void>{};
 }
 
 drogon::Task<Result<void>>
@@ -417,122 +410,115 @@ EmbedEdgeWorker::upsert_bookkeeping(const ClaimedEvent& ev,
     co_return Result<void>{};
 }
 
-// ---------------------------------------------------------------------------
-// write_edge_vector: the terminal phase of process(). Runs after the
-// live-edge/CAS/model preflight in process() has succeeded. Split into
-// its own coroutine because GCC 14 ICEs on the combined frame when the
-// full pipeline (six co_awaits + non-trivial locals across each) lives
-// in one function body. Same lesson as PR #54's get()/list() split.
-// ---------------------------------------------------------------------------
 drogon::Task<Result<EmbedEdgeWorker::Outcome>>
 EmbedEdgeWorker::write_edge_vector(const ClaimedEvent& ev,
                                    const LiveEdge&     live,
                                    const std::string&  collection,
                                    std::shared_ptr<rag::VectorStorePort> chunk_store)
 {
-    // 4. Endpoint point-id lookup + vector fetch from Qdrant.
-    auto point_ids = co_await load_endpoint_point_ids(ev, live);
-    if (!point_ids) co_return std::unexpected(point_ids.error());
+    // 4. Endpoint point-ids.
     std::string ep0_pid, ep1_pid;
     {
-        auto&& p = *point_ids;
-        ep0_pid = p.first;
-        ep1_pid = p.second;
+        auto r = co_await load_endpoint_point_ids(ev, live, ep0_pid, ep1_pid);
+        if (!r) co_return std::unexpected(r.error());
     }
-    auto vecs = co_await chunk_store->fetch_vectors_by_id({ep0_pid, ep1_pid});
-    if (!vecs) co_return std::unexpected(vecs.error());
-    const rag::Embedding* v0 = nullptr;
-    const rag::Embedding* v1 = nullptr;
-    for (const auto& kv : *vecs) {
-        if (kv.first == ep0_pid) v0 = &kv.second;
-        if (kv.first == ep1_pid) v1 = &kv.second;
+    // 4b. Endpoint vectors from Qdrant.
+    rag::Embedding v0, v1;
+    {
+        auto vecs = co_await chunk_store->fetch_vectors_by_id({ep0_pid, ep1_pid});
+        if (!vecs) co_return std::unexpected(vecs.error());
+        for (auto& kv : *vecs) {
+            if (kv.first == ep0_pid) v0 = std::move(kv.second);
+            else if (kv.first == ep1_pid) v1 = std::move(kv.second);
+        }
     }
-    if (!v0 || !v1)
+    if (v0.empty() || v1.empty())
         co_return std::unexpected(Error::unavailable(std::format(
             "Qdrant did not return one of the endpoint vectors "
             "(ep0='{}' ep1='{}'); retry", ep0_pid, ep1_pid)));
 
     // 5. Type vector.
-    auto v_type = co_await load_type_vector(ev);
-    if (!v_type) co_return std::unexpected(v_type.error());
+    rag::Embedding v_type;
+    {
+        auto r = co_await load_type_vector(ev, v_type);
+        if (!r) co_return std::unexpected(r.error());
+    }
 
-    // 6. Formula v1.
-    auto edge_vec = rag::compute_edge_vector_v1(live.auth0, live.auth1,
-                                                *v0, *v1, *v_type);
-    if (!edge_vec) co_return std::unexpected(edge_vec.error());
+    // 6. Formula v1 (pure).
+    rag::Embedding edge_vec;
+    {
+        auto r = rag::compute_edge_vector_v1(live.auth0, live.auth1, v0, v1, v_type);
+        if (!r) co_return std::unexpected(r.error());
+        edge_vec = std::move(*r);
+    }
 
-    // 7. Version-free point id.
+    // 7. Version-free point id (pure).
     const std::string pid = compute_point_id(ev.edge_id,
                                              ev.embedding_model_id,
                                              ev.formula_version);
 
-    // 8. Qdrant upsert. Every payload field the retrieval prefilter
-    // might key on comes from the LIVE edge, not the event payload.
-    std::string payload_json = std::format(
-        R"({{"company_id":"{}","edge_id":"{}","edge_type":"{}",)"
-        R"("formula_version":{},"edge_version":{},)"
-        R"("endpoint_0_chunk_id":"{}","endpoint_1_chunk_id":"{}",)"
-        R"("authority_0":{},"authority_1":{},"review_state":"{}"}})",
-        ev.company_id, ev.edge_id, live.edge_type,
-        ev.formula_version, live.edge_version,
-        live.ep0_chunk_id, live.ep1_chunk_id,
-        live.auth0, live.auth1, live.review_state);
-    if (auto r = co_await edge_store_->upsert_raw(pid, *edge_vec,
-                                                  std::move(payload_json));
-        !r)
-        co_return std::unexpected(r.error());
+    // 8. Qdrant upsert. LIVE payload fields.
+    {
+        std::string payload_json = std::format(
+            R"({{"company_id":"{}","edge_id":"{}","edge_type":"{}",)"
+            R"("formula_version":{},"edge_version":{},)"
+            R"("endpoint_0_chunk_id":"{}","endpoint_1_chunk_id":"{}",)"
+            R"("authority_0":{},"authority_1":{},"review_state":"{}"}})",
+            ev.company_id, ev.edge_id, live.edge_type,
+            ev.formula_version, live.edge_version,
+            live.ep0_chunk_id, live.ep1_chunk_id,
+            live.auth0, live.auth1, live.review_state);
+        auto r = co_await edge_store_->upsert_raw(pid, edge_vec, std::move(payload_json));
+        if (!r) co_return std::unexpected(r.error());
+    }
 
-    // 9. Bookkeeping — live.edge_version so the row matches Qdrant.
-    if (auto r = co_await upsert_bookkeeping(ev, pid, live.edge_version); !r)
-        co_return std::unexpected(r.error());
+    // 9. Bookkeeping.
+    {
+        auto r = co_await upsert_bookkeeping(ev, pid, live.edge_version);
+        if (!r) co_return std::unexpected(r.error());
+    }
 
-    (void)collection;   // reserved for tracing; keeps signature symmetric with process()
+    (void)collection;
     co_return Outcome::Completed;
 }
 
 // ---------------------------------------------------------------------------
-// Process one claimed event. Preflight in process(), terminal write in
-// write_edge_vector(). Both stay small enough for GCC 14's coroutine
-// emitter to lay out the frame.
+// Process one claimed event. Preflight only — hands off to
+// write_edge_vector() for the terminal phase so each frame stays small.
 // ---------------------------------------------------------------------------
 
 drogon::Task<Result<EmbedEdgeWorker::Outcome>>
 EmbedEdgeWorker::process(const ClaimedEvent& ev)
 {
-    // 1. Live-edge probe. Returns NoEdge if the edge was insert-and-
-    //    deleted in one transaction or admin-deleted between enqueue
-    //    and claim (V037 5b-contract note 1).
-    auto live_opt = co_await load_live_edge(ev);
-    if (!live_opt) co_return std::unexpected(live_opt.error());
-    if (!live_opt->has_value())
-        co_return Outcome::NoEdge;
-    LiveEdge live = std::move(**live_opt);
+    // 1. Live-edge probe.
+    LiveEdge live;
+    {
+        auto r = co_await load_live_edge(ev, live);
+        if (!r) co_return std::unexpected(r.error());
+        if (live.missing) co_return Outcome::NoEdge;
+    }
 
-    // 2. Staleness gate — event's edge_version vs. stored
-    //    indexed_edge_version. Concurrent workers cannot corrupt the
-    //    Qdrant point: even if a stale event wins the claim it sees
-    //    the newer indexed_edge_version and superseeds itself.
-    auto iev = co_await load_indexed_edge_version(ev);
-    if (!iev) co_return std::unexpected(iev.error());
-    if (*iev >= live.edge_version)
-        co_return Outcome::Superseded;
+    // 2. Staleness gate.
+    {
+        auto iev = co_await load_indexed_edge_version(ev);
+        if (!iev) co_return std::unexpected(iev.error());
+        if (*iev >= live.edge_version) co_return Outcome::Superseded;
+    }
 
-    // 3. Model collection lookup + disabled-model treatment. A model
-    //    disabled between enqueue and claim is a legitimate operator
-    //    action; treat like NoEdge (complete-and-no-op) rather than
-    //    burning the retry budget.
-    auto coll_opt = co_await load_model_collection(ev.embedding_model_id);
-    if (!coll_opt) co_return std::unexpected(coll_opt.error());
-    if (!coll_opt->has_value())
-        co_return Outcome::ModelDisabled;
-    std::string collection = std::move(**coll_opt);
+    // 3. Model collection.
+    std::string collection;
+    {
+        auto r = co_await load_model_collection(ev.embedding_model_id, collection);
+        if (!r) co_return std::unexpected(r.error());
+        if (collection.empty()) co_return Outcome::ModelDisabled;
+    }
     auto chunk_store = store_for_collection_(collection);
     if (!chunk_store)
         co_return std::unexpected(Error::invalid_state(std::format(
             "no vector store bound to collection '{}' — route a worker for it",
             collection)));
 
-    // 4..9 in write_edge_vector() so this frame stays small.
+    // 4..9 in write_edge_vector().
     co_return co_await write_edge_vector(ev, live, collection, chunk_store);
 }
 
