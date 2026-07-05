@@ -103,6 +103,19 @@ std::string json_escape(std::string_view in)
 
 } // namespace
 
+namespace {
+// Response shape for POST /collections/{name}/points — used by
+// fetch_vectors_by_id. Kept at namespace scope so glaze reflection
+// can name it (local types in a coroutine frame don't work).
+struct QdrantPointRow {
+    std::string        id;
+    std::vector<float> vector;
+};
+struct QdrantPointsResp {
+    std::vector<QdrantPointRow> result;
+};
+} // anonymous namespace
+
 // ---------------------------------------------------------------------------
 // QdrantVectorStore helpers
 // ---------------------------------------------------------------------------
@@ -126,7 +139,7 @@ static std::string build_search_body(const Embedding&    query,
     std::string vec_json = "[";
     for (size_t i = 0; i < query.size(); ++i) {
         if (i) vec_json += ',';
-        vec_json += std::format("{:.8g}", query[i]);
+        vec_json += std::format("{:.9g}", query[i]);
     }
     vec_json += ']';
 
@@ -229,7 +242,7 @@ QdrantVectorStore::upsert(const std::vector<UpsertPoint>& points)
         std::string vec = "[";
         for (size_t i = 0; i < p.vector.size(); ++i) {
             if (i) vec += ',';
-            vec += std::format("{:.8g}", p.vector[i]);
+            vec += std::format("{:.9g}", p.vector[i]);
         }
         vec += ']';
 
@@ -336,6 +349,97 @@ QdrantVectorStore::delete_points_by_id(std::string_view                company_i
     co_return Result<void>{};
 }
 
+// Fetch vectors for a set of point IDs. Uses Qdrant's
+// POST /points body with `with_vector=true`; unknown ids are silently
+// omitted from the response (Qdrant behaviour), which matches the
+// port's documented contract.
+drogon::Task<Result<void>>
+QdrantVectorStore::fetch_vectors_by_id(
+    const std::vector<std::string>&                 point_ids,
+    std::vector<std::pair<std::string, Embedding>>& out)
+{
+    out.clear();
+    if (point_ids.empty())
+        co_return Result<void>{};
+
+    std::string ids_json = "[";
+    for (size_t i = 0; i < point_ids.size(); ++i) {
+        if (i) ids_json += ',';
+        ids_json += std::format("\"{}\"", point_ids[i]);
+    }
+    ids_json += ']';
+    std::string body = std::format(
+        R"({{"ids":{},"with_vector":true,"with_payload":false}})",
+        ids_json);
+
+    drogon::HttpResponsePtr resp;
+    try {
+        resp = co_await send(drogon::Post,
+                             std::format("/collections/{}/points", _collection),
+                             std::move(body));
+    } catch (const std::exception& ex) {
+        co_return std::unexpected(Error::unavailable(
+            std::format("qdrant fetch_vectors_by_id: {}", ex.what())));
+    }
+    if (static_cast<int>(resp->getStatusCode()) != 200) {
+        co_return std::unexpected(Error::unavailable(std::format(
+            "qdrant fetch_vectors_by_id returned {}",
+            static_cast<int>(resp->getStatusCode()))));
+    }
+
+    // Parse the response with glaze. Qdrant returns
+    //   { "result": [ {"id": "...", "vector": [ ... ]}, ... ], ... }
+    // Qdrant wraps every response with {"result": ..., "status": "ok",
+    // "time": ...}. Skip unknown keys so the strict-parse default does
+    // not fail on that envelope — the same shape applies to
+    // QdrantSearchResponse below.
+    QdrantPointsResp parsed;
+    if (auto err = glz::read<glz::opts{.error_on_unknown_keys = false}>(
+            parsed, resp->getBody()); err) {
+        co_return std::unexpected(Error::unavailable(std::format(
+            "qdrant fetch_vectors_by_id: response parse error: {}",
+            glz::format_error(err, resp->getBody()))));
+    }
+    out.reserve(parsed.result.size());
+    for (auto& p : parsed.result)
+        out.emplace_back(std::move(p.id), std::move(p.vector));
+    co_return Result<void>{};
+}
+
+// Upsert one point with a caller-built JSON payload. Used by the
+// EmbedEdgeWorker so the edge payload shape (edge_id, edge_type,
+// formula_version, ...) can be built without extending ChunkPayload.
+drogon::Task<Result<void>>
+QdrantVectorStore::upsert_raw(std::string_view point_id,
+                              const Embedding& vector,
+                              std::string      payload_json)
+{
+    std::string vec_json = "[";
+    for (size_t i = 0; i < vector.size(); ++i) {
+        if (i) vec_json += ',';
+        vec_json += std::format("{:.9g}", vector[i]);
+    }
+    vec_json += ']';
+    std::string body = std::format(
+        R"({{"points":[{{"id":"{}","vector":{},"payload":{}}}]}})",
+        json_escape(point_id), vec_json, payload_json);
+
+    drogon::HttpResponsePtr resp;
+    try {
+        resp = co_await send(drogon::Put,
+                             std::format("/collections/{}/points?wait=true", _collection),
+                             std::move(body));
+    } catch (const std::exception& ex) {
+        co_return std::unexpected(Error::unavailable(std::format(
+            "qdrant upsert_raw: {}", ex.what())));
+    }
+    if (static_cast<int>(resp->getStatusCode()) != 200)
+        co_return std::unexpected(Error::unavailable(std::format(
+            "qdrant upsert_raw returned {}",
+            static_cast<int>(resp->getStatusCode()))));
+    co_return Result<void>{};
+}
+
 drogon::Task<Result<void>>
 QdrantVectorStore::set_payload(std::string_view                company_id,
                                const std::vector<std::string>& point_ids,
@@ -439,8 +543,15 @@ QdrantVectorStore::search(const Embedding&    query,
                         static_cast<int>(resp->getStatusCode()))));
     }
 
+    // Qdrant wraps every response with {"result": ..., "status": "ok",
+    // "time": ...}. The pre-existing strict-parse would fail on that
+    // envelope; the bug never surfaced because production traffic
+    // always came back with a well-formed result payload the field
+    // shape matched, but any Qdrant version bump adding a top-level
+    // field would break search. Same fix as fetch_vectors_by_id above.
     QdrantSearchResponse parsed{};
-    if (auto err = glz::read_json(parsed, resp->getBody()); err) {
+    if (auto err = glz::read<glz::opts{.error_on_unknown_keys = false}>(
+            parsed, resp->getBody()); err) {
         co_return std::unexpected(Error::unavailable("qdrant search response parse failed"));
     }
 
@@ -501,6 +612,49 @@ NullVectorStore::delete_points_by_id(std::string_view company_id,
         if (p.payload.company_id != company_id) return false;
         return std::find(point_ids.begin(), point_ids.end(), p.id) != point_ids.end();
     });
+    // Also drop raw edge points that carry company_id in their payload_json.
+    std::erase_if(_raw_points, [&](const auto& kv) {
+        if (std::find(point_ids.begin(), point_ids.end(), kv.first) == point_ids.end())
+            return false;
+        return kv.second.find(std::format("\"company_id\":\"{}\"", company_id)) != std::string::npos;
+    });
+    // Vectors trailing removed raw points must also go.
+    std::erase_if(_raw_vectors, [&](const auto& kv) {
+        for (const auto& p : _raw_points) if (p.first == kv.first) return false;
+        return std::find(point_ids.begin(), point_ids.end(), kv.first) != point_ids.end();
+    });
+    co_return Result<void>{};
+}
+
+drogon::Task<Result<void>>
+NullVectorStore::fetch_vectors_by_id(
+    const std::vector<std::string>&                 point_ids,
+    std::vector<std::pair<std::string, Embedding>>& out)
+{
+    out.clear();
+    for (const auto& id : point_ids) {
+        for (const auto& p : _points)
+            if (p.id == id) { out.emplace_back(p.id, p.vector); break; }
+        for (const auto& e : _raw_vectors)
+            if (e.first == id) { out.emplace_back(e.first, e.second); break; }
+    }
+    co_return Result<void>{};
+}
+
+drogon::Task<Result<void>>
+NullVectorStore::upsert_raw(std::string_view point_id,
+                            const Embedding& vector,
+                            std::string      payload_json)
+{
+    const std::string id{point_id};
+    bool updated = false;
+    for (auto& e : _raw_points)
+        if (e.first == id) { e.second = std::move(payload_json); updated = true; break; }
+    if (!updated) _raw_points.emplace_back(id, std::move(payload_json));
+
+    for (auto& e : _raw_vectors)
+        if (e.first == id) { e.second = vector; co_return Result<void>{}; }
+    _raw_vectors.emplace_back(id, vector);
     co_return Result<void>{};
 }
 

@@ -5,6 +5,7 @@
 #include "wikore/rag/vector_store.hpp"
 #include "wikore/redis.hpp"
 #include "wikore/scheduler/edge_vector_cleanup_worker.hpp"
+#include "wikore/scheduler/embed_edge_worker.hpp"
 #include "wikore/scheduler/outbox_worker.hpp"
 #include "wikore/scheduler/partition_maintainer.hpp"
 #include "wikore/scheduler/polling_fallback.hpp"
@@ -58,7 +59,7 @@ std::atomic<bool> g_shutdown{false};
 std::atomic<bool> g_fatal_exit{false};
 
 // All workers must finish their drain path before drogon exits.
-std::atomic<int>  g_workers_remaining{5};
+std::atomic<int>  g_workers_remaining{6};
 
 void on_worker_exit(std::string_view name)
 {
@@ -238,6 +239,18 @@ int main()
             static wikore::scheduler::EdgeVectorCleanupWorker edge_cleanup(
                 db, edge_vec_store, shutdown,
                 wikore::scheduler::EdgeVectorCleanupWorker::Options{});
+            // Edge-vector indexing worker consumes qdrant_upsert_edge_vector
+            // events enqueued by V037's knowledge_edges_enqueue_upsert_fn
+            // trigger. Reads endpoint chunk vectors through the same
+            // store_for_collection resolver as ResyncWorker (per-model
+            // chunk collections) and writes edge vectors to
+            // cfg.qdrant_edge_collection with company_id in the payload —
+            // that stamp is what makes PR #53's tenant-scoped delete
+            // filter actually enforce something.
+            static wikore::scheduler::EmbedEdgeWorker embed_edge(
+                db, store_for_collection, edge_vec_store,
+                cfg.qdrant_edge_collection, shutdown,
+                wikore::scheduler::EmbedEdgeWorker::Options{});
             static wikore::scheduler::PollingFallback polling(
                 db, shutdown,
                 wikore::scheduler::PollingFallback::Options{});
@@ -269,6 +282,10 @@ int main()
             drogon::async_run([]() -> drogon::Task<void> {
                 co_await edge_cleanup.run();
                 on_worker_exit("edge-cleanup-worker");
+            });
+            drogon::async_run([]() -> drogon::Task<void> {
+                co_await embed_edge.run();
+                on_worker_exit("embed-edge-worker");
             });
             drogon::async_run([]() -> drogon::Task<void> {
                 co_await polling.run();
