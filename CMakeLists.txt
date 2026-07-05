@@ -153,6 +153,8 @@ add_library(wikore_rag STATIC
     src/rag/llm_provider_factory.cpp
     src/rag/knowledge_edge_repo.cpp
     src/domain/knowledge_edge.cpp
+    src/rag/edge_vector_formula.cpp
+    src/application/embed_type_vectors.cpp
 )
 target_link_libraries(wikore_rag PUBLIC wikore_core)
 
@@ -190,6 +192,7 @@ add_library(wikore_scheduler_lib STATIC
     src/scheduler/polling_fallback.cpp
     src/scheduler/partition_maintainer.cpp
     src/scheduler/edge_vector_cleanup_worker.cpp
+    src/scheduler/embed_edge_worker.cpp
 )
 # wikore_ingest_lib provides DocumentRepoPort::fetch_access_scopes, the
 # canonical live scope recompute the resync worker reuses (no duplicated SQL).

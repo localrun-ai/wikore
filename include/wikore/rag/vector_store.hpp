@@ -56,6 +56,36 @@ public:
     delete_points_by_id(std::string_view                company_id,
                         const std::vector<std::string>& point_ids) = 0;
 
+    // Retrieve the vectors for a set of point IDs. Used by the
+    // EmbedEdgeWorker to load endpoint chunk vectors when computing the
+    // edge-vector formula: it needs the raw vectors of the two endpoint
+    // chunks (identified by document_chunk_vectors.qdrant_point_id) to
+    // combine with the type vector.
+    //
+    // Missing ids simply do not appear in the result; callers must
+    // check membership. Empty point_ids returns an empty map without
+    // hitting Qdrant.
+    virtual drogon::Task<Result<std::vector<std::pair<std::string, Embedding>>>>
+    fetch_vectors_by_id(const std::vector<std::string>& point_ids) = 0;
+
+    // Upsert one edge-vector point with an arbitrary JSON payload.
+    // Used by the EmbedEdgeWorker: the edge payload shape (edge_id,
+    // edge_type, formula_version, edge_version, endpoints...) differs
+    // from ChunkPayload, and the worker builds the JSON directly so
+    // this port stays payload-agnostic on the write path.
+    //
+    // The caller is responsible for:
+    //   * building a well-formed JSON object body in payload_json
+    //     (must contain "company_id" so PR #53's tenant-scoped
+    //     delete_points_by_id filter matches);
+    //   * producing a deterministic point id (V037 5b-contract:
+    //     uuid_v5(edge + model + formula_version) — version-free so
+    //     upserts overwrite in place and never orphan old points).
+    virtual drogon::Task<Result<void>>
+    upsert_raw(std::string_view point_id,
+               const Embedding& vector,
+               std::string      payload_json) = 0;
+
     // Overwrite the ACL-relevant payload keys on an existing set of points
     // WITHOUT re-embedding (Qdrant set-payload, a merge on the named keys).
     // Used by the qdrant_resync_chunk_acl worker: when a grant/owner/move
@@ -102,6 +132,14 @@ public:
     drogon::Task<Result<void>>
     delete_points_by_id(std::string_view                company_id,
                         const std::vector<std::string>& point_ids) override;
+
+    drogon::Task<Result<std::vector<std::pair<std::string, Embedding>>>>
+    fetch_vectors_by_id(const std::vector<std::string>& point_ids) override;
+
+    drogon::Task<Result<void>>
+    upsert_raw(std::string_view point_id,
+               const Embedding& vector,
+               std::string      payload_json) override;
 
     drogon::Task<Result<void>>
     set_payload(std::string_view                company_id,
@@ -153,6 +191,14 @@ public:
     delete_points_by_id(std::string_view                company_id,
                         const std::vector<std::string>& point_ids) override;
 
+    drogon::Task<Result<std::vector<std::pair<std::string, Embedding>>>>
+    fetch_vectors_by_id(const std::vector<std::string>& point_ids) override;
+
+    drogon::Task<Result<void>>
+    upsert_raw(std::string_view point_id,
+               const Embedding& vector,
+               std::string      payload_json) override;
+
     drogon::Task<Result<void>>
     set_payload(std::string_view                company_id,
                 const std::vector<std::string>& point_ids,
@@ -181,8 +227,30 @@ public:
         return false;
     }
 
+    // Test introspection: raw payload JSON string, for edge points
+    // written via upsert_raw. Chunk points return an empty string.
+    std::string raw_payload_for(std::string_view point_id) const {
+        for (const auto& e : _raw_points)
+            if (e.first == point_id) return e.second;
+        return {};
+    }
+
+    // Test introspection: raw stored vector for a point (chunk or edge).
+    const Embedding* vector_for(std::string_view point_id) const {
+        for (const auto& p : _points)
+            if (p.id == point_id) return &p.vector;
+        for (const auto& e : _raw_vectors)
+            if (e.first == point_id) return &e.second;
+        return nullptr;
+    }
+
 private:
-    std::vector<UpsertPoint> _points;
+    std::vector<UpsertPoint>                                 _points;
+    // Edge points written via upsert_raw: id -> (payload_json, vector).
+    // Kept separate from _points because the payload shape differs
+    // (edge_id/edge_type/... instead of chunk_id/document_id/...).
+    std::vector<std::pair<std::string, std::string>>         _raw_points;
+    std::vector<std::pair<std::string, Embedding>>           _raw_vectors;
 };
 
 } // namespace wikore::rag
