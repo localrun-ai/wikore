@@ -147,6 +147,17 @@ private:
     drogon::Task<Result<rag::Embedding>>
     load_type_vector(const ClaimedEvent& ev);
 
+    // Final phase: read endpoint chunk vectors from Qdrant, compute
+    // formula v1, upsert the edge point, and update the bookkeeping
+    // row. Extracted so process() itself is a short flat sequence of
+    // co_awaits — GCC 14's coroutine emitter chokes on process()
+    // otherwise (see load_live_edge comment).
+    drogon::Task<Result<Outcome>>
+    write_edge_vector(const ClaimedEvent& ev,
+                      const LiveEdge&     live,
+                      const std::string&  collection,
+                      std::shared_ptr<rag::VectorStorePort> chunk_store);
+
     drogon::Task<Result<void>>
     upsert_bookkeeping(const ClaimedEvent& ev,
                        const std::string&  qdrant_point_id,

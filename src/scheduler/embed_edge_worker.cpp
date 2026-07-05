@@ -418,70 +418,34 @@ EmbedEdgeWorker::upsert_bookkeeping(const ClaimedEvent& ev,
 }
 
 // ---------------------------------------------------------------------------
-// Process one claimed event. Implements the V037 5b-contract:
-//   * skip-if-gone → Outcome::NoEdge, event marked completed;
-//   * disabled model → Outcome::ModelDisabled, event marked completed;
-//   * CAS on knowledge_edge_embeddings.indexed_edge_version →
-//     Outcome::Superseded when live edge_version <= stored;
-//   * otherwise compute formula v1 and upsert to Qdrant, then
-//     UPSERT the bookkeeping row.
-//
-// The orchestrator is a flat sequence of co_awaits with NO try/catch
-// around them — each helper has its own try/catch tight around one
-// DB round-trip and returns a Result. Same shape as
-// KnowledgeEdgeRepo::get()/list() after PR #54's GCC 14 fix.
+// write_edge_vector: the terminal phase of process(). Runs after the
+// live-edge/CAS/model preflight in process() has succeeded. Split into
+// its own coroutine because GCC 14 ICEs on the combined frame when the
+// full pipeline (six co_awaits + non-trivial locals across each) lives
+// in one function body. Same lesson as PR #54's get()/list() split.
 // ---------------------------------------------------------------------------
-
 drogon::Task<Result<EmbedEdgeWorker::Outcome>>
-EmbedEdgeWorker::process(const ClaimedEvent& ev)
+EmbedEdgeWorker::write_edge_vector(const ClaimedEvent& ev,
+                                   const LiveEdge&     live,
+                                   const std::string&  collection,
+                                   std::shared_ptr<rag::VectorStorePort> chunk_store)
 {
-    // 1. Live-edge probe.
-    auto live_opt = co_await load_live_edge(ev);
-    if (!live_opt) co_return std::unexpected(live_opt.error());
-    if (!live_opt->has_value())
-        co_return Outcome::NoEdge;
-    const LiveEdge& live = **live_opt;
-
-    // 2. Staleness gate — event's edge_version vs. stored
-    //    indexed_edge_version. Live edge_version is the tie-breaker
-    //    for concurrent workers: even if a stale (older) event wins
-    //    the claim, it observes the newer indexed_edge_version and
-    //    superseeds itself.
-    auto iev = co_await load_indexed_edge_version(ev);
-    if (!iev) co_return std::unexpected(iev.error());
-    // A stale event whose payload version is behind the live edge is
-    // still worth processing IF nothing has been indexed yet — that
-    // handles the very first upsert after a burst of enqueue events.
-    // But if the DB already has a newer indexed_edge_version, we are
-    // late; drop.
-    if (*iev >= live.edge_version)
-        co_return Outcome::Superseded;
-
-    // 3. Model collection lookup + disabled-model treatment.
-    auto coll_opt = co_await load_model_collection(ev.embedding_model_id);
-    if (!coll_opt) co_return std::unexpected(coll_opt.error());
-    if (!coll_opt->has_value())
-        // Model disabled between enqueue and claim — legitimate
-        // operator action, not something to retry. Complete-and-no-op.
-        co_return Outcome::ModelDisabled;
-    const std::string collection = **coll_opt;
-    auto chunk_store = store_for_collection_(collection);
-    if (!chunk_store)
-        co_return std::unexpected(Error::invalid_state(std::format(
-            "no vector store bound to collection '{}' — route a worker for it",
-            collection)));
-
     // 4. Endpoint point-id lookup + vector fetch from Qdrant.
     auto point_ids = co_await load_endpoint_point_ids(ev, live);
     if (!point_ids) co_return std::unexpected(point_ids.error());
-    const auto& [ep0_pid, ep1_pid] = *point_ids;
+    std::string ep0_pid, ep1_pid;
+    {
+        auto&& p = *point_ids;
+        ep0_pid = p.first;
+        ep1_pid = p.second;
+    }
     auto vecs = co_await chunk_store->fetch_vectors_by_id({ep0_pid, ep1_pid});
     if (!vecs) co_return std::unexpected(vecs.error());
     const rag::Embedding* v0 = nullptr;
     const rag::Embedding* v1 = nullptr;
-    for (const auto& [pid, vec] : *vecs) {
-        if (pid == ep0_pid) v0 = &vec;
-        if (pid == ep1_pid) v1 = &vec;
+    for (const auto& kv : *vecs) {
+        if (kv.first == ep0_pid) v0 = &kv.second;
+        if (kv.first == ep1_pid) v1 = &kv.second;
     }
     if (!v0 || !v1)
         co_return std::unexpected(Error::unavailable(std::format(
@@ -502,14 +466,8 @@ EmbedEdgeWorker::process(const ClaimedEvent& ev)
                                              ev.embedding_model_id,
                                              ev.formula_version);
 
-    // 8. Qdrant upsert.
-    //
-    // Every payload field the retrieval prefilter might key on
-    // (review_state, edge_version, edge_type, endpoints, authorities)
-    // is taken from the LIVE edge, not the event payload. A late-
-    // arriving stale event would still refuse the write above via the
-    // indexed_edge_version CAS, but even if that check missed, the
-    // payload it writes here matches current truth.
+    // 8. Qdrant upsert. Every payload field the retrieval prefilter
+    // might key on comes from the LIVE edge, not the event payload.
     std::string payload_json = std::format(
         R"({{"company_id":"{}","edge_id":"{}","edge_type":"{}",)"
         R"("formula_version":{},"edge_version":{},)"
@@ -519,16 +477,63 @@ EmbedEdgeWorker::process(const ClaimedEvent& ev)
         ev.formula_version, live.edge_version,
         live.ep0_chunk_id, live.ep1_chunk_id,
         live.auth0, live.auth1, live.review_state);
-    if (auto r = co_await edge_store_->upsert_raw(pid, *edge_vec, std::move(payload_json)); !r)
+    if (auto r = co_await edge_store_->upsert_raw(pid, *edge_vec,
+                                                  std::move(payload_json));
+        !r)
         co_return std::unexpected(r.error());
 
-    // 9. Bookkeeping — use live.edge_version, not ev.edge_version, so
-    //    the row we advertise as indexed matches what we actually
-    //    wrote to Qdrant.
+    // 9. Bookkeeping — live.edge_version so the row matches Qdrant.
     if (auto r = co_await upsert_bookkeeping(ev, pid, live.edge_version); !r)
         co_return std::unexpected(r.error());
 
+    (void)collection;   // reserved for tracing; keeps signature symmetric with process()
     co_return Outcome::Completed;
+}
+
+// ---------------------------------------------------------------------------
+// Process one claimed event. Preflight in process(), terminal write in
+// write_edge_vector(). Both stay small enough for GCC 14's coroutine
+// emitter to lay out the frame.
+// ---------------------------------------------------------------------------
+
+drogon::Task<Result<EmbedEdgeWorker::Outcome>>
+EmbedEdgeWorker::process(const ClaimedEvent& ev)
+{
+    // 1. Live-edge probe. Returns NoEdge if the edge was insert-and-
+    //    deleted in one transaction or admin-deleted between enqueue
+    //    and claim (V037 5b-contract note 1).
+    auto live_opt = co_await load_live_edge(ev);
+    if (!live_opt) co_return std::unexpected(live_opt.error());
+    if (!live_opt->has_value())
+        co_return Outcome::NoEdge;
+    LiveEdge live = std::move(**live_opt);
+
+    // 2. Staleness gate — event's edge_version vs. stored
+    //    indexed_edge_version. Concurrent workers cannot corrupt the
+    //    Qdrant point: even if a stale event wins the claim it sees
+    //    the newer indexed_edge_version and superseeds itself.
+    auto iev = co_await load_indexed_edge_version(ev);
+    if (!iev) co_return std::unexpected(iev.error());
+    if (*iev >= live.edge_version)
+        co_return Outcome::Superseded;
+
+    // 3. Model collection lookup + disabled-model treatment. A model
+    //    disabled between enqueue and claim is a legitimate operator
+    //    action; treat like NoEdge (complete-and-no-op) rather than
+    //    burning the retry budget.
+    auto coll_opt = co_await load_model_collection(ev.embedding_model_id);
+    if (!coll_opt) co_return std::unexpected(coll_opt.error());
+    if (!coll_opt->has_value())
+        co_return Outcome::ModelDisabled;
+    std::string collection = std::move(**coll_opt);
+    auto chunk_store = store_for_collection_(collection);
+    if (!chunk_store)
+        co_return std::unexpected(Error::invalid_state(std::format(
+            "no vector store bound to collection '{}' — route a worker for it",
+            collection)));
+
+    // 4..9 in write_edge_vector() so this frame stays small.
+    co_return co_await write_edge_vector(ev, live, collection, chunk_store);
 }
 
 drogon::Task<void>
