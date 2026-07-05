@@ -44,14 +44,19 @@ public:
     explicit RelationshipEvidenceGate(drogon::orm::DbClientPtr db)
         : db_(std::move(db)) {}
 
+    // No defaults on the security-gate signature. G1 makes callers pass
+    // lifecycle and deadline explicitly for exactly the same reason: an
+    // orchestrator that forgets the deadline gets an unbounded query on
+    // the request path, and a lifecycle default silently hides
+    // 'deprecated'/'archived' filtering decisions in the header.
     drogon::Task<Result<std::vector<AllowedRelationship>>>
     evaluate(std::string_view                    company_id,
              const AccessScope&                  scope,
              const std::vector<std::string>&     allowed_sensitivity_labels,
              const std::vector<std::string>&     allowed_review_states,
              const std::vector<EdgeCandidate>&   candidates,
-             const std::vector<std::string>&     lifecycle = {"active"},
-             postgres::Deadline                  deadline = postgres::no_deadline()) const;
+             const std::vector<std::string>&     lifecycle,
+             postgres::Deadline                  deadline) const;
 
 private:
     drogon::orm::DbClientPtr db_;

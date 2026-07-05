@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include "wikore/rag/relationship_evidence_gate.hpp"
+#include "wikore/adapters/postgres/deadline_exec.hpp"
 #include "wikore/db.hpp"
 #include <drogon/drogon.h>
 #include <drogon/utils/coroutine.h>
@@ -108,14 +109,22 @@ Seed seed(drogon::orm::DbClientPtr db)
 // Insert a knowledge_edges + endpoints pair via the same CTE the repo
 // uses (single statement so the deferred CONSTRAINT TRIGGER fires at
 // statement commit).
+//
+// When seeding a past expires_at (used to test expired-edge redaction),
+// created_at MUST also be stamped in the past — V034's CHECK enforces
+// expires_at IS NULL OR expires_at > created_at, and created_at
+// defaults to now(). Callers pass a matching created_at.
 std::string
 make_edge(drogon::orm::DbClientPtr db,
           const std::string& chunk0, const std::string& chunk1,
           const std::string& review_state = "accepted",
+          std::optional<std::string> created_at = std::nullopt,
           std::optional<std::string> expires_at = std::nullopt,
           std::optional<std::string> superseded_at = std::nullopt)
 {
     auto id = sync_scalar(db, "SELECT gen_random_uuid()");
+    const std::string cre_frag = created_at
+        ? std::format(",'{}'::timestamptz", *created_at) : ",DEFAULT";
     const std::string exp_frag = expires_at
         ? std::format(",'{}'::timestamptz", *expires_at) : ",NULL";
     const std::string sup_frag = superseded_at
@@ -124,9 +133,9 @@ make_edge(drogon::orm::DbClientPtr db,
         "WITH new_edge AS ( "
         "  INSERT INTO knowledge_edges "
         "    (id, company_id, edge_type, direction, confidence, origin, "
-        "     review_state, expires_at, superseded_at) "
+        "     review_state, created_at, expires_at, superseded_at) "
         "  VALUES ('{}','{}','implements','directed',0.9,'administrator', "
-        "          '{}' {} {}) "
+        "          '{}' {} {} {}) "
         "  RETURNING id, company_id "
         ") "
         "INSERT INTO knowledge_edge_endpoints "
@@ -134,7 +143,7 @@ make_edge(drogon::orm::DbClientPtr db,
         "SELECT company_id, id, 0, '{}'::uuid, 'source' FROM new_edge "
         "UNION ALL "
         "SELECT company_id, id, 1, '{}'::uuid, 'target' FROM new_edge",
-        id, CO_REL, review_state, exp_frag, sup_frag, chunk0, chunk1));
+        id, CO_REL, review_state, cre_frag, exp_frag, sup_frag, chunk0, chunk1));
     return id;
 }
 
@@ -160,7 +169,8 @@ wikore::AccessScope scope_of(const std::string& ou_id)
 
 std::vector<std::string> INTERNAL = {"internal"};
 std::vector<std::string> ACCEPTED = {"accepted"};
-std::vector<std::string> ACTIVE   = {"active"};
+// ACTIVE not used — the gate call sites pass their lifecycle inline
+// so the intent is visible at the site rather than hidden in a helper.
 
 } // namespace
 
@@ -176,7 +186,8 @@ TEST_CASE("RelationshipEvidenceGate: both endpoints visible → edge admitted wi
     wikore::rag::RelationshipEvidenceGate gate(db);
     auto result = drogon::sync_wait(gate.evaluate(
         CO_REL, scope_of(s.team_a), INTERNAL, ACCEPTED,
-        {cand(edge_id)}));
+        {cand(edge_id)},
+        std::vector<std::string>{"active"}, wikore::postgres::no_deadline()));
     REQUIRE(result.has_value());
     REQUIRE(result->size() == 1);
     const auto& r = (*result)[0];
@@ -208,7 +219,8 @@ TEST_CASE("RelationshipEvidenceGate: one endpoint invisible → whole edge redac
 
     wikore::rag::RelationshipEvidenceGate gate(db);
     auto result = drogon::sync_wait(gate.evaluate(
-        CO_REL, scope_of(s.team_a), INTERNAL, ACCEPTED, {cand(edge_id)}));
+        CO_REL, scope_of(s.team_a), INTERNAL, ACCEPTED, {cand(edge_id)},
+        std::vector<std::string>{"active"}, wikore::postgres::no_deadline()));
     REQUIRE(result.has_value());
     // Whole-relationship invariant: NOT partially hydrated, entirely dropped.
     CHECK(result->empty());
@@ -225,7 +237,8 @@ TEST_CASE("RelationshipEvidenceGate: expanded scope (both teams) admits the cros
     wikore::rag::RelationshipEvidenceGate gate(db);
     wikore::AccessScope scope{.org_unit_ids = {s.team_a, s.team_b}};
     auto result = drogon::sync_wait(gate.evaluate(
-        CO_REL, scope, INTERNAL, ACCEPTED, {cand(edge_id)}));
+        CO_REL, scope, INTERNAL, ACCEPTED, {cand(edge_id)},
+        std::vector<std::string>{"active"}, wikore::postgres::no_deadline()));
     REQUIRE(result.has_value());
     REQUIRE(result->size() == 1);
     CHECK((*result)[0].edge_id() == edge_id);
@@ -243,7 +256,8 @@ TEST_CASE("RelationshipEvidenceGate: review_state whitelist excludes non-accepte
     wikore::rag::RelationshipEvidenceGate gate(db);
     auto result = drogon::sync_wait(gate.evaluate(
         CO_REL, scope_of(s.team_a), INTERNAL, ACCEPTED,
-        {cand(accepted_id), cand(proposed_id)}));
+        {cand(accepted_id), cand(proposed_id)},
+        std::vector<std::string>{"active"}, wikore::postgres::no_deadline()));
     REQUIRE(result.has_value());
     REQUIRE(result->size() == 1);
     CHECK((*result)[0].edge_id() == accepted_id);
@@ -256,11 +270,13 @@ TEST_CASE("RelationshipEvidenceGate: expired edge is dropped",
     auto db = wikore::Db::get();
     auto s = seed(db);
     auto expired = make_edge(db, s.chunk_a, s.chunk_c, "accepted",
-                             std::string("2000-01-01T00:00:00Z"));
+                             /*created_at=*/std::string("1999-01-01T00:00:00Z"),
+                             /*expires_at=*/std::string("2000-01-01T00:00:00Z"));
 
     wikore::rag::RelationshipEvidenceGate gate(db);
     auto result = drogon::sync_wait(gate.evaluate(
-        CO_REL, scope_of(s.team_a), INTERNAL, ACCEPTED, {cand(expired)}));
+        CO_REL, scope_of(s.team_a), INTERNAL, ACCEPTED, {cand(expired)},
+        std::vector<std::string>{"active"}, wikore::postgres::no_deadline()));
     REQUIRE(result.has_value());
     CHECK(result->empty());
 }
@@ -278,7 +294,8 @@ TEST_CASE("RelationshipEvidenceGate: cross-tenant company_id returns nothing",
     // an edge that belongs to CO_REL.
     auto result = drogon::sync_wait(gate.evaluate(
         "ffffffff-ffff-ffff-ffff-fffffffffff1",
-        scope_of(s.team_a), INTERNAL, ACCEPTED, {cand(edge_id)}));
+        scope_of(s.team_a), INTERNAL, ACCEPTED, {cand(edge_id)},
+        std::vector<std::string>{"active"}, wikore::postgres::no_deadline()));
     REQUIRE(result.has_value());
     CHECK(result->empty());
 }
@@ -295,28 +312,32 @@ TEST_CASE("RelationshipEvidenceGate: empty inputs are fail-closed short-circuits
     // Empty scope.
     {
         auto r = drogon::sync_wait(gate.evaluate(
-            CO_REL, wikore::AccessScope{}, INTERNAL, ACCEPTED, {cand(edge_id)}));
+            CO_REL, wikore::AccessScope{}, INTERNAL, ACCEPTED, {cand(edge_id)},
+        std::vector<std::string>{"active"}, wikore::postgres::no_deadline()));
         REQUIRE(r.has_value());
         CHECK(r->empty());
     }
     // Empty clearance.
     {
         auto r = drogon::sync_wait(gate.evaluate(
-            CO_REL, scope_of(s.team_a), {}, ACCEPTED, {cand(edge_id)}));
+            CO_REL, scope_of(s.team_a), {}, ACCEPTED, {cand(edge_id)},
+        std::vector<std::string>{"active"}, wikore::postgres::no_deadline()));
         REQUIRE(r.has_value());
         CHECK(r->empty());
     }
     // Empty review-state whitelist.
     {
         auto r = drogon::sync_wait(gate.evaluate(
-            CO_REL, scope_of(s.team_a), INTERNAL, {}, {cand(edge_id)}));
+            CO_REL, scope_of(s.team_a), INTERNAL, {}, {cand(edge_id)},
+        std::vector<std::string>{"active"}, wikore::postgres::no_deadline()));
         REQUIRE(r.has_value());
         CHECK(r->empty());
     }
     // Empty candidate list.
     {
         auto r = drogon::sync_wait(gate.evaluate(
-            CO_REL, scope_of(s.team_a), INTERNAL, ACCEPTED, {}));
+            CO_REL, scope_of(s.team_a), INTERNAL, ACCEPTED, {},
+        std::vector<std::string>{"active"}, wikore::postgres::no_deadline()));
         REQUIRE(r.has_value());
         CHECK(r->empty());
     }
@@ -339,7 +360,8 @@ TEST_CASE("RelationshipEvidenceGate: score order is preserved across candidates"
         cand(e2, 0.95f), cand(e1, 0.80f), cand(e3, 0.60f),
     };
     auto result = drogon::sync_wait(gate.evaluate(
-        CO_REL, scope_of(s.team_a), INTERNAL, ACCEPTED, cands));
+        CO_REL, scope_of(s.team_a), INTERNAL, ACCEPTED, cands,
+        std::vector<std::string>{"active"}, wikore::postgres::no_deadline()));
     REQUIRE(result.has_value());
     REQUIRE(result->size() == 3);
     CHECK((*result)[0].edge_id() == e2);

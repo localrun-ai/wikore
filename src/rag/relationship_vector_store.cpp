@@ -28,6 +28,11 @@ struct EdgePayload {
     std::string  edge_type;
     int          formula_version    = 0;
     std::int64_t edge_version       = 0;
+    // Stamped by EmbedEdgeWorker from live knowledge_edges.confidence.
+    // Retrieval intents key the min_confidence Qdrant filter on this.
+    // (Absent = 0.0 which fails any positive floor, so a candidate
+    // written before this field was added is silently excluded.)
+    double       confidence         = 0.0;
     std::string  endpoint_0_chunk_id;
     std::string  endpoint_1_chunk_id;
     std::string  review_state;
@@ -216,12 +221,13 @@ NullRelationshipVectorStore::search(std::string_view                company_id,
     co_return out;
 }
 
-void NullRelationshipVectorStore::add(EdgeCandidate ec, double confidence)
+void NullRelationshipVectorStore::add(EdgeCandidate ec, double confidence,
+                                      std::string review_state)
 {
     _entries.push_back(Entry{
         .candidate    = std::move(ec),
         .confidence   = confidence,
-        .review_state = "accepted",   // sensible default; test harness may reseed
+        .review_state = std::move(review_state),
     });
 }
 

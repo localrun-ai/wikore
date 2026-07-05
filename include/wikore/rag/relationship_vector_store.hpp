@@ -110,7 +110,9 @@ public:
 
     // Test seed: add a candidate that will be returned by search() when
     // company_id + review_state + confidence all match the filter.
-    void add(EdgeCandidate ec, double confidence);
+    // review_state is exposed so step 7's tests can seed 'proposed' or
+    // other non-accepted entries alongside 'accepted' ones.
+    void add(EdgeCandidate ec, double confidence, std::string review_state = "accepted");
 
 private:
     struct Entry {
