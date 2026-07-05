@@ -37,6 +37,17 @@ public:
     delete_by_version(std::string_view company_id,
                       std::string_view document_version_id) = 0;
 
+    // Delete an explicit set of points by their Qdrant point IDs. Idempotent:
+    // Qdrant's POST /points/delete with a points list treats missing IDs as
+    // no-ops. Used by the qdrant_delete_edge_points outbox consumer: V034's
+    // BEFORE DELETE trigger on knowledge_edges captures every affected
+    // qdrant_point_id into an outbox payload before ON DELETE CASCADE removes
+    // the knowledge_edge_embeddings rows, so this worker can never look them
+    // up by joining live tables. Empty point_ids is a no-op.
+    virtual drogon::Task<Result<void>>
+    delete_points_by_id(std::string_view                company_id,
+                        const std::vector<std::string>& point_ids) = 0;
+
     // Overwrite the ACL-relevant payload keys on an existing set of points
     // WITHOUT re-embedding (Qdrant set-payload, a merge on the named keys).
     // Used by the qdrant_resync_chunk_acl worker: when a grant/owner/move
@@ -79,6 +90,10 @@ public:
     drogon::Task<Result<void>>
     delete_by_version(std::string_view company_id,
                       std::string_view document_version_id) override;
+
+    drogon::Task<Result<void>>
+    delete_points_by_id(std::string_view                company_id,
+                        const std::vector<std::string>& point_ids) override;
 
     drogon::Task<Result<void>>
     set_payload(std::string_view                company_id,
@@ -127,6 +142,10 @@ public:
                       std::string_view document_version_id) override;
 
     drogon::Task<Result<void>>
+    delete_points_by_id(std::string_view                company_id,
+                        const std::vector<std::string>& point_ids) override;
+
+    drogon::Task<Result<void>>
     set_payload(std::string_view                company_id,
                 const std::vector<std::string>& point_ids,
                 const PayloadPatch&             patch) override;
@@ -145,6 +164,13 @@ public:
         for (const auto& p : _points)
             if (p.id == point_id) return &p.payload;
         return nullptr;
+    }
+
+    // Test introspection: whether a point with this id currently exists.
+    bool contains(std::string_view point_id) const {
+        for (const auto& p : _points)
+            if (p.id == point_id) return true;
+        return false;
     }
 
 private:

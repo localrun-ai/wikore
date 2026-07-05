@@ -288,6 +288,45 @@ QdrantVectorStore::delete_by_version(std::string_view company_id,
     co_return Result<void>{};
 }
 
+// Explicit-id delete: Qdrant accepts `{"points": ["id1", "id2", ...]}` as the
+// body of POST /points/delete. This is idempotent — a missing id is a no-op
+// on the Qdrant side, matching the outbox retry semantics.
+drogon::Task<Result<void>>
+QdrantVectorStore::delete_points_by_id(std::string_view                company_id,
+                                       const std::vector<std::string>& point_ids)
+{
+    (void)company_id; // reserved for cross-tenant sanity checks; point IDs
+                      // are uuid_v5-derived and globally unique per model.
+    if (point_ids.empty())
+        co_return Result<void>{};
+
+    std::string body = R"({"points":[)";
+    for (size_t i = 0; i < point_ids.size(); ++i) {
+        if (i) body += ',';
+        body += std::format("\"{}\"", point_ids[i]);
+    }
+    body += "]}";
+
+    drogon::HttpResponsePtr resp;
+    try {
+        // wait=true so a downstream reader observing the outbox event as
+        // 'completed' cannot then see the point in Qdrant.
+        resp = co_await send(drogon::Post,
+                             std::format("/collections/{}/points/delete?wait=true", _collection),
+                             std::move(body));
+    } catch (const std::exception& ex) {
+        co_return std::unexpected(
+            Error::unavailable(std::format("qdrant delete_points_by_id: {}", ex.what())));
+    }
+
+    if (static_cast<int>(resp->getStatusCode()) != 200) {
+        co_return std::unexpected(Error::unavailable(
+            std::format("qdrant delete_points_by_id returned {}",
+                        static_cast<int>(resp->getStatusCode()))));
+    }
+    co_return Result<void>{};
+}
+
 drogon::Task<Result<void>>
 QdrantVectorStore::set_payload(std::string_view                company_id,
                                const std::vector<std::string>& point_ids,
@@ -435,6 +474,18 @@ NullVectorStore::delete_by_version(std::string_view company_id,
     std::erase_if(_points, [&](const UpsertPoint& p) {
         return p.payload.company_id         == company_id
             && p.payload.document_version_id == document_version_id;
+    });
+    co_return Result<void>{};
+}
+
+drogon::Task<Result<void>>
+NullVectorStore::delete_points_by_id(std::string_view /*company_id*/,
+                                     const std::vector<std::string>& point_ids)
+{
+    if (point_ids.empty())
+        co_return Result<void>{};
+    std::erase_if(_points, [&](const UpsertPoint& p) {
+        return std::find(point_ids.begin(), point_ids.end(), p.id) != point_ids.end();
     });
     co_return Result<void>{};
 }

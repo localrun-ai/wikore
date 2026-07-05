@@ -187,6 +187,7 @@ add_library(wikore_scheduler_lib STATIC
     src/scheduler/resync_worker.cpp
     src/scheduler/polling_fallback.cpp
     src/scheduler/partition_maintainer.cpp
+    src/scheduler/edge_vector_cleanup_worker.cpp
 )
 # wikore_ingest_lib provides DocumentRepoPort::fetch_access_scopes, the
 # canonical live scope recompute the resync worker reuses (no duplicated SQL).

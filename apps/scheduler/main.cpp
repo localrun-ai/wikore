@@ -4,6 +4,7 @@
 #include "wikore/rag/embedder.hpp"
 #include "wikore/rag/vector_store.hpp"
 #include "wikore/redis.hpp"
+#include "wikore/scheduler/edge_vector_cleanup_worker.hpp"
 #include "wikore/scheduler/outbox_worker.hpp"
 #include "wikore/scheduler/partition_maintainer.hpp"
 #include "wikore/scheduler/polling_fallback.hpp"
@@ -57,7 +58,7 @@ std::atomic<bool> g_shutdown{false};
 std::atomic<bool> g_fatal_exit{false};
 
 // All workers must finish their drain path before drogon exits.
-std::atomic<int>  g_workers_remaining{4};
+std::atomic<int>  g_workers_remaining{5};
 
 void on_worker_exit(std::string_view name)
 {
@@ -229,6 +230,14 @@ int main()
             static wikore::scheduler::ResyncWorker resync(
                 db, store_for_collection, doc_repo, shutdown,
                 wikore::scheduler::ResyncWorker::Options{});
+            // Edge-cleanup worker consumes qdrant_delete_edge_points events
+            // enqueued by V034's BEFORE DELETE trigger on knowledge_edges.
+            // Uses its own QdrantVectorStore bound to the edge collection.
+            auto edge_vec_store = std::make_shared<wikore::rag::QdrantVectorStore>(
+                cfg.qdrant_url, cfg.qdrant_edge_collection);
+            static wikore::scheduler::EdgeVectorCleanupWorker edge_cleanup(
+                db, edge_vec_store, shutdown,
+                wikore::scheduler::EdgeVectorCleanupWorker::Options{});
             static wikore::scheduler::PollingFallback polling(
                 db, shutdown,
                 wikore::scheduler::PollingFallback::Options{});
@@ -256,6 +265,10 @@ int main()
             drogon::async_run([]() -> drogon::Task<void> {
                 co_await resync.run();
                 on_worker_exit("resync-worker");
+            });
+            drogon::async_run([]() -> drogon::Task<void> {
+                co_await edge_cleanup.run();
+                on_worker_exit("edge-cleanup-worker");
             });
             drogon::async_run([]() -> drogon::Task<void> {
                 co_await polling.run();
