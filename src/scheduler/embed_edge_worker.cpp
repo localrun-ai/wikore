@@ -232,6 +232,7 @@ EmbedEdgeWorker::load_live_edge(const ClaimedEvent& ev, LiveEdge& out)
             SELECT e.edge_type::text                     AS edge_type,
                    e.review_state::text                  AS review_state,
                    e.edge_version::bigint                AS edge_version,
+                   e.confidence::float8                  AS confidence,
                    ep0.chunk_id::text                    AS ep0_chunk_id,
                    ep1.chunk_id::text                    AS ep1_chunk_id,
                    COALESCE(d0.authority_level, 50)      AS auth0,
@@ -260,6 +261,7 @@ EmbedEdgeWorker::load_live_edge(const ClaimedEvent& ev, LiveEdge& out)
     out.edge_type    = rows[0]["edge_type"].as<std::string>();
     out.review_state = rows[0]["review_state"].as<std::string>();
     out.edge_version = rows[0]["edge_version"].as<std::int64_t>();
+    out.confidence   = rows[0]["confidence"].as<double>();
     out.ep0_chunk_id = rows[0]["ep0_chunk_id"].as<std::string>();
     out.ep1_chunk_id = rows[0]["ep1_chunk_id"].as<std::string>();
     out.auth0        = rows[0]["auth0"].as<int>();
@@ -530,10 +532,12 @@ EmbedEdgeWorker::apply_edge_vector(const ClaimedEvent& ev,
         std::string payload_json = std::format(
             R"({{"company_id":"{}","edge_id":"{}","edge_type":"{}",)"
             R"("formula_version":{},"edge_version":{},)"
+            R"("confidence":{:.6f},)"
             R"("endpoint_0_chunk_id":"{}","endpoint_1_chunk_id":"{}",)"
             R"("authority_0":{},"authority_1":{},"review_state":"{}"}})",
             ev.company_id, ev.edge_id, live.edge_type,
             ev.formula_version, live.edge_version,
+            live.confidence,
             live.ep0_chunk_id, live.ep1_chunk_id,
             live.auth0, live.auth1, live.review_state);
         auto r = co_await edge_store_->upsert_raw(point_id, edge_vec, std::move(payload_json));

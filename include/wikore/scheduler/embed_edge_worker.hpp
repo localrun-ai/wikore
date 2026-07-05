@@ -115,6 +115,11 @@ private:
         std::string  edge_type;
         std::string  review_state;
         std::int64_t edge_version = 0;
+        // knowledge_edges.confidence (NUMERIC in [0,1]) — read live so
+        // the Qdrant payload's `confidence` filter is grounded on
+        // whatever the admin/reviewer last set, not the enqueue-time
+        // snapshot. Retrieval intents key on this floor.
+        double       confidence   = 0.0;
         std::string  ep0_chunk_id;
         std::string  ep1_chunk_id;
         int          auth0 = 50;
