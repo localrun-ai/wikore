@@ -14,6 +14,13 @@ struct Config {
 
     // Qdrant
     std::string qdrant_url     = "http://localhost:6333";
+    // Qdrant collection holding BaryGraph Lite edge vectors. The edge-cleanup
+    // worker deletes points from this collection when knowledge_edges rows
+    // are removed (V034 outbox). The collection itself is created by the
+    // edge-vector indexing pipeline (BaryGraph Lite step 5); until then the
+    // worker's delete calls are no-ops against an empty collection, which
+    // is fine — Qdrant treats missing ids as no-ops.
+    std::string qdrant_edge_collection = "wikore_edges_v1";
 
     // LLM (OpenAI-compatible: llama-server or cloud)
     std::string llm_base_url   = "http://localhost:8080/v1";
@@ -60,6 +67,7 @@ struct Config {
         e("PARTITION_DATABASE_URL", c.partition_database_url);
         e("REDIS_URL",         c.redis_url);
         e("QDRANT_URL",        c.qdrant_url);
+        e("QDRANT_EDGE_COLLECTION", c.qdrant_edge_collection);
         e("LLM_BASE_URL",      c.llm_base_url);
         e("LLM_MODEL",         c.llm_model);
         e("EMBED_BASE_URL",    c.embed_base_url);

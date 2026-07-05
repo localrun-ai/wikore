@@ -18,6 +18,7 @@ add_executable(wikore_tests
     test_clearance.cpp
     test_retrieval_orchestrator.cpp
     test_resync_worker.cpp
+    test_edge_vector_cleanup_worker.cpp
     test_wiki_query_handler.cpp
     test_me_handler.cpp
     test_orgs_tree_handler.cpp
