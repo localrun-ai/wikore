@@ -9,6 +9,7 @@
 #include "wikore/rag/vector_store.hpp"          // QdrantVectorStore
 #include "wikore/rag/evidence_gate.hpp"         // EvidenceGate
 #include "wikore/rag/retrieval_orchestrator.hpp"
+#include "wikore/rag/knowledge_edge_repo.hpp"
 #include "handlers.hpp"
 
 #include <drogon/drogon.h>
@@ -66,6 +67,7 @@ int main() {
     // -----------------------------------------------------------------------
     struct RagDeps {
         std::shared_ptr<wikore::rag::RetrievalOrchestrator> orch;
+        std::shared_ptr<wikore::rag::KnowledgeEdgeRepo>     edge_repo;
         drogon::orm::DbClientPtr                            db;
     };
     auto deps = std::make_shared<RagDeps>();
@@ -81,6 +83,7 @@ int main() {
         deps->db   = db;
         deps->orch = std::make_shared<wikore::rag::RetrievalOrchestrator>(
             embedder, resolver, vector_store, wikore::rag::EvidenceGate(db));
+        deps->edge_repo = std::make_shared<wikore::rag::KnowledgeEdgeRepo>(db);
         spdlog::info("[wikore] RAG read path ready");
     });
 
@@ -256,6 +259,66 @@ int main() {
     drogon::app().registerHandler("/api/admin/users",
         [](const Req&, CB&& cb) { cb(not_implemented()); },
         {drogon::Get, drogon::Post, "wikore::AuthFilter", "wikore::AdminFilter"});
+
+    // -----------------------------------------------------------------------
+    // Admin: knowledge edges (BaryGraph Lite)
+    // -----------------------------------------------------------------------
+    auto admin_edges_guard = [deps](CB& cb) -> bool {
+        if (!deps->edge_repo) {   // before beginning advice populated it
+            auto r = drogon::HttpResponse::newHttpResponse();
+            r->setStatusCode(drogon::k503ServiceUnavailable);
+            r->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+            r->setBody(R"({"error":"service starting"})");
+            cb(r);
+            return false;
+        }
+        return true;
+    };
+
+    drogon::app().registerHandler("/api/admin/edges",
+        [deps, admin_edges_guard](Req req, CB cb) -> drogon::AsyncTask {
+            if (!admin_edges_guard(cb)) co_return;
+            auto resp = co_await wikore::api::edges_create(
+                deps->edge_repo, deps->db, std::move(req));
+            cb(resp);
+        },
+        {drogon::Post, "wikore::AuthFilter", "wikore::AdminFilter"});
+
+    drogon::app().registerHandler("/api/admin/edges",
+        [deps, admin_edges_guard](Req req, CB cb) -> drogon::AsyncTask {
+            if (!admin_edges_guard(cb)) co_return;
+            auto resp = co_await wikore::api::edges_list(
+                deps->edge_repo, deps->db, std::move(req));
+            cb(resp);
+        },
+        {drogon::Get, "wikore::AuthFilter", "wikore::AdminFilter"});
+
+    drogon::app().registerHandler("/api/admin/edges/{1}",
+        [deps, admin_edges_guard](Req req, CB cb, std::string edge_id) -> drogon::AsyncTask {
+            if (!admin_edges_guard(cb)) co_return;
+            auto resp = co_await wikore::api::edges_get(
+                deps->edge_repo, deps->db, std::move(req), std::move(edge_id));
+            cb(resp);
+        },
+        {drogon::Get, "wikore::AuthFilter", "wikore::AdminFilter"});
+
+    drogon::app().registerHandler("/api/admin/edges/{1}",
+        [deps, admin_edges_guard](Req req, CB cb, std::string edge_id) -> drogon::AsyncTask {
+            if (!admin_edges_guard(cb)) co_return;
+            auto resp = co_await wikore::api::edges_update(
+                deps->edge_repo, deps->db, std::move(req), std::move(edge_id));
+            cb(resp);
+        },
+        {drogon::HttpMethod::Patch, "wikore::AuthFilter", "wikore::AdminFilter"});
+
+    drogon::app().registerHandler("/api/admin/edges/{1}",
+        [deps, admin_edges_guard](Req req, CB cb, std::string edge_id) -> drogon::AsyncTask {
+            if (!admin_edges_guard(cb)) co_return;
+            auto resp = co_await wikore::api::edges_delete(
+                deps->edge_repo, deps->db, std::move(req), std::move(edge_id));
+            cb(resp);
+        },
+        {drogon::Delete, "wikore::AuthFilter", "wikore::AdminFilter"});
 
     // -----------------------------------------------------------------------
     // Server config

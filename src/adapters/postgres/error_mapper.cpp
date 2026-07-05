@@ -14,6 +14,12 @@ constexpr std::string_view SQLSTATE_DEADLOCK               = "40P01";
 constexpr std::string_view SQLSTATE_FK_VIOLATION           = "23503";
 constexpr std::string_view SQLSTATE_NOT_NULL_VIOLATION     = "23502";
 constexpr std::string_view SQLSTATE_QUERY_CANCELED         = "57014";
+// User-input formatting failures — client sent an ill-formed literal that
+// hit a ::uuid, ::jsonb, ::timestamptz, ::numeric etc. cast. Surface as 400,
+// not 500, so callers get an actionable message instead of alert noise.
+constexpr std::string_view SQLSTATE_INVALID_TEXT_REPR      = "22P02";
+constexpr std::string_view SQLSTATE_INVALID_DATETIME_FMT   = "22007";
+constexpr std::string_view SQLSTATE_INVALID_JSON_TEXT      = "22032";
 
 // Maps named CHECK / UNIQUE constraints (and unique-index constraint names) to
 // typed domain Errors. The pg_constraint introspection test
@@ -161,6 +167,16 @@ const std::unordered_map<std::string, Error> k_constraint_map = {
     // Edge UUID reuse rejection — recreating an edge with a previously-deleted UUID.
     {"knowledge_edges_no_uuid_reuse",
         Error::conflict("knowledge_edges UUID has prior history; UUIDs cannot be reused after delete")},
+    // Endpoint FK to document_chunks. Composite `(company_id, chunk_id)`
+    // means a nonexistent chunk id AND a cross-tenant chunk id both hit
+    // this FK; either way it is admin input, not a server bug.
+    {"knowledge_edge_endpoints_company_id_chunk_id_fkey",
+        Error::invalid_input("endpoint chunk does not exist in this tenant")},
+    // Endpoint FK to knowledge_edges. Same composite pattern; a mismatch
+    // between the endpoint's edge_id and its parent's (company_id, id)
+    // pair means the caller referenced an edge in a different tenant.
+    {"knowledge_edge_endpoints_company_id_edge_id_fkey",
+        Error::invalid_input("endpoint references an edge that does not exist in this tenant")},
     // V036: privileged access sessions (BaryGraph Lite)
     {"privileged_access_sessions_purpose_check",
         Error::invalid_input("privileged_access_session purpose must be at least 10 characters")},
@@ -426,6 +442,25 @@ Error map_db_exception(const drogon::orm::DrogonDbException& ex) {
 
     if (sqlstate == SQLSTATE_NOT_NULL_VIOLATION)
         return Error::invalid_input("required field is missing: " + msg);
+
+    // Text-format / cast failures triggered by user-supplied literals.
+    // Kept below constraint and FK dispatch so a named constraint still
+    // wins — but a bare ill-formed UUID / timestamp / JSON must return
+    // 400, not 500.
+    //
+    // Pipeline mode (PgBatchConnection) surfaces some of these errors as
+    // plain DrogonDbException with no SQLSTATE — same limitation as the
+    // 57014 statement-timeout branch above. Fall back to matching the
+    // stable Postgres message text; text-to-type cast failures are by
+    // construction literal-input-driven, so the risk of misclassifying
+    // an internal bug as a 400 is the same tradeoff the file already
+    // accepted for the timeout match.
+    if (sqlstate == SQLSTATE_INVALID_TEXT_REPR
+        || sqlstate == SQLSTATE_INVALID_DATETIME_FMT
+        || sqlstate == SQLSTATE_INVALID_JSON_TEXT
+        || msg.find("invalid input syntax for type") != std::string::npos
+        || msg.find("date/time field value out of range") != std::string::npos)
+        return Error::invalid_input("input has an invalid format: " + msg);
 
     return Error::database_error("database error [" + sqlstate + "]: " + msg);
 }
