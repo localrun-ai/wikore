@@ -151,6 +151,8 @@ add_library(wikore_rag STATIC
     src/rag/llm_provider_openai.cpp
     src/rag/llm_provider_anthropic.cpp
     src/rag/llm_provider_factory.cpp
+    src/rag/knowledge_edge_repo.cpp
+    src/domain/knowledge_edge.cpp
 )
 target_link_libraries(wikore_rag PUBLIC wikore_core)
 

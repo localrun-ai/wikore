@@ -1,5 +1,6 @@
 #pragma once
 #include "wikore/rag/retrieval_orchestrator.hpp"
+#include "wikore/rag/knowledge_edge_repo.hpp"
 #include <drogon/HttpRequest.h>
 #include <drogon/HttpResponse.h>
 #include <drogon/orm/DbClient.h>
@@ -59,5 +60,52 @@ orgs_tree(drogon::orm::DbClientPtr db, drogon::HttpRequestPtr req);
 drogon::Task<drogon::HttpResponsePtr>
 org_get(drogon::orm::DbClientPtr db, drogon::HttpRequestPtr req,
         std::string org_unit_id);
+
+// -------------------- Admin: knowledge edges (BaryGraph Lite V034) --------
+//
+// All routes below sit behind BOTH AuthFilter and AdminFilter. Tenant is
+// resolved from the authenticated (admin) user; the URL never carries a
+// company_id. The KnowledgeEdgeRepo is passed in by shared_ptr from the
+// startup wiring in apps/api/main.cpp so the handlers can be constructed
+// lazily against the same DbClient used by the retrieval path.
+//
+// Endpoint immutability (V034 trigger) is respected at the type level:
+// the update handler only exposes the mutable field set (confidence,
+// review_state, provenance, expires_at). Adding a new endpoint requires
+// deleting and recreating the edge.
+
+// POST /api/admin/edges — create an admin-authored chunk-to-chunk edge.
+drogon::Task<drogon::HttpResponsePtr>
+edges_create(std::shared_ptr<rag::KnowledgeEdgeRepo> repo,
+             drogon::orm::DbClientPtr                db,
+             drogon::HttpRequestPtr                  req);
+
+// GET /api/admin/edges/{edge_id} — single edge by id.
+drogon::Task<drogon::HttpResponsePtr>
+edges_get(std::shared_ptr<rag::KnowledgeEdgeRepo> repo,
+          drogon::orm::DbClientPtr                db,
+          drogon::HttpRequestPtr                  req,
+          std::string                             edge_id);
+
+// GET /api/admin/edges?edge_type=&review_state=&chunk_id=&limit=&offset=
+drogon::Task<drogon::HttpResponsePtr>
+edges_list(std::shared_ptr<rag::KnowledgeEdgeRepo> repo,
+           drogon::orm::DbClientPtr                db,
+           drogon::HttpRequestPtr                  req);
+
+// PATCH /api/admin/edges/{edge_id} — update mutable fields only.
+drogon::Task<drogon::HttpResponsePtr>
+edges_update(std::shared_ptr<rag::KnowledgeEdgeRepo> repo,
+             drogon::orm::DbClientPtr                db,
+             drogon::HttpRequestPtr                  req,
+             std::string                             edge_id);
+
+// DELETE /api/admin/edges/{edge_id} — cascades to endpoints/embeddings,
+// enqueues qdrant_delete_edge_points via the V034 BEFORE DELETE trigger.
+drogon::Task<drogon::HttpResponsePtr>
+edges_delete(std::shared_ptr<rag::KnowledgeEdgeRepo> repo,
+             drogon::orm::DbClientPtr                db,
+             drogon::HttpRequestPtr                  req,
+             std::string                             edge_id);
 
 } // namespace wikore::api
