@@ -24,18 +24,52 @@
 --     (formula_version, edge_type, embedding_model_id)
 --   * fixed weights w_ep = 0.65, w_type = 0.35 for formula_version = 1
 --
--- Point ID stability follows the doc's uuid_v5 spec:
---   uuid_v5(edge_id + ':' + embedding_model_id + ':' + formula_version
---         + ':' + edge_version)
--- The scheduler is responsible for computing this; the trigger only
--- names which edge_version is authoritative at the enqueue moment.
+-- Point-ID formula for 5b (upsert-in-place, no orphans):
+--   qdrant_point_id = uuid_v5(
+--       edge_id + ':' + embedding_model_id + ':' + formula_version)
+--   (NOT edge_version — see the orphan-avoidance note below.)
 --
--- Every edge INSERT (via the parent CONSTRAINT TRIGGER path from V034)
--- and every UPDATE that bumps edge_version enqueues one upsert event
--- per enabled embedding_model. Retrieval-safety before the worker runs
--- is preserved because EvidenceGate never trusts Qdrant for
--- authorization — a stale (or missing) point is a recall issue, not a
--- leak.
+-- edge_version is carried in the outbox payload as a STALENESS GUARD,
+-- not as an input to the point ID. The 5b worker:
+--   * skips events whose payload.edge_version <= knowledge_edge_
+--     embeddings.indexed_edge_version (out-of-order redelivery guard);
+--   * on write, upserts the SAME qdrant_point_id in place and updates
+--     knowledge_edge_embeddings.indexed_edge_version to the payload's
+--     value.
+-- If edge_version were part of the point ID, every bump would create
+-- a NEW Qdrant point ID; knowledge_edge_embeddings (keyed on
+-- (edge_id, embedding_model_id)) only holds the latest, and V034's
+-- BEFORE DELETE trigger can then only ever emit the current point ID
+-- into the qdrant_delete_edge_points event — every previous version's
+-- point would become a permanent orphan invisible to cleanup. Keeping
+-- the point ID version-free and treating edge_version as a monotonic
+-- write-side guard fixes both the ordering hazard and the orphan risk
+-- with no extra Qdrant calls.
+--
+-- Retrieval-safety before the 5b worker runs is preserved because
+-- EvidenceGate never trusts Qdrant for authorization — a stale (or
+-- missing) point is a recall issue, not a leak.
+--
+-- Two 5b-contract notes worth writing down here so the worker author
+-- has them in one place:
+--
+--   1. Upsert events can outlive their edge. An INSERT + DELETE within
+--      one transaction still enqueues at least one upsert event (the
+--      AFTER INSERT trigger fires and the outbox row commits with the
+--      transaction), but by the time the worker runs the edge is
+--      gone. Similarly, an admin DELETE can happen between enqueue and
+--      claim. The worker MUST treat "edge no longer exists" as
+--      complete-and-no-op, not as an error — the V034 delete path
+--      already owns Qdrant cleanup via qdrant_delete_edge_points.
+--
+--   2. Re-enabling a previously-disabled embedding model does NOT
+--      backfill existing edges through this trigger. The trigger only
+--      fires on knowledge_edges INSERT/UPDATE, and it enumerates
+--      currently-enabled models at that moment. Existing edges will
+--      only reindex on their next edge_version bump. A model-enable
+--      resync is a separate future job (bulk-emit one upsert event
+--      per (edge, newly-enabled model) for the affected tenant), not
+--      something this trigger will notice.
 
 -- ---------------------------------------------------------------------------
 -- edge_type_vectors — per-(formula_version, edge_type, embedding_model)
@@ -149,11 +183,16 @@ BEGIN
 END;
 $$;
 
--- Trigger fires AFTER INSERT/UPDATE and reads freshly-committed state.
--- The V034 parent CONSTRAINT TRIGGER (which asserts two endpoints and
--- writes initial history) runs at COMMIT via DEFERRABLE INITIALLY
--- DEFERRED, so this AFTER INSERT sees a valid edge with endpoints
--- present.
+-- Trigger fires AFTER INSERT/UPDATE at end-of-statement (NOT at COMMIT
+-- — non-deferred AFTER ROW triggers do not wait for the transaction
+-- to commit). The trigger function reads only NEW plus the
+-- embedding_models registry, so it does not depend on endpoints being
+-- observable through it: the V034 endpoints CONSTRAINT TRIGGER is
+-- deferred to COMMIT for its two-endpoint assertion, but this one has
+-- no such dependency. If the enclosing transaction aborts (e.g. the
+-- endpoints check fires at COMMIT and fails), the outbox rows this
+-- trigger wrote also roll back with it, so we never enqueue events
+-- for edges that never committed.
 CREATE TRIGGER knowledge_edges_enqueue_upsert_insert
     AFTER INSERT ON knowledge_edges
     FOR EACH ROW EXECUTE FUNCTION knowledge_edges_enqueue_upsert_fn();

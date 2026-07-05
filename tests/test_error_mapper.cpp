@@ -201,8 +201,9 @@ const std::unordered_set<std::string> k_allowlist = {
     // Empty vector CHECK — inserting a zero-dim vector is a bug in the
     // admin embed job, not user input.
     "edge_type_vectors_vector_dim_positive_chk",
-    // Inline description length CHECK — same rationale.
-    "edge_type_vectors_check",
+    // Column-level description length CHECK — PG names it
+    // <table>_<column>_check, not <table>_check.
+    "edge_type_vectors_description_check",
     // PK on (formula_version, edge_type, embedding_model_id) — a
     // duplicate is a bug in the admin embed job (should upsert instead
     // of inserting twice).

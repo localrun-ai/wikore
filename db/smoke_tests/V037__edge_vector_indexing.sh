@@ -198,6 +198,37 @@ COUNT=$(sql "SELECT count(*) FROM outbox_events
   && pass "V037.14" "DELETE does not emit upsert event (still 3 from history)" \
   || fail "V037.14" "DELETE altered upsert-event count (got $COUNT)"
 
+# V037.14b: same-transaction INSERT + DELETE still enqueues the upsert
+# event that the trigger fired at end-of-INSERT-statement. The 5b
+# worker MUST treat "edge no longer exists at claim time" as
+# complete-and-no-op — this test is the write-side witness.
+V37_EDGE_INSDEL='7e376c00-0000-0000-0000-0000000000ff'
+sql "BEGIN;
+     WITH e AS (
+       INSERT INTO knowledge_edges
+         (id, company_id, edge_type, direction, confidence, origin)
+       VALUES ('$V37_EDGE_INSDEL','$V37_CO','implements','directed',0.9,'administrator')
+       RETURNING id, company_id
+     )
+     INSERT INTO knowledge_edge_endpoints (company_id, edge_id, ordinal, chunk_id, role)
+     SELECT company_id, id, 0, '$V37_C1'::uuid, 'source' FROM e
+     UNION ALL
+     SELECT company_id, id, 1, '$V37_C2'::uuid, 'target' FROM e;
+     DELETE FROM knowledge_edges WHERE id='$V37_EDGE_INSDEL';
+     COMMIT;" > /dev/null 2>&1
+
+UPSERTS=$(sql "SELECT count(*) FROM outbox_events
+               WHERE aggregate_id='$V37_EDGE_INSDEL'
+                 AND job_type='qdrant_upsert_edge_vector'
+                 AND payload->>'embedding_model_id'='$V37_MODEL';")
+EDGE_GONE=$(sql "SELECT NOT EXISTS (
+                     SELECT 1 FROM knowledge_edges WHERE id='$V37_EDGE_INSDEL');")
+if [ "$UPSERTS" = "1" ] && [ "$EDGE_GONE" = "t" ]; then
+  pass "V037.14b" "same-tx INSERT+DELETE leaves upsert event with no live edge (5b contract)"
+else
+  fail "V037.14b" "unexpected state (upserts=$UPSERTS, edge_gone=$EDGE_GONE)"
+fi
+
 # V037.15: enqueue function is not callable by public
 NO_PUBLIC=$(sql "SELECT NOT EXISTS (
     SELECT 1 FROM information_schema.role_routine_grants
