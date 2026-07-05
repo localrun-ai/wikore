@@ -18,15 +18,15 @@ std::optional<E> parse_enum(std::string_view s,
 }
 
 constexpr std::array<std::pair<std::string_view, EdgeType>, 9> kEdgeTypeTable{{
-    {"implements",   EdgeType::implements},
-    {"depends_on",   EdgeType::depends_on},
-    {"contradicts",  EdgeType::contradicts},
-    {"refines",      EdgeType::refines},
-    {"generalizes",  EdgeType::generalizes},
-    {"derived_from", EdgeType::derived_from},
-    {"supports",     EdgeType::supports},
-    {"references",   EdgeType::references},
-    {"invalidates",  EdgeType::invalidates},
+    {"implements",             EdgeType::implements},
+    {"depends_on",             EdgeType::depends_on},
+    {"exception_to",           EdgeType::exception_to},
+    {"contradicts",            EdgeType::contradicts},
+    {"same_requirement_as",    EdgeType::same_requirement_as},
+    {"derived_from",           EdgeType::derived_from},
+    {"cites",                  EdgeType::cites},
+    {"affects",                EdgeType::affects},
+    {"requires_approval_from", EdgeType::requires_approval_from},
 }};
 
 constexpr std::array<std::pair<std::string_view, EdgeDirection>, 2> kDirectionTable{{

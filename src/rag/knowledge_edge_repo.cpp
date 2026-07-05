@@ -39,29 +39,43 @@ std::optional<std::string> nullable_text(const drogon::orm::Row& r, const char* 
                            : std::optional<std::string>(r[col].as<std::string>());
 }
 
-// Hydrate one edge row (no endpoints yet).
-domain::KnowledgeEdge hydrate_edge(const drogon::orm::Row& r)
+// Hydrate one edge row (no endpoints yet). Returns an Error on schema
+// drift (an enum value not in the C++ table) rather than substituting
+// a default — silently rendering, e.g., 'cites' as 'references' would
+// misrepresent stored data instead of surfacing the drift.
+Result<domain::KnowledgeEdge> hydrate_edge(const drogon::orm::Row& r)
 {
-    // Parses are total by construction: V034 CHECKs guarantee the enum
-    // subset. A miss here would be a schema/config drift; log + fall back.
-    auto parse_or_default = [&](auto parse_fn, const char* col, auto fallback) {
-        auto v = parse_fn(r[col].as<std::string>());
+    auto parse_or_fail = [&r]<typename P>(P parse_fn, const char* col, const char* what)
+        -> Result<std::decay_t<decltype(*parse_fn(std::string_view{}))>>
+    {
+        auto s = r[col].as<std::string>();
+        auto v = parse_fn(s);
         if (!v) {
-            spdlog::error("[knowledge_edge_repo] unexpected {}='{}' — schema drift?",
-                          col, r[col].as<std::string>());
-            return fallback;
+            spdlog::error("[knowledge_edge_repo] schema drift: unexpected {}='{}'",
+                          col, s);
+            return std::unexpected(Error::database_error(std::format(
+                "knowledge_edge row has unrecognised {} '{}' — schema drift", what, s)));
         }
         return *v;
     };
 
-    domain::KnowledgeEdge e{
+    auto edge_type    = parse_or_fail(domain::parse_edge_type,    "edge_type",    "edge_type");
+    if (!edge_type)    return std::unexpected(edge_type.error());
+    auto direction    = parse_or_fail(domain::parse_direction,    "direction",    "direction");
+    if (!direction)    return std::unexpected(direction.error());
+    auto origin       = parse_or_fail(domain::parse_origin,       "origin",       "origin");
+    if (!origin)       return std::unexpected(origin.error());
+    auto review_state = parse_or_fail(domain::parse_review_state, "review_state", "review_state");
+    if (!review_state) return std::unexpected(review_state.error());
+
+    return domain::KnowledgeEdge{
         .id           = r["id"].as<std::string>(),
         .company_id   = r["company_id"].as<std::string>(),
-        .edge_type    = parse_or_default(domain::parse_edge_type,    "edge_type",    domain::EdgeType::references),
-        .direction    = parse_or_default(domain::parse_direction,    "direction",    domain::EdgeDirection::directed),
+        .edge_type    = *edge_type,
+        .direction    = *direction,
         .confidence   = r["confidence"].as<double>(),
-        .origin       = parse_or_default(domain::parse_origin,       "origin",       domain::EdgeOrigin::administrator),
-        .review_state = parse_or_default(domain::parse_review_state, "review_state", domain::EdgeReviewState::proposed),
+        .origin       = *origin,
+        .review_state = *review_state,
         .provenance_json = r["provenance"].isNull() ? "{}"
                                                     : r["provenance"].as<std::string>(),
         .formula_version = r["formula_version"].as<int>(),
@@ -74,7 +88,6 @@ domain::KnowledgeEdge hydrate_edge(const drogon::orm::Row& r)
         .superseded_at   = nullable_text(r, "superseded_at"),
         .endpoints       = {},
     };
-    return e;
 }
 
 // Load endpoints for a set of edge ids, keyed by edge_id.
@@ -148,6 +161,11 @@ KnowledgeEdgeRepo::create(std::string_view                     company_id,
         review == domain::EdgeReviewState::accepted  ||
         review == domain::EdgeReviewState::rejected  ||
         review == domain::EdgeReviewState::superseded;
+    // superseded lifecycle timestamp is separate from reviewed_at: V034's
+    // history captures edge_superseded_at for as-of reconstruction, so a
+    // superseded row must carry a non-NULL timestamp or the history is a
+    // lie. Stamp it whenever review_state moves to superseded.
+    const bool superseded_now = review == domain::EdgeReviewState::superseded;
 
     // Data-modifying CTE: insert edge, then insert both endpoints in one
     // statement. Runs as a single implicit transaction so the deferred
@@ -188,13 +206,14 @@ KnowledgeEdgeRepo::create(std::string_view                     company_id,
             "  INSERT INTO knowledge_edges "
             "    (company_id, edge_type, direction, confidence, origin, "
             "     review_state, provenance, created_by, reviewed_by, reviewed_at, "
-            "     expires_at) "
+            "     expires_at, superseded_at) "
             "  VALUES "
             "    ($1::uuid, $2, $3, $4::numeric, $5, $6, "
             "     COALESCE($7::jsonb, '{}'::jsonb), $8::uuid, "
-            "     CASE WHEN $9::int = 1 THEN $8::uuid ELSE NULL END, "
-            "     CASE WHEN $9::int = 1 THEN now()   ELSE NULL END, "
-            "     CASE WHEN $10::text = '' THEN NULL ELSE $10::timestamptz END) "
+            "     CASE WHEN $9::int  = 1 THEN $8::uuid ELSE NULL END, "
+            "     CASE WHEN $9::int  = 1 THEN now()   ELSE NULL END, "
+            "     CASE WHEN $10::text = '' THEN NULL ELSE $10::timestamptz END, "
+            "     CASE WHEN $15::int  = 1 THEN now() ELSE NULL END) "
             "  RETURNING id, company_id"
             ") "
             "INSERT INTO knowledge_edge_endpoints (company_id, edge_id, ordinal, chunk_id, role) "
@@ -213,7 +232,8 @@ KnowledgeEdgeRepo::create(std::string_view                     company_id,
             static_cast<int>(review_stamps),
             exp_arg,
             chunk0_arg, role0_arg,
-            chunk1_arg, role1_arg);
+            chunk1_arg, role1_arg,
+            static_cast<int>(superseded_now));
         if (rows.empty())
             co_return std::unexpected(Error::database_error("create returned no rows"));
         edge_id = rows[0]["edge_id"].as<std::string>();
@@ -250,7 +270,9 @@ KnowledgeEdgeRepo::get(std::string_view company_id, std::string_view edge_id)
         }
         if (rows.empty())
             co_return std::unexpected(Error::not_found("knowledge_edge not found"));
-        edge = hydrate_edge(rows[0]);
+        auto hydrated = hydrate_edge(rows[0]);
+        if (!hydrated) co_return std::unexpected(hydrated.error());
+        edge = std::move(*hydrated);
     }
 
     std::vector<std::string> ids;
@@ -312,8 +334,9 @@ KnowledgeEdgeRepo::list(std::string_view                        company_id,
         ids.reserve(rows.size());
         for (const auto& r : rows) {
             auto e = hydrate_edge(r);
-            ids.push_back(e.id);
-            out.push_back(std::move(e));
+            if (!e) co_return std::unexpected(e.error());
+            ids.push_back(e->id);
+            out.push_back(std::move(*e));
         }
     }
 
@@ -360,6 +383,13 @@ KnowledgeEdgeRepo::update(std::string_view                      company_id,
         *cmd.review_state == domain::EdgeReviewState::accepted  ||
         *cmd.review_state == domain::EdgeReviewState::rejected  ||
         *cmd.review_state == domain::EdgeReviewState::superseded);
+    // Same rationale as create(): a superseded row must carry a non-NULL
+    // superseded_at so history-based as-of reconstruction can tell it was
+    // superseded. Stamp it iff we are transitioning to superseded.
+    // Note: moving back to a non-superseded state leaves the historical
+    // superseded_at intact — that is deliberate; history is append-only.
+    // (Same intentional stickiness applies to reviewed_by/reviewed_at.)
+    const bool superseded_now = cmd.review_state && *cmd.review_state == domain::EdgeReviewState::superseded;
 
     try {
         // Provenance and expires_at use a two-bind pair (a NULL sentinel
@@ -390,8 +420,9 @@ KnowledgeEdgeRepo::update(std::string_view                      company_id,
             "                   WHEN $6::text  = ''  THEN NULL "
             "                   ELSE $6::timestamptz "
             "                 END, "
-            "  reviewed_by  = CASE WHEN $7::int = 1 THEN $8::uuid ELSE reviewed_by END, "
-            "  reviewed_at  = CASE WHEN $7::int = 1 THEN now()    ELSE reviewed_at END "
+            "  reviewed_by  = CASE WHEN $7::int = 1  THEN $8::uuid ELSE reviewed_by END, "
+            "  reviewed_at  = CASE WHEN $7::int = 1  THEN now()    ELSE reviewed_at END, "
+            "  superseded_at = CASE WHEN $11::int = 1 THEN now()   ELSE superseded_at END "
             "WHERE id = $9::uuid AND company_id = $10::uuid "
             "RETURNING id::text AS id",
             conf_arg,
@@ -399,7 +430,8 @@ KnowledgeEdgeRepo::update(std::string_view                      company_id,
             prov_present, prov_arg,
             exp_present,  exp_arg,
             static_cast<int>(review_stamps), actor_arg,
-            edge_id_arg, company_id_arg);
+            edge_id_arg, company_id_arg,
+            static_cast<int>(superseded_now));
         if (rows.empty())
             co_return std::unexpected(Error::not_found("knowledge_edge not found"));
     } catch (const drogon::orm::DrogonDbException& ex) {

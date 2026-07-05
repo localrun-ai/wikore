@@ -16,19 +16,21 @@ namespace wikore::domain {
 // uses before hitting the DB.
 // ---------------------------------------------------------------------------
 
-// V1 edge type set — must stay in sync with V034's knowledge_edges_edge_type_v1_chk.
-// Types requiring non-chunk endpoints (supersedes, section_*, responsible_team)
-// are intentionally omitted; they will land with v2 typed endpoints.
+// V1 edge type set — must stay in sync with V034's
+// knowledge_edges_edge_type_v1_chk (chunk-to-chunk types only).
+// Types requiring non-chunk endpoints (supersedes, section_*,
+// responsible_team) are intentionally omitted; they will land with v2
+// typed endpoints.
 enum class EdgeType {
     implements,
     depends_on,
+    exception_to,
     contradicts,
-    refines,
-    generalizes,
+    same_requirement_as,
     derived_from,
-    supports,
-    references,
-    invalidates,
+    cites,
+    affects,
+    requires_approval_from,
 };
 
 enum class EdgeDirection {

@@ -36,7 +36,11 @@ struct EdgeDto {
     double                                   confidence;
     std::string                              origin;
     std::string                              review_state;
-    std::string                              provenance;   // raw JSONB
+    // provenance is returned as the RAW JSONB text (e.g. `{"parser":"foo"}`),
+    // NOT as a nested object. That is deliberate: glaze would otherwise have
+    // to parse arbitrary user-controlled JSON at serialisation time. Clients
+    // must JSON.parse() the string themselves.
+    std::string                              provenance;
     int                                      formula_version;
     long long                                edge_version;
     std::optional<std::string>               created_by;
@@ -171,6 +175,14 @@ struct AdminCtx {
 drogon::Task<Result<AdminCtx>>
 resolve_admin(drogon::orm::DbClientPtr db, const drogon::HttpRequestPtr& req)
 {
+    // AuthFilter guarantees identity on any route it fronts. The other
+    // handlers (org_get, me) render this defensive branch as 401
+    // Unauthorized, but Error::Kind has no Unauthorized variant, so we
+    // return forbidden() here — Kind::Forbidden -> 403. The branch is
+    // effectively unreachable; a stray 403 for a missing identity is
+    // still closer to correct than a 500, and if this ever fires it is
+    // a wiring bug (AuthFilter missing on a new admin route) that we
+    // want surfaced.
     if (!req->getAttributes()->find("identity"))
         co_return std::unexpected(Error::forbidden("unauthenticated"));
     const auto id = req->getAttributes()->get<Identity>("identity");

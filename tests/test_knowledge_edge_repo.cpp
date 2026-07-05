@@ -171,7 +171,7 @@ TEST_CASE("KnowledgeEdgeRepo: create rejects self-loop and out-of-range confiden
     CHECK(r2.error().kind == wikore::Error::Kind::InvalidInput);
 }
 
-TEST_CASE("KnowledgeEdgeRepo: cross-tenant chunks in an edge are rejected by composite FK",
+TEST_CASE("KnowledgeEdgeRepo: cross-tenant chunks in an edge return InvalidInput",
           "[integration][edge_repo]")
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
@@ -179,13 +179,93 @@ TEST_CASE("KnowledgeEdgeRepo: cross-tenant chunks in an edge are rejected by com
     seed(db);
     wikore::rag::KnowledgeEdgeRepo repo(db);
 
-    // company CO_EDGE + one chunk from CO_OTHER → FK violation.
+    // company CO_EDGE + one chunk from CO_OTHER → composite FK on
+    // knowledge_edge_endpoints(company_id, chunk_id) fires. Named in
+    // error_mapper as knowledge_edge_endpoints_company_id_chunk_id_fkey
+    // -> invalid_input, so the API returns 400, not 500.
     auto cmd = default_cmd(CH1_EDGE, CH_OTHER);
     auto r = drogon::sync_wait(repo.create(CO_EDGE, ADMIN_USER, cmd));
     REQUIRE_FALSE(r.has_value());
-    // V034's endpoints FK maps to database_error / conflict via error_mapper;
-    // we assert only that it did NOT succeed (existence never leaks).
-    CHECK(r.error().kind != wikore::Error::Kind::NotFound);
+    CHECK(r.error().kind == wikore::Error::Kind::InvalidInput);
+}
+
+TEST_CASE("KnowledgeEdgeRepo: round-trips a non-overlap V1 edge type",
+          "[integration][edge_repo]")
+{
+    // Regression for a review finding: the C++ EdgeType table must cover
+    // every V034 CHECK vocabulary value, not just the first four.
+    // 'cites' was one of the five real V1 types that were missing from
+    // the initial PR.
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    seed(db);
+    wikore::rag::KnowledgeEdgeRepo repo(db);
+
+    auto cmd = default_cmd(CH1_EDGE, CH2_EDGE, wikore::domain::EdgeType::cites);
+    auto created = drogon::sync_wait(repo.create(CO_EDGE, ADMIN_USER, cmd));
+    REQUIRE(created.has_value());
+    CHECK(created->edge_type == wikore::domain::EdgeType::cites);
+
+    // Round-trip through get() — the hydrator must NOT substitute a
+    // fallback type for a value it does not recognise.
+    auto fetched = drogon::sync_wait(repo.get(CO_EDGE, created->id));
+    REQUIRE(fetched.has_value());
+    CHECK(fetched->edge_type == wikore::domain::EdgeType::cites);
+
+    // Filter by exception_to (also non-overlap): should return no rows,
+    // NOT a database error.
+    wikore::domain::ListKnowledgeEdgesFilter f;
+    f.edge_type = wikore::domain::EdgeType::exception_to;
+    auto list = drogon::sync_wait(repo.list(CO_EDGE, f));
+    REQUIRE(list.has_value());
+    CHECK(list->empty());
+}
+
+TEST_CASE("KnowledgeEdgeRepo: hydrate fails loud on schema drift",
+          "[integration][edge_repo]")
+{
+    // Force a row into an unknown edge_type by dropping the CHECK, so we
+    // can prove hydrate_edge returns database_error rather than silently
+    // rendering the row as some default (which would misrepresent stored
+    // data on future migrations).
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    seed(db);
+    wikore::rag::KnowledgeEdgeRepo repo(db);
+
+    auto created = drogon::sync_wait(
+        repo.create(CO_EDGE, ADMIN_USER, default_cmd()));
+    REQUIRE(created.has_value());
+
+    // Round-trip works with the correct enum.
+    auto ok = drogon::sync_wait(repo.get(CO_EDGE, created->id));
+    REQUIRE(ok.has_value());
+
+    // Now corrupt the row so hydrate encounters an unknown type. We
+    // temporarily drop the CHECK for the UPDATE, then restore it.
+    exec_sync(db, "ALTER TABLE knowledge_edges DROP CONSTRAINT knowledge_edges_edge_type_v1_chk");
+    exec_sync(db,
+        "UPDATE knowledge_edges SET edge_type='future_type_not_in_c++' "
+        "WHERE id=$1::uuid", created->id);
+    exec_sync(db,
+        "ALTER TABLE knowledge_edges ADD CONSTRAINT knowledge_edges_edge_type_v1_chk "
+        "CHECK (edge_type IN ('implements','depends_on','exception_to','contradicts',"
+        "                     'same_requirement_as','derived_from','cites','affects',"
+        "                     'requires_approval_from','future_type_not_in_c++'))");
+
+    auto drift = drogon::sync_wait(repo.get(CO_EDGE, created->id));
+    REQUIRE_FALSE(drift.has_value());
+    CHECK(drift.error().kind == wikore::Error::Kind::DatabaseError);
+
+    // Cleanup: restore the original CHECK.
+    exec_sync(db, "ALTER TABLE knowledge_edges DROP CONSTRAINT knowledge_edges_edge_type_v1_chk");
+    exec_sync(db,
+        "UPDATE knowledge_edges SET edge_type='implements' WHERE id=$1::uuid", created->id);
+    exec_sync(db,
+        "ALTER TABLE knowledge_edges ADD CONSTRAINT knowledge_edges_edge_type_v1_chk "
+        "CHECK (edge_type IN ('implements','depends_on','exception_to','contradicts',"
+        "                     'same_requirement_as','derived_from','cites','affects',"
+        "                     'requires_approval_from'))");
 }
 
 TEST_CASE("KnowledgeEdgeRepo: get + list are tenant-scoped",
@@ -297,6 +377,80 @@ TEST_CASE("KnowledgeEdgeRepo: update bumps edge_version and stamps reviewer",
     REQUIRE(after->reviewed_by.has_value());
     CHECK(*after->reviewed_by == ADMIN_USER);
     REQUIRE(after->reviewed_at.has_value());
+    // Not superseded — timestamp stays NULL.
+    CHECK_FALSE(after->superseded_at.has_value());
+}
+
+TEST_CASE("KnowledgeEdgeRepo: update to superseded stamps superseded_at",
+          "[integration][edge_repo]")
+{
+    // Regression for a review finding: V034's history captures
+    // edge_superseded_at for as-of reconstruction. A superseded edge
+    // with a NULL superseded_at undermines exactly the lifecycle data
+    // the schema was built to keep. Stamp it whenever review_state
+    // moves to superseded, on both create() and update().
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    seed(db);
+    wikore::rag::KnowledgeEdgeRepo repo(db);
+
+    auto cmd = default_cmd();
+    cmd.review_state = wikore::domain::EdgeReviewState::proposed;
+    auto e = drogon::sync_wait(repo.create(CO_EDGE, ADMIN_USER, cmd));
+    REQUIRE(e.has_value());
+    CHECK_FALSE(e->superseded_at.has_value());
+
+    wikore::domain::UpdateKnowledgeEdgeCmd upd;
+    upd.review_state = wikore::domain::EdgeReviewState::superseded;
+    auto after = drogon::sync_wait(repo.update(CO_EDGE, ADMIN_USER, e->id, upd));
+    REQUIRE(after.has_value());
+    CHECK(after->review_state == wikore::domain::EdgeReviewState::superseded);
+    REQUIRE(after->superseded_at.has_value());
+    REQUIRE(after->reviewed_by.has_value());
+    CHECK(*after->reviewed_by == ADMIN_USER);
+}
+
+TEST_CASE("KnowledgeEdgeRepo: create with malformed provenance/expires_at returns InvalidInput",
+          "[integration][edge_repo]")
+{
+    // Regression for a review finding: user-controlled cast failures
+    // (22P02, 22007, 22032) must return 400, not 500 — routine admin
+    // input mistakes should not look like server errors.
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    seed(db);
+    wikore::rag::KnowledgeEdgeRepo repo(db);
+
+    // Malformed JSON in provenance — hits ::jsonb cast, SQLSTATE 22P02
+    // (invalid_text_representation from json parse).
+    auto bad_json = default_cmd();
+    bad_json.provenance_json = "{not valid json";
+    auto r1 = drogon::sync_wait(repo.create(CO_EDGE, ADMIN_USER, bad_json));
+    REQUIRE_FALSE(r1.has_value());
+    CHECK(r1.error().kind == wikore::Error::Kind::InvalidInput);
+
+    // Garbage expires_at — hits ::timestamptz cast, SQLSTATE 22007.
+    auto bad_ts = default_cmd();
+    bad_ts.expires_at = "not-a-timestamp";
+    auto r2 = drogon::sync_wait(repo.create(CO_EDGE, ADMIN_USER, bad_ts));
+    REQUIRE_FALSE(r2.has_value());
+    CHECK(r2.error().kind == wikore::Error::Kind::InvalidInput);
+}
+
+TEST_CASE("KnowledgeEdgeRepo: create with review_state=superseded stamps superseded_at",
+          "[integration][edge_repo]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    seed(db);
+    wikore::rag::KnowledgeEdgeRepo repo(db);
+
+    auto cmd = default_cmd();
+    cmd.review_state = wikore::domain::EdgeReviewState::superseded;
+    auto e = drogon::sync_wait(repo.create(CO_EDGE, ADMIN_USER, cmd));
+    REQUIRE(e.has_value());
+    CHECK(e->review_state == wikore::domain::EdgeReviewState::superseded);
+    REQUIRE(e->superseded_at.has_value());
 }
 
 TEST_CASE("KnowledgeEdgeRepo: remove enqueues qdrant_delete_edge_points via V034 trigger",
