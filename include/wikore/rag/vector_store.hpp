@@ -37,13 +37,21 @@ public:
     delete_by_version(std::string_view company_id,
                       std::string_view document_version_id) = 0;
 
-    // Delete an explicit set of points by their Qdrant point IDs. Idempotent:
-    // Qdrant's POST /points/delete with a points list treats missing IDs as
-    // no-ops. Used by the qdrant_delete_edge_points outbox consumer: V034's
+    // Delete an explicit set of points by their Qdrant point IDs, scoped
+    // to a company_id. Uses `{"filter":{"must":[{"key":"company_id",...},
+    // {"has_id":[...]}]}}` so a corrupted or hand-crafted outbox payload
+    // cannot remove another tenant's points. Idempotent: Qdrant treats
+    // missing ids (or non-matching filter) as a no-op, matching the
+    // outbox retry semantics.
+    //
+    // Called by the qdrant_delete_edge_points outbox consumer: V034's
     // BEFORE DELETE trigger on knowledge_edges captures every affected
-    // qdrant_point_id into an outbox payload before ON DELETE CASCADE removes
-    // the knowledge_edge_embeddings rows, so this worker can never look them
-    // up by joining live tables. Empty point_ids is a no-op.
+    // qdrant_point_id into an outbox payload before ON DELETE CASCADE
+    // removes the knowledge_edge_embeddings rows, so this worker can
+    // never look them up by joining live tables. Empty point_ids is a
+    // no-op. Precondition (from BaryGraph Lite step 5): edge points
+    // carry `company_id` in their Qdrant payload — required by ACL
+    // prefiltering on retrieval anyway.
     virtual drogon::Task<Result<void>>
     delete_points_by_id(std::string_view                company_id,
                         const std::vector<std::string>& point_ids) = 0;

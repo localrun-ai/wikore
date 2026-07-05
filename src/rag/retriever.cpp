@@ -288,24 +288,33 @@ QdrantVectorStore::delete_by_version(std::string_view company_id,
     co_return Result<void>{};
 }
 
-// Explicit-id delete: Qdrant accepts `{"points": ["id1", "id2", ...]}` as the
-// body of POST /points/delete. This is idempotent — a missing id is a no-op
-// on the Qdrant side, matching the outbox retry semantics.
+// Explicit-id delete scoped to a tenant. Qdrant accepts a filter body on
+// POST /points/delete; we combine `company_id == <cid>` with `has_id: [...]`
+// so a corrupted or forged outbox payload cannot remove another tenant's
+// points. Idempotent — a missing id (or non-matching filter) is a no-op on
+// the Qdrant side, matching the outbox retry semantics.
 drogon::Task<Result<void>>
 QdrantVectorStore::delete_points_by_id(std::string_view                company_id,
                                        const std::vector<std::string>& point_ids)
 {
-    (void)company_id; // reserved for cross-tenant sanity checks; point IDs
-                      // are uuid_v5-derived and globally unique per model.
     if (point_ids.empty())
         co_return Result<void>{};
 
-    std::string body = R"({"points":[)";
+    std::string ids_json = "[";
     for (size_t i = 0; i < point_ids.size(); ++i) {
-        if (i) body += ',';
-        body += std::format("\"{}\"", point_ids[i]);
+        if (i) ids_json += ',';
+        ids_json += std::format("\"{}\"", point_ids[i]);
     }
-    body += "]}";
+    ids_json += ']';
+
+    // Filter form: must-match company_id AND must-be-in point_ids.
+    // has_id is Qdrant's built-in point-id filter (docs: "Filter by point ID").
+    std::string body = std::format(
+        R"({{"filter":{{"must":[)"
+        R"({{"key":"company_id","match":{{"value":"{}"}}}},)"
+        R"({{"has_id":{}}})"
+        R"(]}}}})",
+        json_escape(company_id), ids_json);
 
     drogon::HttpResponsePtr resp;
     try {
@@ -479,12 +488,17 @@ NullVectorStore::delete_by_version(std::string_view company_id,
 }
 
 drogon::Task<Result<void>>
-NullVectorStore::delete_points_by_id(std::string_view /*company_id*/,
+NullVectorStore::delete_points_by_id(std::string_view company_id,
                                      const std::vector<std::string>& point_ids)
 {
     if (point_ids.empty())
         co_return Result<void>{};
+    // Mirror the Qdrant adapter's tenant filter: a point only vanishes if
+    // BOTH its id is in the list AND its payload's company_id matches.
+    // A cross-tenant delete request is silently a no-op (Qdrant filter
+    // semantics), which is exactly what the safety story wants.
     std::erase_if(_points, [&](const UpsertPoint& p) {
+        if (p.payload.company_id != company_id) return false;
         return std::find(point_ids.begin(), point_ids.end(), p.id) != point_ids.end();
     });
     co_return Result<void>{};

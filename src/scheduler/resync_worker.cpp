@@ -126,9 +126,13 @@ drogon::Task<int> ResyncWorker::reap_stale_claims()
             SET    claimed_at    = NULL,
                    claimed_by    = NULL,
                    attempt_count = GREATEST(attempt_count - 1, 0),
-                   last_error    = COALESCE(last_error, '') ||
-                                   ' [reaped: stale claim by ' ||
-                                   COALESCE(claimed_by, '?') || ']'
+                   -- Bound last_error to 4KB so repeated reap cycles do
+                   -- not accumulate a multi-megabyte tail across retries.
+                   last_error    = left(
+                       COALESCE(last_error, '') ||
+                       ' [reaped: stale claim by ' ||
+                       COALESCE(claimed_by, '?') || ']',
+                       4096)
             WHERE  job_type     = 'qdrant_resync_chunk_acl'
               AND  completed_at IS NULL
               AND  claimed_at IS NOT NULL

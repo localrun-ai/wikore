@@ -82,9 +82,18 @@ EdgeVectorCleanupWorker::claim_batch()
                -- Unmarshal the qdrant_point_ids JSONB array into a
                -- text[] so the C++ side receives std::vector<std::string>
                -- directly, avoiding a per-worker JSON dependency.
+               -- Defensive: a malformed non-array payload would make
+               -- jsonb_array_elements_text raise and fail the entire
+               -- batch claim, wedging the consumer without progressing
+               -- attempt_count. Fall through to an empty array so the
+               -- offending row processes as a no-op and completes.
                ARRAY(
                    SELECT jsonb_array_elements_text(
-                       COALESCE(e.payload->'qdrant_point_ids', '[]'::jsonb))
+                       CASE
+                           WHEN jsonb_typeof(e.payload->'qdrant_point_ids') = 'array'
+                               THEN e.payload->'qdrant_point_ids'
+                           ELSE '[]'::jsonb
+                       END)
                ) AS point_ids
     )";
 
@@ -119,9 +128,14 @@ drogon::Task<int> EdgeVectorCleanupWorker::reap_stale_claims()
             SET    claimed_at    = NULL,
                    claimed_by    = NULL,
                    attempt_count = GREATEST(attempt_count - 1, 0),
-                   last_error    = COALESCE(last_error, '') ||
-                                   ' [reaped: stale claim by ' ||
-                                   COALESCE(claimed_by, '?') || ']'
+                   -- Bound last_error to 4KB so repeated reap cycles
+                   -- do not accumulate a multi-megabyte tail across
+                   -- retries.
+                   last_error    = left(
+                       COALESCE(last_error, '') ||
+                       ' [reaped: stale claim by ' ||
+                       COALESCE(claimed_by, '?') || ']',
+                       4096)
             WHERE  job_type     = 'qdrant_delete_edge_points'
               AND  completed_at IS NULL
               AND  claimed_at IS NOT NULL

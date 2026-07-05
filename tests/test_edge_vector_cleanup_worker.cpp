@@ -27,14 +27,18 @@
 
 namespace {
 
+// Fixed IDs are safe for company/chunk/model — they have no reuse guard,
+// and seed()'s `DELETE FROM companies` cascade wipes them cleanly across
+// runs. The knowledge_edges UUID is NOT safe: V034's
+// knowledge_edges_no_uuid_reuse trigger rejects any INSERT whose id has
+// prior history, and knowledge_edges_history has no company FK by design,
+// so the cascade cannot clear it. Every seed() below picks a fresh edge id.
 constexpr auto CO_EDGECLEAN     = "ec000000-0000-0000-0000-0000000000c1";
 constexpr auto DOC_EDGECLEAN    = "ec0d0000-0000-0000-0000-000000000001";
 constexpr auto VER_EDGECLEAN    = "ec7e0000-0000-0000-0000-000000000001";
 constexpr auto CH1_EDGECLEAN    = "ecc80000-0000-0000-0000-000000000001";
 constexpr auto CH2_EDGECLEAN    = "ecc80000-0000-0000-0000-000000000002";
 constexpr auto MODEL_EDGECLEAN  = "ec110000-0000-0000-0000-000000000001";
-constexpr auto EDGE_EDGECLEAN   = "ec6c0000-0000-0000-0000-000000000001";
-constexpr auto POINT_EDGECLEAN  = "ecff0000-0000-0000-0000-000000000001";
 
 bool db_available() { return std::getenv("DATABASE_URL") != nullptr; }
 
@@ -48,10 +52,25 @@ drogon::orm::Result exec_sync(drogon::orm::DbClientPtr db, std::string sql, Args
         }());
 }
 
-// Seed a company with two chunks, one knowledge_edge between them, and one
-// edge embedding row referencing POINT_EDGECLEAN. Deleting the edge fires the
-// V034 trigger which enqueues an outbox event carrying [POINT_EDGECLEAN].
-void seed(drogon::orm::DbClientPtr db)
+struct SeedIds {
+    std::string edge_id;
+    std::string point_id;
+};
+
+// Seed a company with two chunks, a fresh knowledge_edge, and one edge
+// embedding row. Returns the fresh edge/point ids so each test operates on
+// its own edge UUID (see comment above).
+//
+// Correctness note (was P1 in review): drogon's TransactionPtr commits
+// on destruction ASYNCHRONOUSLY, so a sync_wait around a
+// begin+INSERT+COMMIT coroutine returns before COMMIT actually lands —
+// a following INSERT into knowledge_edge_embeddings then races the
+// parent FK. We issue the whole atomic block as one multi-statement
+// simple-protocol string (no bind params -> drogon uses simple query
+// protocol; multi-statement allowed), which completes synchronously and
+// surfaces commit-time trigger errors (e.g. the deferred two-endpoint
+// check) directly to the test.
+SeedIds seed(drogon::orm::DbClientPtr db)
 {
     exec_sync(db, "DELETE FROM companies WHERE id=$1::uuid", std::string(CO_EDGECLEAN));
     exec_sync(db, "DELETE FROM embedding_models WHERE id=$1::uuid", std::string(MODEL_EDGECLEAN));
@@ -82,38 +101,48 @@ void seed(drogon::orm::DbClientPtr db)
         std::string(CH1_EDGECLEAN), std::string(CO_EDGECLEAN), std::string(VER_EDGECLEAN),
         std::string(CH2_EDGECLEAN));
 
-    // Insert edge + endpoints atomically so the deferred CONSTRAINT TRIGGER
-    // passes at COMMIT.
-    drogon::sync_wait([db]() -> drogon::Task<void> {
-        auto tx = co_await db->newTransactionCoro();
-        co_await tx->execSqlCoro(
-            "INSERT INTO knowledge_edges (id,company_id,edge_type,direction,confidence,origin) "
-            "VALUES ($1::uuid,$2::uuid,'implements','directed',0.9,'administrator')",
-            std::string(EDGE_EDGECLEAN), std::string(CO_EDGECLEAN));
-        co_await tx->execSqlCoro(
-            "INSERT INTO knowledge_edge_endpoints (company_id,edge_id,ordinal,chunk_id,role) "
-            "VALUES ($1::uuid,$2::uuid,0,$3::uuid,'source'),"
-            "       ($1::uuid,$2::uuid,1,$4::uuid,'target')",
-            std::string(CO_EDGECLEAN), std::string(EDGE_EDGECLEAN),
-            std::string(CH1_EDGECLEAN), std::string(CH2_EDGECLEAN));
-    }());
+    // Fresh UUIDs per test to sidestep V034's no-reuse guard.
+    auto edge_id  = std::string(exec_sync(db, "SELECT gen_random_uuid() AS id")[0]["id"].c_str());
+    auto point_id = std::string(exec_sync(db, "SELECT gen_random_uuid() AS id")[0]["id"].c_str());
+
+    // Insert edge + endpoints in one synchronous multi-statement so the
+    // deferred CONSTRAINT TRIGGER passes at COMMIT and control returns
+    // only AFTER commit. Constants are inlined (no bind params) so
+    // drogon uses the simple query protocol, which accepts multi-statement.
+    exec_sync(db, std::format(
+        "BEGIN;"
+        "INSERT INTO knowledge_edges "
+        "  (id,company_id,edge_type,direction,confidence,origin) "
+        "  VALUES ('{}'::uuid,'{}'::uuid,'implements','directed',0.9,'administrator');"
+        "INSERT INTO knowledge_edge_endpoints "
+        "  (company_id,edge_id,ordinal,chunk_id,role) "
+        "  VALUES ('{}'::uuid,'{}'::uuid,0,'{}'::uuid,'source'),"
+        "         ('{}'::uuid,'{}'::uuid,1,'{}'::uuid,'target');"
+        "COMMIT;",
+        edge_id, CO_EDGECLEAN,
+        CO_EDGECLEAN, edge_id, CH1_EDGECLEAN,
+        CO_EDGECLEAN, edge_id, CH2_EDGECLEAN));
+
     exec_sync(db,
         "INSERT INTO knowledge_edge_embeddings "
         "(company_id,edge_id,embedding_model_id,qdrant_point_id,formula_version,indexed_edge_version) "
         "VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,1,1)",
-        std::string(CO_EDGECLEAN), std::string(EDGE_EDGECLEAN),
-        std::string(MODEL_EDGECLEAN), std::string(POINT_EDGECLEAN));
+        std::string(CO_EDGECLEAN), edge_id, std::string(MODEL_EDGECLEAN), point_id);
+
+    return {edge_id, point_id};
 }
 
 // Build a NullVectorStore pre-seeded with the edge point so we can observe
-// its removal after the worker runs.
-std::shared_ptr<wikore::rag::NullVectorStore> seeded_store()
+// its removal after the worker runs. company_id in the payload is set so
+// the tenant-scoped delete_points_by_id filter actually matches.
+std::shared_ptr<wikore::rag::NullVectorStore>
+seeded_store(const std::string& point_id)
 {
     auto store = std::make_shared<wikore::rag::NullVectorStore>();
     wikore::rag::ChunkPayload p;
     p.company_id = CO_EDGECLEAN;
     drogon::sync_wait(store->upsert(std::vector<wikore::rag::UpsertPoint>{
-        {.id = POINT_EDGECLEAN,
+        {.id = point_id,
          .vector = wikore::rag::Embedding(4, 0.1f),
          .payload = std::move(p)}}));
     return store;
@@ -136,14 +165,13 @@ TEST_CASE("EdgeVectorCleanupWorker: deleting an edge triggers point removal",
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
-    seed(db);
-    auto store = seeded_store();
-    REQUIRE(store->contains(POINT_EDGECLEAN));
+    auto ids = seed(db);
+    auto store = seeded_store(ids.point_id);
+    REQUIRE(store->contains(ids.point_id));
 
     // Deleting the edge fires the V034 BEFORE DELETE trigger, which
     // enqueues one qdrant_delete_edge_points event containing the point id.
-    exec_sync(db, "DELETE FROM knowledge_edges WHERE id=$1::uuid",
-              std::string(EDGE_EDGECLEAN));
+    exec_sync(db, "DELETE FROM knowledge_edges WHERE id=$1::uuid", ids.edge_id);
 
     // Sanity: the outbox event exists and is unclaimed.
     auto pre = exec_sync(db,
@@ -151,7 +179,7 @@ TEST_CASE("EdgeVectorCleanupWorker: deleting an edge triggers point removal",
         "FROM outbox_events "
         "WHERE aggregate_id=$1::uuid AND job_type='qdrant_delete_edge_points' "
         "  AND completed_at IS NULL",
-        std::string(EDGE_EDGECLEAN));
+        ids.edge_id);
     REQUIRE(pre.size() == 1);
 
     std::atomic<bool> stop{false};
@@ -166,12 +194,12 @@ TEST_CASE("EdgeVectorCleanupWorker: deleting an edge triggers point removal",
         "SELECT completed_at IS NOT NULL AS done "
         "FROM outbox_events "
         "WHERE aggregate_id=$1::uuid AND job_type='qdrant_delete_edge_points'",
-        std::string(EDGE_EDGECLEAN));
+        ids.edge_id);
     REQUIRE(post.size() == 1);
     CHECK(std::string(post[0]["done"].c_str()) == "t");
 
     // Qdrant point is gone.
-    CHECK_FALSE(store->contains(POINT_EDGECLEAN));
+    CHECK_FALSE(store->contains(ids.point_id));
 }
 
 TEST_CASE("EdgeVectorCleanupWorker: redelivery of the same event is idempotent",
@@ -179,42 +207,73 @@ TEST_CASE("EdgeVectorCleanupWorker: redelivery of the same event is idempotent",
 {
     if (!db_available()) SKIP("DATABASE_URL not set");
     auto db = wikore::Db::get();
-    seed(db);
-    auto store = seeded_store();
+    auto ids = seed(db);
+    auto store = seeded_store(ids.point_id);
 
     // Trigger the outbox event.
-    exec_sync(db, "DELETE FROM knowledge_edges WHERE id=$1::uuid",
-              std::string(EDGE_EDGECLEAN));
-
-    // Rewind: mark the event as unclaimed and not yet completed so a second
-    // drain sees it again. This simulates a retry after an unclean shutdown
-    // between delete_points_by_id and mark_completed.
-    exec_sync(db,
-        "UPDATE outbox_events "
-        "SET completed_at=NULL, claimed_at=NULL, claimed_by=NULL "
-        "WHERE aggregate_id=$1::uuid AND job_type='qdrant_delete_edge_points'",
-        std::string(EDGE_EDGECLEAN));
+    exec_sync(db, "DELETE FROM knowledge_edges WHERE id=$1::uuid", ids.edge_id);
 
     std::atomic<bool> stop{false};
     auto worker = make_worker(db, store, stop);
 
-    // First drain: the point exists, gets deleted.
-    (void)drogon::sync_wait(worker.drain_once());
-    CHECK_FALSE(store->contains(POINT_EDGECLEAN));
+    // First drain: the point exists, gets deleted, event marked completed.
+    int processed = drogon::sync_wait(worker.drain_once());
+    CHECK(processed >= 1);
+    CHECK_FALSE(store->contains(ids.point_id));
 
-    // Simulate redelivery: reopen the event, run again. delete_points_by_id
-    // over a non-existent id must be a clean no-op (matches Qdrant semantics).
+    // Simulate redelivery of the same completed event: rewind it to
+    // pending and drain again. delete_points_by_id over a non-existent
+    // id must be a clean no-op (matches Qdrant filter semantics).
     exec_sync(db,
         "UPDATE outbox_events "
         "SET completed_at=NULL, claimed_at=NULL, claimed_by=NULL "
         "WHERE aggregate_id=$1::uuid AND job_type='qdrant_delete_edge_points'",
-        std::string(EDGE_EDGECLEAN));
-    int processed = drogon::sync_wait(worker.drain_once());
+        ids.edge_id);
+    processed = drogon::sync_wait(worker.drain_once());
     CHECK(processed >= 1);
     auto post = exec_sync(db,
         "SELECT completed_at IS NOT NULL AS done "
         "FROM outbox_events "
         "WHERE aggregate_id=$1::uuid AND job_type='qdrant_delete_edge_points'",
-        std::string(EDGE_EDGECLEAN));
+        ids.edge_id);
+    CHECK(std::string(post[0]["done"].c_str()) == "t");
+}
+
+TEST_CASE("EdgeVectorCleanupWorker: cross-tenant point IDs are not deleted",
+          "[integration][edge_cleanup]")
+{
+    if (!db_available()) SKIP("DATABASE_URL not set");
+    auto db = wikore::Db::get();
+    auto ids = seed(db);
+
+    // Store contains ONE point that claims to belong to a DIFFERENT tenant.
+    // delete_points_by_id(CO_EDGECLEAN, [that_point]) must NOT remove it —
+    // the has_id + company_id filter combination rules it out (regression
+    // test for the P3 tenant-scoping finding on the port).
+    auto store = std::make_shared<wikore::rag::NullVectorStore>();
+    wikore::rag::ChunkPayload p;
+    p.company_id = "ffffffff-ffff-ffff-ffff-ffffffffffff";  // some other tenant
+    drogon::sync_wait(store->upsert(std::vector<wikore::rag::UpsertPoint>{
+        {.id = ids.point_id,
+         .vector = wikore::rag::Embedding(4, 0.1f),
+         .payload = std::move(p)}}));
+
+    exec_sync(db, "DELETE FROM knowledge_edges WHERE id=$1::uuid", ids.edge_id);
+
+    std::atomic<bool> stop{false};
+    auto worker = make_worker(db, store, stop);
+    int processed = drogon::sync_wait(worker.drain_once());
+    CHECK(processed >= 1);
+
+    // The point survives even though its id was in the event's payload,
+    // because the filter's company_id clause did not match. The event
+    // still completes — from the worker's perspective the requested
+    // delete succeeded (Qdrant filter no-op).
+    CHECK(store->contains(ids.point_id));
+    auto post = exec_sync(db,
+        "SELECT completed_at IS NOT NULL AS done "
+        "FROM outbox_events "
+        "WHERE aggregate_id=$1::uuid AND job_type='qdrant_delete_edge_points'",
+        ids.edge_id);
     CHECK(std::string(post[0]["done"].c_str()) == "t");
 }

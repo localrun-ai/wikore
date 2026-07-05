@@ -249,6 +249,7 @@ Configuration is read from environment variables. The checked-in
 | `PARTITION_DATABASE_URL` | required by scheduler | Restricted partition-maintenance connection |
 | `REDIS_URL` | `redis://127.0.0.1:6379/0` | Queues, heartbeats, and caches |
 | `QDRANT_URL` | `http://localhost:6333` | Vector index |
+| `QDRANT_EDGE_COLLECTION` | `wikore_edges_v1` | Qdrant collection holding BaryGraph Lite edge vectors; `EdgeVectorCleanupWorker` deletes from this collection when `knowledge_edges` rows are removed |
 | `EMBED_BASE_URL` | `http://localhost:8081/v1` | OpenAI-compatible embeddings endpoint |
 | `EMBED_MODEL` | empty | Registry model name used by ingest and scheduler |
 | `EMBED_DIMS` | `768` | Expected embedding dimension |
