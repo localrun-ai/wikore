@@ -85,10 +85,11 @@ public:
     drogon::Task<int>  release_my_claims();
     drogon::Task<int>  reap_stale_claims();
 
-    std::size_t events_completed()  const { return events_completed_.load(); }
-    std::size_t events_failed()     const { return events_failed_.load(); }
-    std::size_t events_superseded() const { return events_superseded_.load(); }
-    std::size_t events_no_edge()    const { return events_no_edge_.load(); }
+    std::size_t events_completed()      const { return events_completed_.load(); }
+    std::size_t events_failed()         const { return events_failed_.load(); }
+    std::size_t events_superseded()     const { return events_superseded_.load(); }
+    std::size_t events_no_edge()        const { return events_no_edge_.load(); }
+    std::size_t events_model_disabled() const { return events_model_disabled_.load(); }
 
 private:
     struct ClaimedEvent {
@@ -98,17 +99,58 @@ private:
         std::string  edge_type;
         std::string  embedding_model_id;
         int          formula_version = 0;
+        // edge_version and review_state are payload-time snapshots used
+        // ONLY for the pre-check / staleness gate. Every payload field
+        // written to Qdrant is re-read live in process() so a stale
+        // event cannot durably stamp the wrong review_state.
         std::int64_t edge_version    = 0;
         std::string  review_state;
     };
 
-    enum class Outcome { Completed, Superseded, NoEdge };
+    enum class Outcome { Completed, Superseded, NoEdge, ModelDisabled };
+
+    // Live snapshot the worker takes at process() time so payload
+    // fields cannot be racy vs. the enqueue moment.
+    struct LiveEdge {
+        std::string  edge_type;
+        std::string  review_state;
+        std::int64_t edge_version = 0;
+        std::string  ep0_chunk_id;
+        std::string  ep1_chunk_id;
+        int          auth0 = 50;
+        int          auth1 = 50;
+    };
 
     drogon::Task<std::vector<ClaimedEvent>> claim_batch();
     drogon::Task<Result<Outcome>>           process(const ClaimedEvent& ev);
     drogon::Task<void>                      mark_completed(const std::string& event_id);
     drogon::Task<void>                      mark_failed(const std::string& event_id,
                                                         std::string_view  reason);
+
+    // Helper coroutines split out of process() to keep each coroutine
+    // frame small — GCC 14 hits an ICE (build_special_member_call at
+    // cp/call.cc:11096) when a single coroutine frame contains too many
+    // co_awaits + non-trivial locals inside try blocks. Splitting also
+    // makes the process() control flow linear and easy to reason about.
+    drogon::Task<Result<std::optional<LiveEdge>>>
+    load_live_edge(const ClaimedEvent& ev);
+
+    drogon::Task<Result<std::int64_t>>
+    load_indexed_edge_version(const ClaimedEvent& ev);
+
+    drogon::Task<Result<std::optional<std::string>>>
+    load_model_collection(const std::string& model_id);
+
+    drogon::Task<Result<std::pair<std::string, std::string>>>
+    load_endpoint_point_ids(const ClaimedEvent& ev, const LiveEdge& edge);
+
+    drogon::Task<Result<rag::Embedding>>
+    load_type_vector(const ClaimedEvent& ev);
+
+    drogon::Task<Result<void>>
+    upsert_bookkeeping(const ClaimedEvent& ev,
+                       const std::string&  qdrant_point_id,
+                       std::int64_t        edge_version);
 
     drogon::orm::DbClientPtr                    db_;
     VectorStoreForCollection                    store_for_collection_;
@@ -121,6 +163,7 @@ private:
     std::atomic<std::size_t>                    events_failed_{0};
     std::atomic<std::size_t>                    events_superseded_{0};
     std::atomic<std::size_t>                    events_no_edge_{0};
+    std::atomic<std::size_t>                    events_model_disabled_{0};
 };
 
 } // namespace wikore::scheduler

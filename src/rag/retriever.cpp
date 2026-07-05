@@ -139,7 +139,7 @@ static std::string build_search_body(const Embedding&    query,
     std::string vec_json = "[";
     for (size_t i = 0; i < query.size(); ++i) {
         if (i) vec_json += ',';
-        vec_json += std::format("{:.8g}", query[i]);
+        vec_json += std::format("{:.9g}", query[i]);
     }
     vec_json += ']';
 
@@ -242,7 +242,7 @@ QdrantVectorStore::upsert(const std::vector<UpsertPoint>& points)
         std::string vec = "[";
         for (size_t i = 0; i < p.vector.size(); ++i) {
             if (i) vec += ',';
-            vec += std::format("{:.8g}", p.vector[i]);
+            vec += std::format("{:.9g}", p.vector[i]);
         }
         vec += ']';
 
@@ -386,8 +386,13 @@ QdrantVectorStore::fetch_vectors_by_id(const std::vector<std::string>& point_ids
 
     // Parse the response with glaze. Qdrant returns
     //   { "result": [ {"id": "...", "vector": [ ... ]}, ... ], ... }
+    // Qdrant wraps every response with {"result": ..., "status": "ok",
+    // "time": ...}. Skip unknown keys so the strict-parse default does
+    // not fail on that envelope — the same shape applies to
+    // QdrantSearchResponse below.
     QdrantPointsResp parsed;
-    if (auto err = glz::read_json(parsed, resp->getBody()); err) {
+    if (auto err = glz::read<glz::opts{.error_on_unknown_keys = false}>(
+            parsed, resp->getBody()); err) {
         co_return std::unexpected(Error::unavailable(std::format(
             "qdrant fetch_vectors_by_id: response parse error: {}",
             glz::format_error(err, resp->getBody()))));
@@ -410,7 +415,7 @@ QdrantVectorStore::upsert_raw(std::string_view point_id,
     std::string vec_json = "[";
     for (size_t i = 0; i < vector.size(); ++i) {
         if (i) vec_json += ',';
-        vec_json += std::format("{:.8g}", vector[i]);
+        vec_json += std::format("{:.9g}", vector[i]);
     }
     vec_json += ']';
     std::string body = std::format(
@@ -536,8 +541,15 @@ QdrantVectorStore::search(const Embedding&    query,
                         static_cast<int>(resp->getStatusCode()))));
     }
 
+    // Qdrant wraps every response with {"result": ..., "status": "ok",
+    // "time": ...}. The pre-existing strict-parse would fail on that
+    // envelope; the bug never surfaced because production traffic
+    // always came back with a well-formed result payload the field
+    // shape matched, but any Qdrant version bump adding a top-level
+    // field would break search. Same fix as fetch_vectors_by_id above.
     QdrantSearchResponse parsed{};
-    if (auto err = glz::read_json(parsed, resp->getBody()); err) {
+    if (auto err = glz::read<glz::opts{.error_on_unknown_keys = false}>(
+            parsed, resp->getBody()); err) {
         co_return std::unexpected(Error::unavailable("qdrant search response parse failed"));
     }
 
@@ -631,11 +643,11 @@ NullVectorStore::upsert_raw(std::string_view point_id,
                             std::string      payload_json)
 {
     const std::string id{point_id};
-    // Upsert semantics on both parallel stores.
+    bool updated = false;
     for (auto& e : _raw_points)
-        if (e.first == id) { e.second = std::move(payload_json); goto vec; }
-    _raw_points.emplace_back(id, std::move(payload_json));
-vec:
+        if (e.first == id) { e.second = std::move(payload_json); updated = true; break; }
+    if (!updated) _raw_points.emplace_back(id, std::move(payload_json));
+
     for (auto& e : _raw_vectors)
         if (e.first == id) { e.second = vector; co_return Result<void>{}; }
     _raw_vectors.emplace_back(id, vector);

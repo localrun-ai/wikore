@@ -11,14 +11,15 @@ namespace wikore::application {
 namespace {
 
 // Serialize a float vector as Postgres REAL[] text literal '{a,b,c}'.
-// The values come from the embedder, so 8 significant digits round-trip
-// float32 losslessly through the text protocol.
+// FLT_DECIMAL_DIG (9 digits) is the minimum for a float32 round-trip
+// through decimal — 8 is one short (there exist float32 values that
+// print-then-parse back to a ±1 ulp neighbour with 8g).
 std::string to_pg_real_array(const rag::Embedding& v)
 {
     std::string s = "{";
     for (size_t i = 0; i < v.size(); ++i) {
         if (i) s += ',';
-        s += std::format("{:.8g}", v[i]);
+        s += std::format("{:.9g}", v[i]);
     }
     s += '}';
     return s;
