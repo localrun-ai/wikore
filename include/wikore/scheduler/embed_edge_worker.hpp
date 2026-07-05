@@ -167,6 +167,13 @@ private:
     // apply_edge_vector writes those to Qdrant and to the bookkeeping
     // table.
     drogon::Task<Result<void>>
+    fetch_endpoint_vectors(std::shared_ptr<rag::VectorStorePort> chunk_store,
+                           const std::string& ep0_pid,
+                           const std::string& ep1_pid,
+                           rag::Embedding&    out_v0,
+                           rag::Embedding&    out_v1);
+
+    drogon::Task<Result<void>>
     load_endpoint_vecs(const ClaimedEvent& ev,
                        const LiveEdge&     live,
                        std::shared_ptr<rag::VectorStorePort> chunk_store,

@@ -411,13 +411,29 @@ EmbedEdgeWorker::upsert_bookkeeping(const ClaimedEvent& ev,
     co_return Result<void>{};
 }
 
-// load_endpoint_vecs — do the two co_awaits that need endpoint chunk
-// vector data (point-id lookup, Qdrant fetch). Keeping this in its own
-// tiny coroutine keeps prepare_edge_vector's frame small enough for
-// GCC 14. The out-param vectors live in the CALLER's stack, not this
-// frame — that plus the load_endpoint_point_ids/fetch_vectors_by_id
-// each returning Result<void>/Result<vec<pair>> keeps this frame's
-// destructor short.
+// Split into two single-co_await helpers because GCC 14's coroutine
+// frame destructor emitter ICEs (build_special_member_call at
+// cp/call.cc:11096, inlining Error::~Error) on frames that contain
+// two co_awaits together with any std::format-returning path — this
+// combination pushed the destructor codegen past what the emitter
+// handles. Keeping each helper to exactly one co_await is the smallest
+// shape we've found that reliably survives.
+drogon::Task<Result<void>>
+EmbedEdgeWorker::fetch_endpoint_vectors(std::shared_ptr<rag::VectorStorePort> chunk_store,
+                                        const std::string& ep0_pid,
+                                        const std::string& ep1_pid,
+                                        rag::Embedding&    out_v0,
+                                        rag::Embedding&    out_v1)
+{
+    auto vecs = co_await chunk_store->fetch_vectors_by_id({ep0_pid, ep1_pid});
+    if (!vecs) co_return std::unexpected(vecs.error());
+    for (auto& kv : *vecs) {
+        if (kv.first == ep0_pid) out_v0 = std::move(kv.second);
+        else if (kv.first == ep1_pid) out_v1 = std::move(kv.second);
+    }
+    co_return Result<void>{};
+}
+
 drogon::Task<Result<void>>
 EmbedEdgeWorker::load_endpoint_vecs(const ClaimedEvent& ev,
                                     const LiveEdge&     live,
@@ -431,17 +447,16 @@ EmbedEdgeWorker::load_endpoint_vecs(const ClaimedEvent& ev,
         if (!r) co_return std::unexpected(r.error());
     }
     {
-        auto vecs = co_await chunk_store->fetch_vectors_by_id({ep0_pid, ep1_pid});
-        if (!vecs) co_return std::unexpected(vecs.error());
-        for (auto& kv : *vecs) {
-            if (kv.first == ep0_pid) out_v0 = std::move(kv.second);
-            else if (kv.first == ep1_pid) out_v1 = std::move(kv.second);
-        }
+        auto r = co_await fetch_endpoint_vectors(chunk_store, ep0_pid, ep1_pid,
+                                                 out_v0, out_v1);
+        if (!r) co_return std::unexpected(r.error());
     }
-    if (out_v0.empty() || out_v1.empty())
-        co_return std::unexpected(Error::unavailable(std::format(
+    if (out_v0.empty() || out_v1.empty()) {
+        std::string msg = std::format(
             "Qdrant did not return one of the endpoint vectors "
-            "(ep0='{}' ep1='{}'); retry", ep0_pid, ep1_pid)));
+            "(ep0='{}' ep1='{}'); retry", ep0_pid, ep1_pid);
+        co_return std::unexpected(Error::unavailable(std::move(msg)));
+    }
     co_return Result<void>{};
 }
 
