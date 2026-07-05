@@ -156,9 +156,31 @@ private:
     drogon::Task<Result<void>>
     load_type_vector(const ClaimedEvent& ev, rag::Embedding& out_v_type);
 
-    // Terminal phase: read endpoint chunk vectors from Qdrant, compute
-    // formula v1, upsert edge point, and update bookkeeping. Split out
-    // so process() itself has a tiny frame GCC 14 can emit.
+    // Terminal phases (split from a single write_edge_vector coroutine
+    // because GCC 14's coroutine emitter ICEs even after the previous
+    // split; five co_awaits + Embedding locals in one frame is still
+    // too much). Both stages return Result<void> and communicate via
+    // stack-allocated out-params in the caller.
+    //
+    // prepare_edge_vector loads endpoint + type vectors from Qdrant and
+    // Postgres, runs the pure formula, and produces (edge_vec, pid).
+    // apply_edge_vector writes those to Qdrant and to the bookkeeping
+    // table.
+    drogon::Task<Result<void>>
+    prepare_edge_vector(const ClaimedEvent& ev,
+                        const LiveEdge&     live,
+                        std::shared_ptr<rag::VectorStorePort> chunk_store,
+                        rag::Embedding&     out_edge_vec,
+                        std::string&        out_point_id);
+
+    drogon::Task<Result<void>>
+    apply_edge_vector(const ClaimedEvent& ev,
+                      const LiveEdge&     live,
+                      const rag::Embedding& edge_vec,
+                      const std::string&    point_id);
+
+    // Kept for the process() -> apply chain readability; body is the
+    // two-line stitch of prepare + apply.
     drogon::Task<Result<Outcome>>
     write_edge_vector(const ClaimedEvent& ev,
                       const LiveEdge&     live,

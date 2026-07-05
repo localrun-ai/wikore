@@ -410,11 +410,12 @@ EmbedEdgeWorker::upsert_bookkeeping(const ClaimedEvent& ev,
     co_return Result<void>{};
 }
 
-drogon::Task<Result<EmbedEdgeWorker::Outcome>>
-EmbedEdgeWorker::write_edge_vector(const ClaimedEvent& ev,
-                                   const LiveEdge&     live,
-                                   const std::string&  collection,
-                                   std::shared_ptr<rag::VectorStorePort> chunk_store)
+drogon::Task<Result<void>>
+EmbedEdgeWorker::prepare_edge_vector(const ClaimedEvent& ev,
+                                     const LiveEdge&     live,
+                                     std::shared_ptr<rag::VectorStorePort> chunk_store,
+                                     rag::Embedding&     out_edge_vec,
+                                     std::string&        out_point_id)
 {
     // 4. Endpoint point-ids.
     std::string ep0_pid, ep1_pid;
@@ -445,19 +446,26 @@ EmbedEdgeWorker::write_edge_vector(const ClaimedEvent& ev,
     }
 
     // 6. Formula v1 (pure).
-    rag::Embedding edge_vec;
     {
         auto r = rag::compute_edge_vector_v1(live.auth0, live.auth1, v0, v1, v_type);
         if (!r) co_return std::unexpected(r.error());
-        edge_vec = std::move(*r);
+        out_edge_vec = std::move(*r);
     }
 
     // 7. Version-free point id (pure).
-    const std::string pid = compute_point_id(ev.edge_id,
-                                             ev.embedding_model_id,
-                                             ev.formula_version);
+    out_point_id = compute_point_id(ev.edge_id,
+                                    ev.embedding_model_id,
+                                    ev.formula_version);
+    co_return Result<void>{};
+}
 
-    // 8. Qdrant upsert. LIVE payload fields.
+drogon::Task<Result<void>>
+EmbedEdgeWorker::apply_edge_vector(const ClaimedEvent& ev,
+                                   const LiveEdge&     live,
+                                   const rag::Embedding& edge_vec,
+                                   const std::string&    point_id)
+{
+    // 8. Qdrant upsert. LIVE payload fields, not event snapshot.
     {
         std::string payload_json = std::format(
             R"({{"company_id":"{}","edge_id":"{}","edge_type":"{}",)"
@@ -468,17 +476,35 @@ EmbedEdgeWorker::write_edge_vector(const ClaimedEvent& ev,
             ev.formula_version, live.edge_version,
             live.ep0_chunk_id, live.ep1_chunk_id,
             live.auth0, live.auth1, live.review_state);
-        auto r = co_await edge_store_->upsert_raw(pid, edge_vec, std::move(payload_json));
+        auto r = co_await edge_store_->upsert_raw(point_id, edge_vec, std::move(payload_json));
         if (!r) co_return std::unexpected(r.error());
     }
 
     // 9. Bookkeeping.
     {
-        auto r = co_await upsert_bookkeeping(ev, pid, live.edge_version);
+        auto r = co_await upsert_bookkeeping(ev, point_id, live.edge_version);
         if (!r) co_return std::unexpected(r.error());
     }
+    co_return Result<void>{};
+}
 
+drogon::Task<Result<EmbedEdgeWorker::Outcome>>
+EmbedEdgeWorker::write_edge_vector(const ClaimedEvent& ev,
+                                   const LiveEdge&     live,
+                                   const std::string&  collection,
+                                   std::shared_ptr<rag::VectorStorePort> chunk_store)
+{
     (void)collection;
+    rag::Embedding edge_vec;
+    std::string    pid;
+    {
+        auto r = co_await prepare_edge_vector(ev, live, chunk_store, edge_vec, pid);
+        if (!r) co_return std::unexpected(r.error());
+    }
+    {
+        auto r = co_await apply_edge_vector(ev, live, edge_vec, pid);
+        if (!r) co_return std::unexpected(r.error());
+    }
     co_return Outcome::Completed;
 }
 
