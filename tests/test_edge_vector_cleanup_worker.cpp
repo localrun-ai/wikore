@@ -105,23 +105,37 @@ SeedIds seed(drogon::orm::DbClientPtr db)
     auto edge_id  = std::string(exec_sync(db, "SELECT gen_random_uuid() AS id")[0]["id"].c_str());
     auto point_id = std::string(exec_sync(db, "SELECT gen_random_uuid() AS id")[0]["id"].c_str());
 
-    // Insert edge + endpoints in one synchronous multi-statement so the
-    // deferred CONSTRAINT TRIGGER passes at COMMIT and control returns
-    // only AFTER commit. Constants are inlined (no bind params) so
-    // drogon uses the simple query protocol, which accepts multi-statement.
-    exec_sync(db, std::format(
-        "BEGIN;"
-        "INSERT INTO knowledge_edges "
-        "  (id,company_id,edge_type,direction,confidence,origin) "
-        "  VALUES ('{}'::uuid,'{}'::uuid,'implements','directed',0.9,'administrator');"
-        "INSERT INTO knowledge_edge_endpoints "
-        "  (company_id,edge_id,ordinal,chunk_id,role) "
-        "  VALUES ('{}'::uuid,'{}'::uuid,0,'{}'::uuid,'source'),"
-        "         ('{}'::uuid,'{}'::uuid,1,'{}'::uuid,'target');"
-        "COMMIT;",
-        edge_id, CO_EDGECLEAN,
-        CO_EDGECLEAN, edge_id, CH1_EDGECLEAN,
-        CO_EDGECLEAN, edge_id, CH2_EDGECLEAN));
+    // Insert edge + endpoints as ONE data-modifying CTE.
+    //
+    // Correctness note: drogon's TransactionPtr commits on destruction
+    // ASYNCHRONOUSLY, so a sync_wait around a begin+INSERT+COMMIT coroutine
+    // returns before COMMIT actually lands — a following INSERT into
+    // knowledge_edge_embeddings then races the parent FK. Multi-statement
+    // "BEGIN; ...; COMMIT;" is also unusable here: the CI drogon build
+    // enables libpq pipeline mode (PgBatchConnection), which routes every
+    // query through a prepared statement, and prepared statements reject
+    // multi-command strings ("cannot insert multiple commands into a
+    // prepared statement").
+    //
+    // A single-statement data-modifying CTE runs in its own implicit
+    // transaction: the deferred two-endpoint CONSTRAINT TRIGGER fires at
+    // that statement's commit, and exec_sync returning means the commit
+    // has landed — so the next INSERT into knowledge_edge_embeddings sees
+    // the parent edge row without a race. Bind parameters are fine again
+    // (single command).
+    exec_sync(db,
+        "WITH e AS ("
+        "  INSERT INTO knowledge_edges "
+        "    (id,company_id,edge_type,direction,confidence,origin) "
+        "  VALUES ($1::uuid,$2::uuid,'implements','directed',0.9,'administrator') "
+        "  RETURNING id, company_id"
+        ") "
+        "INSERT INTO knowledge_edge_endpoints (company_id,edge_id,ordinal,chunk_id,role) "
+        "SELECT company_id, id, 0, $3::uuid, 'source' FROM e "
+        "UNION ALL "
+        "SELECT company_id, id, 1, $4::uuid, 'target' FROM e",
+        edge_id, std::string(CO_EDGECLEAN),
+        std::string(CH1_EDGECLEAN), std::string(CH2_EDGECLEAN));
 
     exec_sync(db,
         "INSERT INTO knowledge_edge_embeddings "
