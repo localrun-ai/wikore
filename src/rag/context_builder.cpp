@@ -10,6 +10,15 @@ namespace {
 
 constexpr std::size_t kChatTemplateAllowance = 32;
 
+// C++23 deducing-this alternative to the std::visit overloaded pattern.
+// Used to type-dispatch across the AllowedEvidence variant without a
+// generic lambda that would compile equally for AllowedChunk and
+// AllowedRelationship — we want per-alternative code, not a common
+// interface, because relationship rendering is deliberately unimplemented
+// in this PR (see the visit sites below).
+template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
+template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
+
 bool add_overflows(std::size_t a, std::size_t b) noexcept
 {
     return b > std::numeric_limits<std::size_t>::max() - a;
@@ -87,9 +96,19 @@ Result<PromptContext> ContextBuilder::build(
     // cross-tenant object is an evidence-routing bug even when it would not
     // have been selected for the prompt.
     for (const auto& ev : evidence) {
+        // AllowedRelationship rendering (edge citation format, endpoint
+        // hydration into the prompt) is step 8 of BaryGraph Lite. Until
+        // then reject it explicitly so a caller that constructs a mixed
+        // variant surfaces the gap loudly instead of silently dropping
+        // the relationship on the floor.
         const auto& company_id = std::visit(
-            [](const AllowedChunk& c) -> const std::string& {
-                return c.company_id();
+            overloaded{
+                [](const AllowedChunk& c) -> const std::string& {
+                    return c.company_id();
+                },
+                [](const AllowedRelationship& r) -> const std::string& {
+                    return r.company_id();
+                },
             }, ev);
         if (company_id != ctx.tenant.company_id) {
             spdlog::error("[context-builder] cross-tenant evidence: "
@@ -129,27 +148,45 @@ Result<PromptContext> ContextBuilder::build(
         }
 
         bool accepted = false;
-        std::visit([&](const AllowedChunk& chunk) {
-            const std::string escaped_text = escape_source_text(chunk.text());
-            const std::string block = std::format(
-                "[SRC {}]\n<source>\n{}\n</source>\n\n",
-                included + 1, escaped_text);
-            const std::string candidate_user = evidence_blocks + block + query_block;
-            if (prompt_bytes(opts.system_prompt, candidate_user)
-                    > opts.max_prompt_bytes) {
-                return;
-            }
-            auto tokens = token_counter_->count(opts.system_prompt, candidate_user);
-            if (!tokens) {
-                counter_error = tokens.error();
-                return;
-            }
-            if (*tokens > input_token_budget)
-                return;
-            evidence_blocks += block;
-            out.source_chunk_ids.push_back(chunk.chunk_id());
-            accepted = true;
+        std::optional<Error> reject_error;
+        std::visit(overloaded{
+            [&](const AllowedChunk& chunk) {
+                const std::string escaped_text = escape_source_text(chunk.text());
+                const std::string block = std::format(
+                    "[SRC {}]\n<source>\n{}\n</source>\n\n",
+                    included + 1, escaped_text);
+                const std::string candidate_user = evidence_blocks + block + query_block;
+                if (prompt_bytes(opts.system_prompt, candidate_user)
+                        > opts.max_prompt_bytes) {
+                    return;
+                }
+                auto tokens = token_counter_->count(opts.system_prompt, candidate_user);
+                if (!tokens) {
+                    counter_error = tokens.error();
+                    return;
+                }
+                if (*tokens > input_token_budget)
+                    return;
+                evidence_blocks += block;
+                out.source_chunk_ids.push_back(chunk.chunk_id());
+                accepted = true;
+            },
+            [&](const AllowedRelationship& /*rel*/) {
+                // Step 8 territory: relationship rendering (citation
+                // format for edges, endpoint text folding, whole-
+                // relationship-or-nothing bytes accounting) is
+                // deliberately deferred. Fail closed until it lands
+                // so callers cannot accidentally emit an edge-shaped
+                // AllowedEvidence into a prompt through the chunk
+                // renderer.
+                reject_error = Error::invalid_state(
+                    "context_builder: AllowedRelationship rendering not yet "
+                    "implemented; step 8 of BaryGraph Lite will add it");
+            },
         }, ev);
+
+        if (reject_error)
+            return std::unexpected(std::move(*reject_error));
 
         if (counter_error)
             return std::unexpected(std::move(*counter_error));

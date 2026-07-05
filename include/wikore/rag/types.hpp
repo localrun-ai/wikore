@@ -137,6 +137,30 @@ struct ChunkCandidate {
     ChunkPayload payload;
 };
 
+// ---------------------------------------------------------------------------
+// EdgeCandidate: result of a Qdrant search on the edge collection, before the
+// RelationshipEvidenceGate check.
+//
+// Payload fields come from V037's knowledge_edges_enqueue_upsert_fn writer
+// (see EmbedEdgeWorker) — company_id, edge_id, edge_type, formula_version,
+// edge_version, endpoint_0_chunk_id, endpoint_1_chunk_id, review_state.
+// Everything is advisory: the gate MUST re-read the edge, its endpoints,
+// and per-endpoint visibility from live Postgres. The candidate exists only
+// to name a point for scoring and to feed the batch id list the gate
+// materialises in one set-based query.
+// ---------------------------------------------------------------------------
+
+struct EdgeCandidate {
+    std::string edge_id;
+    std::string company_id;                   // advisory; re-verified by gate
+    std::string edge_type;                    // advisory
+    float       score              = 0.0f;    // Qdrant cosine similarity
+    std::int64_t edge_version      = 0;       // advisory staleness hint
+    int         formula_version    = 0;
+    std::string endpoint_0_chunk_id;          // advisory; re-verified by gate
+    std::string endpoint_1_chunk_id;          // advisory; re-verified by gate
+};
+
 #ifdef WIKORE_ENABLE_TEST_HOOKS
 // Test-only construction hook. Release/production targets never see this
 // declaration and therefore cannot define the friend to mint evidence.
@@ -204,17 +228,105 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// AllowedRelationship: an edge that has passed RelationshipEvidenceGate.
+//
+// Same passkey construction pattern as AllowedChunk: only
+// RelationshipEvidenceGate (and test_support::TestGate under the test-hooks
+// macro) can mint one. Every endpoint is guaranteed to have been live-
+// authorized at gate time; the gate hydrates the endpoint chunks' text
+// alongside admission so the reranker and ContextBuilder never touch
+// Qdrant payload text directly.
+//
+// Per docs/barygraph_features.md §"No partial relationship hydration": if
+// ANY endpoint fails authorization the WHOLE relationship disappears — the
+// gate never emits an AllowedRelationship for a partially-visible edge.
+// Even the existence of the relationship is redacted from the caller,
+// because revealing it can leak information about the inaccessible
+// endpoint.
+// ---------------------------------------------------------------------------
+
+class RelationshipEvidenceGate;
+
+class AllowedRelationship {
+public:
+    class ConstructionToken {
+        ConstructionToken() = default;
+        friend class RelationshipEvidenceGate;
+#ifdef WIKORE_ENABLE_TEST_HOOKS
+        friend class test_support::TestGate;
+#endif
+    };
+
+    // Hydrated endpoint view. The gate carries the live chunk text +
+    // section heading so downstream consumers (reranker, ContextBuilder)
+    // never need to re-query Postgres or trust the Qdrant payload.
+    struct AllowedEndpoint {
+        int                        ordinal        = 0;  // 0 or 1
+        std::string                chunk_id;
+        std::string                document_version_id;
+        std::string                text;
+        std::optional<std::string> section_heading;
+    };
+
+    AllowedRelationship(ConstructionToken,
+                        std::string  company_id,
+                        std::string  edge_id,
+                        std::string  edge_type,
+                        std::string  direction,
+                        float        score,
+                        double       confidence,
+                        std::string  review_state,
+                        std::int64_t edge_version,
+                        AllowedEndpoint ep0,
+                        AllowedEndpoint ep1)
+        : company_id_(std::move(company_id))
+        , edge_id_(std::move(edge_id))
+        , edge_type_(std::move(edge_type))
+        , direction_(std::move(direction))
+        , score_(score)
+        , confidence_(confidence)
+        , review_state_(std::move(review_state))
+        , edge_version_(edge_version)
+        , ep0_(std::move(ep0))
+        , ep1_(std::move(ep1)) {}
+
+    AllowedRelationship() = delete;
+
+    [[nodiscard]] const std::string& company_id()   const noexcept { return company_id_; }
+    [[nodiscard]] const std::string& edge_id()      const noexcept { return edge_id_; }
+    [[nodiscard]] const std::string& edge_type()    const noexcept { return edge_type_; }
+    [[nodiscard]] const std::string& direction()    const noexcept { return direction_; }
+    [[nodiscard]] float              score()        const noexcept { return score_; }
+    [[nodiscard]] double             confidence()   const noexcept { return confidence_; }
+    [[nodiscard]] const std::string& review_state() const noexcept { return review_state_; }
+    [[nodiscard]] std::int64_t       edge_version() const noexcept { return edge_version_; }
+    [[nodiscard]] const AllowedEndpoint& endpoint_0() const noexcept { return ep0_; }
+    [[nodiscard]] const AllowedEndpoint& endpoint_1() const noexcept { return ep1_; }
+
+private:
+    std::string     company_id_;
+    std::string     edge_id_;
+    std::string     edge_type_;
+    std::string     direction_;
+    float           score_        = 0.0f;
+    double          confidence_   = 0.0;
+    std::string     review_state_;
+    std::int64_t    edge_version_ = 0;
+    AllowedEndpoint ep0_;
+    AllowedEndpoint ep1_;
+};
+
+// ---------------------------------------------------------------------------
 // AllowedEvidence — the variant type accepted by ContextBuilder.
 //
-// Currently a single-member variant containing AllowedChunk (chunk-only
-// retrieval, Iteration 3). AllowedRelationship and AllowedPath will be added
-// as BaryGraph Lite edges become available (V034+).
+// Extended with AllowedRelationship once V034+ edges become retrievable.
+// AllowedPath will follow when bounded-path traversal lands.
 //
 // ContextBuilder must accept std::span<const AllowedEvidence> and must NOT
 // be overloaded for ChunkCandidate, raw Qdrant payloads, or diagnostic types.
 // ---------------------------------------------------------------------------
 
-using AllowedEvidence = std::variant<AllowedChunk>;
+using AllowedEvidence = std::variant<AllowedChunk, AllowedRelationship>;
 
 // ---------------------------------------------------------------------------
 // QdrantFilter: access-controlled search filter for a Qdrant query.

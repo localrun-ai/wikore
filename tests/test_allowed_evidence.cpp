@@ -55,9 +55,18 @@ ContextBuilderOptions roomy_options()
 static_assert(!std::is_convertible_v<ChunkCandidate, AllowedEvidence>);
 static_assert(!std::is_default_constructible_v<AllowedChunk>);
 static_assert(!std::is_default_constructible_v<AllowedChunk::ConstructionToken>);
-static_assert(std::variant_size_v<AllowedEvidence> == 1);
+// Bumped from 1 to 2 in step 6 of BaryGraph Lite: the variant now also
+// carries AllowedRelationship. Chunk stays at alternative 0 so existing
+// visit overloads keep their index; relationship is alternative 1.
+static_assert(std::variant_size_v<AllowedEvidence> == 2);
 static_assert(std::is_same_v<
     std::variant_alternative_t<0, AllowedEvidence>, AllowedChunk>);
+static_assert(std::is_same_v<
+    std::variant_alternative_t<1, AllowedEvidence>, AllowedRelationship>);
+// AllowedRelationship shares AllowedChunk's construction-token discipline:
+// only the corresponding gate can mint one.
+static_assert(!std::is_default_constructible_v<AllowedRelationship>);
+static_assert(!std::is_default_constructible_v<AllowedRelationship::ConstructionToken>);
 static_assert(std::is_same_v<
     decltype(std::declval<const AllowedChunk>().company_id()),
     const std::string&>);
