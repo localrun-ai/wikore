@@ -184,6 +184,22 @@ const std::unordered_set<std::string> k_allowlist = {
     // foreign_key_violation with a named constraint; a cross-tenant actor
     // is a programming bug -> database_error.
     "tenant_features_enabled_by_same_company_fk",
+
+    // V036: privileged access sessions
+    // Inline CHECKs (expires_at > starts_at, revoked_at/revoked_by pair
+    // consistency) get PG-generated names. Allowed-listed because
+    // inserting an inconsistent session is a programming bug in the
+    // session-management service.
+    "privileged_access_sessions_check",
+    "privileged_access_sessions_check1",
+    // Composite-FK target UNIQUE key on (company_id, id) — auto-named by PG.
+    // A duplicate would require a duplicate primary-key id, which the PK
+    // constraint already rejects. Programming bug -> database_error.
+    "privileged_access_sessions_company_id_id_key",
+    // Internal denormalized counter maintained by the approval trigger.
+    "privileged_access_sessions_decision_count_chk",
+    // History change_kind is trigger-owned, not caller input.
+    "privileged_access_session_history_change_kind_check",
 };
 
 bool integration_db_available() {
