@@ -1564,9 +1564,39 @@ kTypeDescriptions[] = {
 qdrant_point_id = uuid_v5(
     edge_id + ":" + str(embedding_model_id)
     + ":" + str(formula_version)
-    + ":" + str(edge_version)
 )
 ```
+
+**Note: `edge_version` is deliberately NOT part of the point ID.** The
+BaryGraph PoC includes it, but for Wikore that would orphan every
+previous-version point in Qdrant:
+`knowledge_edge_embeddings` is keyed on `(edge_id, embedding_model_id)`
+and holds a single `qdrant_point_id` per row, and V034's `BEFORE
+DELETE` trigger emits `qdrant_delete_edge_points` with only the current
+point ID. Including `edge_version` in the ID would mint a new point per
+bump; the bookkeeping row would forget the old one; and no cleanup path
+would ever see it again.
+
+Wikore's write path treats `edge_version` as a monotonic **staleness
+guard** in the outbox payload instead:
+
+* every `knowledge_edges` INSERT/UPDATE-that-bumps-edge_version
+  enqueues one `qdrant_upsert_edge_vector` event per enabled
+  embedding model, carrying the current `edge_version` in the
+  payload (V037's `knowledge_edges_enqueue_upsert_fn`);
+* the `EmbedEdgeWorker` claims an event and compares
+  `payload.edge_version` against
+  `knowledge_edge_embeddings.indexed_edge_version` for
+  `(edge_id, embedding_model_id)`; events with `<=` are dropped
+  as superseded (mirrors `ResyncWorker`'s CAS pattern from V032);
+* on write, the worker upserts the SAME `qdrant_point_id`
+  in place — no new ID is minted — and sets
+  `indexed_edge_version = payload.edge_version` in the
+  bookkeeping row.
+
+Result: every edge has at most one live Qdrant point per model, out-of-
+order redelivery is safe, and V034's `qdrant_delete_edge_points`
+cleanup covers every point that ever existed.
 
 `embedding_model_id` is the UUID FK from the existing `embedding_models`
 table introduced in `V003__documents.sql`. Wikore already has this registry;

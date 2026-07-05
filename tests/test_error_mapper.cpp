@@ -196,6 +196,18 @@ const std::unordered_set<std::string> k_allowlist = {
     // A duplicate would require a duplicate primary-key id, which the PK
     // constraint already rejects. Programming bug -> database_error.
     "privileged_access_sessions_company_id_id_key",
+
+    // V037: edge vector indexing
+    // Empty vector CHECK — inserting a zero-dim vector is a bug in the
+    // admin embed job, not user input.
+    "edge_type_vectors_vector_dim_positive_chk",
+    // Column-level description length CHECK — PG names it
+    // <table>_<column>_check, not <table>_check.
+    "edge_type_vectors_description_check",
+    // PK on (formula_version, edge_type, embedding_model_id) — a
+    // duplicate is a bug in the admin embed job (should upsert instead
+    // of inserting twice).
+    "edge_type_vectors_pkey",
     // Internal denormalized counter maintained by the approval trigger.
     "privileged_access_sessions_decision_count_chk",
     // History change_kind is trigger-owned, not caller input.
