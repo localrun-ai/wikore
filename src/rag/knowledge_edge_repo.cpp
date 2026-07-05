@@ -229,25 +229,37 @@ KnowledgeEdgeRepo::get(std::string_view company_id, std::string_view edge_id)
     if (!domain::looks_like_uuid(edge_id))
         co_return std::unexpected(Error::not_found("knowledge_edge not found"));
 
-    try {
+    // Fetch the edge row and its endpoints in two SELECTs. Structured so
+    // that `co_await` never crosses `try`/`catch` boundaries — GCC 14
+    // hits an ICE (build_special_member_call at cp/call.cc:11096) on
+    // certain arrangements of coroutine suspension inside try blocks,
+    // and the reset here keeps the frame flat.
+    domain::KnowledgeEdge edge;
+    {
         std::string edge_id_arg   {edge_id};
         std::string company_id_arg{company_id};
-        auto rows = co_await db_->execSqlCoro(
-            std::format("SELECT {} FROM knowledge_edges "
-                        "WHERE id = $1::uuid AND company_id = $2::uuid",
-                        kEdgeCols),
-            edge_id_arg, company_id_arg);
+        drogon::orm::Result rows{nullptr};
+        try {
+            rows = co_await db_->execSqlCoro(
+                std::format("SELECT {} FROM knowledge_edges "
+                            "WHERE id = $1::uuid AND company_id = $2::uuid",
+                            kEdgeCols),
+                edge_id_arg, company_id_arg);
+        } catch (const drogon::orm::DrogonDbException& ex) {
+            co_return std::unexpected(postgres::map_db_exception(ex));
+        }
         if (rows.empty())
             co_return std::unexpected(Error::not_found("knowledge_edge not found"));
-        auto edge = hydrate_edge(rows[0]);
-        auto ends = co_await load_endpoints(db_, company_id, {edge.id});
-        if (!ends) co_return std::unexpected(ends.error());
-        auto it = ends->find(edge.id);
-        if (it != ends->end()) edge.endpoints = std::move(it->second);
-        co_return edge;
-    } catch (const drogon::orm::DrogonDbException& ex) {
-        co_return std::unexpected(postgres::map_db_exception(ex));
+        edge = hydrate_edge(rows[0]);
     }
+
+    std::vector<std::string> ids;
+    ids.push_back(edge.id);
+    auto ends = co_await load_endpoints(db_, company_id, ids);
+    if (!ends) co_return std::unexpected(ends.error());
+    if (auto it = ends->find(edge.id); it != ends->end())
+        edge.endpoints = std::move(it->second);
+    co_return edge;
 }
 
 drogon::Task<Result<std::vector<domain::KnowledgeEdge>>>
@@ -264,29 +276,38 @@ KnowledgeEdgeRepo::list(std::string_view                        company_id,
         filter.review_state ? std::string(domain::to_wire(*filter.review_state)) : std::string();
     const std::string chunk_id = filter.endpoint_chunk_id.value_or(std::string());
 
+    // Same coroutine-frame shape as get(): keep co_await outside try blocks
+    // where possible to avoid the GCC 14 ICE (build_special_member_call at
+    // cp/call.cc:11096) that some try/co_return/co_await combinations
+    // trigger in coroutine-frame emission.
     std::vector<domain::KnowledgeEdge> out;
     std::vector<std::string>          ids;
-    try {
+    {
         std::string company_id_arg{company_id};
-        auto rows = co_await db_->execSqlCoro(
-            std::format(
-                "SELECT {} FROM knowledge_edges "
-                "WHERE company_id = $1::uuid "
-                "  AND ($2::text = '' OR edge_type    = $2::text) "
-                "  AND ($3::text = '' OR review_state = $3::text) "
-                "  AND ($4::text = '' OR id IN ("
-                "        SELECT edge_id FROM knowledge_edge_endpoints "
-                "        WHERE company_id = $1::uuid "
-                "          AND chunk_id   = $4::uuid)) "
-                "ORDER BY created_at DESC, id ASC "
-                "LIMIT $5::int OFFSET $6::int",
-                kEdgeCols),
-            company_id_arg,
-            edge_type,
-            review_state,
-            chunk_id,
-            filter.limit,
-            filter.offset);
+        drogon::orm::Result rows{nullptr};
+        try {
+            rows = co_await db_->execSqlCoro(
+                std::format(
+                    "SELECT {} FROM knowledge_edges "
+                    "WHERE company_id = $1::uuid "
+                    "  AND ($2::text = '' OR edge_type    = $2::text) "
+                    "  AND ($3::text = '' OR review_state = $3::text) "
+                    "  AND ($4::text = '' OR id IN ("
+                    "        SELECT edge_id FROM knowledge_edge_endpoints "
+                    "        WHERE company_id = $1::uuid "
+                    "          AND chunk_id   = $4::uuid)) "
+                    "ORDER BY created_at DESC, id ASC "
+                    "LIMIT $5::int OFFSET $6::int",
+                    kEdgeCols),
+                company_id_arg,
+                edge_type,
+                review_state,
+                chunk_id,
+                filter.limit,
+                filter.offset);
+        } catch (const drogon::orm::DrogonDbException& ex) {
+            co_return std::unexpected(postgres::map_db_exception(ex));
+        }
         out.reserve(rows.size());
         ids.reserve(rows.size());
         for (const auto& r : rows) {
@@ -294,15 +315,13 @@ KnowledgeEdgeRepo::list(std::string_view                        company_id,
             ids.push_back(e.id);
             out.push_back(std::move(e));
         }
-    } catch (const drogon::orm::DrogonDbException& ex) {
-        co_return std::unexpected(postgres::map_db_exception(ex));
     }
 
     auto ends = co_await load_endpoints(db_, company_id, ids);
     if (!ends) co_return std::unexpected(ends.error());
     for (auto& e : out) {
-        auto it = ends->find(e.id);
-        if (it != ends->end()) e.endpoints = std::move(it->second);
+        if (auto it = ends->find(e.id); it != ends->end())
+            e.endpoints = std::move(it->second);
     }
     co_return out;
 }
