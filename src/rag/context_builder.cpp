@@ -34,19 +34,21 @@ std::size_t prompt_bytes(std::string_view system_message,
 
 // Prompt-safety escape. Applied to every string we splice from live PG
 // data (chunk text, section heading, edge_type, review_state, origin,
-// direction) so a source that contains angle brackets or ampersands
-// cannot appear to close the surrounding <source> tag or inject markup
-// the LLM might interpret structurally.
+// direction, role) so a source that contains angle brackets, ampersands,
+// or double quotes cannot appear to close the surrounding <source> tag,
+// inject markup, or break out of a quoted attribute (section headings
+// are rendered inside double quotes).
 std::string escape(std::string_view text)
 {
     std::string escaped;
     escaped.reserve(text.size());
     for (const char c : text) {
         switch (c) {
-        case '&': escaped += "&amp;";  break;
-        case '<': escaped += "&lt;";   break;
-        case '>': escaped += "&gt;";   break;
-        default:  escaped += c;        break;
+        case '&':  escaped += "&amp;";  break;
+        case '<':  escaped += "&lt;";   break;
+        case '>':  escaped += "&gt;";   break;
+        case '"':  escaped += "&quot;"; break;
+        default:   escaped += c;        break;
         }
     }
     return escaped;
@@ -82,15 +84,41 @@ std::string format_endpoint_line(
 //
 // Format matches docs §"Context construction and answer semantics"
 // verbatim in shape — [REL Rn: type, origin=..., review_state=...,
-// confidence=...] plus per-endpoint lines and a direction hint. origin
-// is spelled out (administrator / inference / deterministic) so the
-// LLM can distinguish a model-proposed edge from an admin decision.
+// confidence=...] plus per-endpoint lines and a direction hint.
+//
+// Direction orientation for 'directed' edges is driven by ROLE, not by
+// wire-ordinal. V034 stores the role of each endpoint (source / target
+// / subject / object / a / b) independently of the ordinal — an edge
+// legitimately created as ordinal0=target, ordinal1=source must render
+// as "source implements target", not "target implements source". Rules:
+//   * If exactly one endpoint has role in {source, subject}, that one
+//     is on the semantic LEFT of the arrow.
+//   * Otherwise (both source/subject, both target/object, both a/b,
+//     or an unknown role) fall back to ordinal order (ordinal 0 left).
+// This also future-proofs rendering for the V2 typed-endpoint work.
 std::string format_relationship_block(
     int                        rel_n,
     const AllowedRelationship& r,
-    int                        src_a,
-    int                        src_b)
+    int                        src_a_wire,   // [SRC N] of ordinal 0
+    int                        src_b_wire)   // [SRC N] of ordinal 1
 {
+    // Decide semantic-left endpoint by role. `left_is_ordinal0` means
+    // ordinal 0's role is the acting/source side; false means we flip
+    // to render ordinal 1 on the left of the arrow.
+    const auto is_left_role = [](std::string_view role) {
+        return role == "source" || role == "subject";
+    };
+    const bool r0_left = is_left_role(r.endpoint_0().role);
+    const bool r1_left = is_left_role(r.endpoint_1().role);
+    // Only flip when exactly one endpoint is a left-role; ambiguity
+    // (both or neither) falls back to wire ordinal.
+    const bool left_is_ordinal0 = !(r1_left && !r0_left);
+
+    const int src_left  = left_is_ordinal0 ? src_a_wire : src_b_wire;
+    const int src_right = left_is_ordinal0 ? src_b_wire : src_a_wire;
+    const auto& ep_left  = left_is_ordinal0 ? r.endpoint_0() : r.endpoint_1();
+    const auto& ep_right = left_is_ordinal0 ? r.endpoint_1() : r.endpoint_0();
+
     std::string block;
     block += std::format(
         "[REL {}: {}, origin={}, review_state={}, confidence={:.2f}]\n",
@@ -99,20 +127,23 @@ std::string format_relationship_block(
         escape(r.origin()),
         escape(r.review_state()),
         r.confidence());
-    block += format_endpoint_line("A", src_a, r.endpoint_0().section_heading);
-    block += format_endpoint_line("B", src_b, r.endpoint_1().section_heading);
+    // Endpoint labels A/B follow the semantic-left/right order after
+    // role-based reorientation. Downstream citation targets [SRC N],
+    // which is the same physical chunk either way.
+    block += format_endpoint_line("A", src_left,  ep_left.section_heading);
+    block += format_endpoint_line("B", src_right, ep_right.section_heading);
 
     // Direction line. The V034 CHECK constrains direction to
     // {'directed','symmetric'}. For directed we spell out
-    // "[SRC a] {edge_type} [SRC b]" so the model does not have to
-    // infer role from ordinal. For symmetric we say so.
+    // "[SRC left] {edge_type} [SRC right]" so the model does not have
+    // to infer role from ordinal. For symmetric we say so.
     if (r.direction() == "symmetric") {
         block += "Direction: symmetric\n";
     } else {
         // Defensive default: treat anything non-'symmetric' as directed
         // rather than leaking a mystery value into the prompt.
         block += std::format("Direction: [SRC {}] {} [SRC {}]\n",
-                             src_a, escape(r.edge_type()), src_b);
+                             src_left, escape(r.edge_type()), src_right);
     }
     block += "\n";
     return block;

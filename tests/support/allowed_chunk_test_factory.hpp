@@ -140,11 +140,13 @@ inline AllowedRelationship make_rel(
 // Convenience for constructing an endpoint inline.
 inline AllowedRelationship::AllowedEndpoint make_endpoint(
     int ordinal, std::string chunk_id, std::string text,
+    std::string role                = "source",
     std::string document_version_id = "test-ver",
     std::optional<std::string> section_heading = std::nullopt)
 {
     return AllowedRelationship::AllowedEndpoint{
         .ordinal              = ordinal,
+        .role                 = std::move(role),
         .chunk_id             = std::move(chunk_id),
         .document_version_id  = std::move(document_version_id),
         .text                 = std::move(text),

@@ -260,8 +260,16 @@ public:
     // Hydrated endpoint view. The gate carries the live chunk text +
     // section heading so downstream consumers (reranker, ContextBuilder)
     // never need to re-query Postgres or trust the Qdrant payload.
+    //
+    // `role` is the V034 knowledge_edge_endpoints.role value
+    // (source/target/subject/object/a/b). It carries the RELATIONSHIP
+    // ORIENTATION independently of the wire-ordinal: an edge legitimately
+    // created as ordinal0=target, ordinal1=source must render with the
+    // source endpoint on the semantic left, so downstream rendering
+    // (ContextBuilder Direction line) MUST prefer role over ordinal.
     struct AllowedEndpoint {
         int                        ordinal        = 0;  // 0 or 1
+        std::string                role;                 // source/target/subject/object/a/b
         std::string                chunk_id;
         std::string                document_version_id;
         std::string                text;
@@ -298,12 +306,13 @@ public:
     [[nodiscard]] const std::string& edge_id()      const noexcept { return edge_id_; }
     [[nodiscard]] const std::string& edge_type()    const noexcept { return edge_type_; }
     [[nodiscard]] const std::string& direction()    const noexcept { return direction_; }
-    // origin is a V034 knowledge_edges enum: 'administrator' (explicit
-    // human decision), 'inference' (model-proposed), or 'deterministic'
-    // (produced by a scheduled rule). Surfaced here because the
+    // origin is a V034 knowledge_edges enum: 'parser' (parser-extracted
+    // during ingest), 'deterministic_rule' (produced by a scheduled
+    // deterministic rule), 'administrator' (explicit human decision),
+    // or 'llm_proposal' (model-proposed). Surfaced here because the
     // ContextBuilder rendering per docs §"Context construction" must
-    // label inferred edges to prevent the LLM from claiming a strength
-    // the edge does not have.
+    // label llm_proposal edges to prevent the LLM from claiming a
+    // strength the edge does not have.
     [[nodiscard]] const std::string& origin()       const noexcept { return origin_; }
     [[nodiscard]] float              score()        const noexcept { return score_; }
     [[nodiscard]] double             confidence()   const noexcept { return confidence_; }
