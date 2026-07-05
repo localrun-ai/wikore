@@ -411,6 +411,40 @@ EmbedEdgeWorker::upsert_bookkeeping(const ClaimedEvent& ev,
     co_return Result<void>{};
 }
 
+// load_endpoint_vecs — do the two co_awaits that need endpoint chunk
+// vector data (point-id lookup, Qdrant fetch). Keeping this in its own
+// tiny coroutine keeps prepare_edge_vector's frame small enough for
+// GCC 14. The out-param vectors live in the CALLER's stack, not this
+// frame — that plus the load_endpoint_point_ids/fetch_vectors_by_id
+// each returning Result<void>/Result<vec<pair>> keeps this frame's
+// destructor short.
+drogon::Task<Result<void>>
+EmbedEdgeWorker::load_endpoint_vecs(const ClaimedEvent& ev,
+                                    const LiveEdge&     live,
+                                    std::shared_ptr<rag::VectorStorePort> chunk_store,
+                                    rag::Embedding&     out_v0,
+                                    rag::Embedding&     out_v1)
+{
+    std::string ep0_pid, ep1_pid;
+    {
+        auto r = co_await load_endpoint_point_ids(ev, live, ep0_pid, ep1_pid);
+        if (!r) co_return std::unexpected(r.error());
+    }
+    {
+        auto vecs = co_await chunk_store->fetch_vectors_by_id({ep0_pid, ep1_pid});
+        if (!vecs) co_return std::unexpected(vecs.error());
+        for (auto& kv : *vecs) {
+            if (kv.first == ep0_pid) out_v0 = std::move(kv.second);
+            else if (kv.first == ep1_pid) out_v1 = std::move(kv.second);
+        }
+    }
+    if (out_v0.empty() || out_v1.empty())
+        co_return std::unexpected(Error::unavailable(std::format(
+            "Qdrant did not return one of the endpoint vectors "
+            "(ep0='{}' ep1='{}'); retry", ep0_pid, ep1_pid)));
+    co_return Result<void>{};
+}
+
 drogon::Task<Result<void>>
 EmbedEdgeWorker::prepare_edge_vector(const ClaimedEvent& ev,
                                      const LiveEdge&     live,
@@ -418,38 +452,24 @@ EmbedEdgeWorker::prepare_edge_vector(const ClaimedEvent& ev,
                                      rag::Embedding&     out_edge_vec,
                                      std::string&        out_point_id)
 {
-    // Heap-allocate the heavy intermediate state so it lives OUTSIDE
-    // the coroutine frame. GCC 14 ICEs when Embedding-sized locals
-    // (std::vector<float>) sit in the frame across multiple co_awaits;
-    // holding them behind a unique_ptr keeps the frame small enough
-    // for the coroutine emitter to lay out.
+    // Heap-allocate the Embedding locals so they do not live in this
+    // coroutine's frame. GCC 14's coroutine-frame destructor emitter
+    // ICEs when three std::vector<float> instances sit in the frame
+    // together (build_special_member_call:cp/call.cc:11096); moving
+    // them to the heap through a unique_ptr sidesteps that.
     struct Locals {
-        std::string    ep0_pid;
-        std::string    ep1_pid;
         rag::Embedding v0;
         rag::Embedding v1;
         rag::Embedding v_type;
     };
     auto s = std::make_unique<Locals>();
 
-    // 4. Endpoint point-ids.
+    // 4/4b. Endpoint vectors (own coroutine so the two round-trips
+    // don't inflate this frame).
     {
-        auto r = co_await load_endpoint_point_ids(ev, live, s->ep0_pid, s->ep1_pid);
+        auto r = co_await load_endpoint_vecs(ev, live, chunk_store, s->v0, s->v1);
         if (!r) co_return std::unexpected(r.error());
     }
-    // 4b. Endpoint vectors from Qdrant.
-    {
-        auto vecs = co_await chunk_store->fetch_vectors_by_id({s->ep0_pid, s->ep1_pid});
-        if (!vecs) co_return std::unexpected(vecs.error());
-        for (auto& kv : *vecs) {
-            if (kv.first == s->ep0_pid) s->v0 = std::move(kv.second);
-            else if (kv.first == s->ep1_pid) s->v1 = std::move(kv.second);
-        }
-    }
-    if (s->v0.empty() || s->v1.empty())
-        co_return std::unexpected(Error::unavailable(std::format(
-            "Qdrant did not return one of the endpoint vectors "
-            "(ep0='{}' ep1='{}'); retry", s->ep0_pid, s->ep1_pid)));
 
     // 5. Type vector.
     {
