@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <format>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -417,37 +418,48 @@ EmbedEdgeWorker::prepare_edge_vector(const ClaimedEvent& ev,
                                      rag::Embedding&     out_edge_vec,
                                      std::string&        out_point_id)
 {
+    // Heap-allocate the heavy intermediate state so it lives OUTSIDE
+    // the coroutine frame. GCC 14 ICEs when Embedding-sized locals
+    // (std::vector<float>) sit in the frame across multiple co_awaits;
+    // holding them behind a unique_ptr keeps the frame small enough
+    // for the coroutine emitter to lay out.
+    struct Locals {
+        std::string    ep0_pid;
+        std::string    ep1_pid;
+        rag::Embedding v0;
+        rag::Embedding v1;
+        rag::Embedding v_type;
+    };
+    auto s = std::make_unique<Locals>();
+
     // 4. Endpoint point-ids.
-    std::string ep0_pid, ep1_pid;
     {
-        auto r = co_await load_endpoint_point_ids(ev, live, ep0_pid, ep1_pid);
+        auto r = co_await load_endpoint_point_ids(ev, live, s->ep0_pid, s->ep1_pid);
         if (!r) co_return std::unexpected(r.error());
     }
     // 4b. Endpoint vectors from Qdrant.
-    rag::Embedding v0, v1;
     {
-        auto vecs = co_await chunk_store->fetch_vectors_by_id({ep0_pid, ep1_pid});
+        auto vecs = co_await chunk_store->fetch_vectors_by_id({s->ep0_pid, s->ep1_pid});
         if (!vecs) co_return std::unexpected(vecs.error());
         for (auto& kv : *vecs) {
-            if (kv.first == ep0_pid) v0 = std::move(kv.second);
-            else if (kv.first == ep1_pid) v1 = std::move(kv.second);
+            if (kv.first == s->ep0_pid) s->v0 = std::move(kv.second);
+            else if (kv.first == s->ep1_pid) s->v1 = std::move(kv.second);
         }
     }
-    if (v0.empty() || v1.empty())
+    if (s->v0.empty() || s->v1.empty())
         co_return std::unexpected(Error::unavailable(std::format(
             "Qdrant did not return one of the endpoint vectors "
-            "(ep0='{}' ep1='{}'); retry", ep0_pid, ep1_pid)));
+            "(ep0='{}' ep1='{}'); retry", s->ep0_pid, s->ep1_pid)));
 
     // 5. Type vector.
-    rag::Embedding v_type;
     {
-        auto r = co_await load_type_vector(ev, v_type);
+        auto r = co_await load_type_vector(ev, s->v_type);
         if (!r) co_return std::unexpected(r.error());
     }
 
     // 6. Formula v1 (pure).
     {
-        auto r = rag::compute_edge_vector_v1(live.auth0, live.auth1, v0, v1, v_type);
+        auto r = rag::compute_edge_vector_v1(live.auth0, live.auth1, s->v0, s->v1, s->v_type);
         if (!r) co_return std::unexpected(r.error());
         out_edge_vec = std::move(*r);
     }
