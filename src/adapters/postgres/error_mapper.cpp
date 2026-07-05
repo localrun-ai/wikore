@@ -444,15 +444,23 @@ Error map_db_exception(const drogon::orm::DrogonDbException& ex) {
         return Error::invalid_input("required field is missing: " + msg);
 
     // Text-format / cast failures triggered by user-supplied literals.
-    // Kept below constraint and FK dispatch so that a named constraint
-    // still wins — but a bare ill-formed UUID / timestamp / JSON must
-    // return 400, not 500.
-    if (sqlstate == SQLSTATE_INVALID_TEXT_REPR)
+    // Kept below constraint and FK dispatch so a named constraint still
+    // wins — but a bare ill-formed UUID / timestamp / JSON must return
+    // 400, not 500.
+    //
+    // Pipeline mode (PgBatchConnection) surfaces some of these errors as
+    // plain DrogonDbException with no SQLSTATE — same limitation as the
+    // 57014 statement-timeout branch above. Fall back to matching the
+    // stable Postgres message text; text-to-type cast failures are by
+    // construction literal-input-driven, so the risk of misclassifying
+    // an internal bug as a 400 is the same tradeoff the file already
+    // accepted for the timeout match.
+    if (sqlstate == SQLSTATE_INVALID_TEXT_REPR
+        || sqlstate == SQLSTATE_INVALID_DATETIME_FMT
+        || sqlstate == SQLSTATE_INVALID_JSON_TEXT
+        || msg.find("invalid input syntax for type") != std::string::npos
+        || msg.find("date/time field value out of range") != std::string::npos)
         return Error::invalid_input("input has an invalid format: " + msg);
-    if (sqlstate == SQLSTATE_INVALID_DATETIME_FMT)
-        return Error::invalid_input("timestamp has an invalid format: " + msg);
-    if (sqlstate == SQLSTATE_INVALID_JSON_TEXT)
-        return Error::invalid_input("JSON input has an invalid format: " + msg);
 
     return Error::database_error("database error [" + sqlstate + "]: " + msg);
 }

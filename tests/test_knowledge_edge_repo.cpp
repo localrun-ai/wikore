@@ -241,8 +241,31 @@ TEST_CASE("KnowledgeEdgeRepo: hydrate fails loud on schema drift",
     auto ok = drogon::sync_wait(repo.get(CO_EDGE, created->id));
     REQUIRE(ok.has_value());
 
-    // Now corrupt the row so hydrate encounters an unknown type. We
-    // temporarily drop the CHECK for the UPDATE, then restore it.
+    // RAII cleanup: restore the CHECK + the row's edge_type even if an
+    // assertion mid-test aborts the case. Otherwise the widened
+    // constraint would leak into other tests running in the same DB.
+    struct CheckRestorer {
+        drogon::orm::DbClientPtr db;
+        std::string edge_id;
+        ~CheckRestorer() {
+            try {
+                exec_sync(db, "ALTER TABLE knowledge_edges "
+                              "DROP CONSTRAINT IF EXISTS knowledge_edges_edge_type_v1_chk");
+                exec_sync(db, "UPDATE knowledge_edges SET edge_type='implements' "
+                              "WHERE id=$1::uuid", edge_id);
+                exec_sync(db,
+                    "ALTER TABLE knowledge_edges ADD CONSTRAINT knowledge_edges_edge_type_v1_chk "
+                    "CHECK (edge_type IN ('implements','depends_on','exception_to','contradicts',"
+                    "                     'same_requirement_as','derived_from','cites','affects',"
+                    "                     'requires_approval_from'))");
+            } catch (...) {
+                // Swallow: destructor must not throw. CI rebuilds the DB per run.
+            }
+        }
+    };
+    CheckRestorer restorer{db, created->id};
+
+    // Now corrupt the row so hydrate encounters an unknown type.
     exec_sync(db, "ALTER TABLE knowledge_edges DROP CONSTRAINT knowledge_edges_edge_type_v1_chk");
     exec_sync(db,
         "UPDATE knowledge_edges SET edge_type='future_type_not_in_c++' "
@@ -256,16 +279,7 @@ TEST_CASE("KnowledgeEdgeRepo: hydrate fails loud on schema drift",
     auto drift = drogon::sync_wait(repo.get(CO_EDGE, created->id));
     REQUIRE_FALSE(drift.has_value());
     CHECK(drift.error().kind == wikore::Error::Kind::DatabaseError);
-
-    // Cleanup: restore the original CHECK.
-    exec_sync(db, "ALTER TABLE knowledge_edges DROP CONSTRAINT knowledge_edges_edge_type_v1_chk");
-    exec_sync(db,
-        "UPDATE knowledge_edges SET edge_type='implements' WHERE id=$1::uuid", created->id);
-    exec_sync(db,
-        "ALTER TABLE knowledge_edges ADD CONSTRAINT knowledge_edges_edge_type_v1_chk "
-        "CHECK (edge_type IN ('implements','depends_on','exception_to','contradicts',"
-        "                     'same_requirement_as','derived_from','cites','affects',"
-        "                     'requires_approval_from'))");
+    // ~CheckRestorer runs here (or on any earlier throw/REQUIRE fail).
 }
 
 TEST_CASE("KnowledgeEdgeRepo: get + list are tenant-scoped",
