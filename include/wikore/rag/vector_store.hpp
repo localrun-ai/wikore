@@ -62,11 +62,21 @@ public:
     // chunks (identified by document_chunk_vectors.qdrant_point_id) to
     // combine with the type vector.
     //
-    // Missing ids simply do not appear in the result; callers must
-    // check membership. Empty point_ids returns an empty map without
-    // hitting Qdrant.
-    virtual drogon::Task<Result<std::vector<std::pair<std::string, Embedding>>>>
-    fetch_vectors_by_id(const std::vector<std::string>& point_ids) = 0;
+    // Missing ids simply do not appear in `out`; callers must check
+    // membership. Empty point_ids leaves `out` empty without hitting
+    // Qdrant. `out` is cleared first.
+    //
+    // Out-parameter (not a returned Result<vector<pair<...>>>) on
+    // purpose: the CI compiler's coroutine-frame emitter ICEs
+    // (build_special_member_call, cp/call.cc:11096) when a co_await
+    // resumes with a deeply nested std::expected payload like
+    // expected<vector<pair<string, Embedding>>, Error>. Keeping every
+    // awaited type at Task<Result<void>> matches the frame shapes that
+    // are proven to compile there (KnowledgeEdgeRepo, the other outbox
+    // consumers).
+    virtual drogon::Task<Result<void>>
+    fetch_vectors_by_id(const std::vector<std::string>&                 point_ids,
+                        std::vector<std::pair<std::string, Embedding>>& out) = 0;
 
     // Upsert one edge-vector point with an arbitrary JSON payload.
     // Used by the EmbedEdgeWorker: the edge payload shape (edge_id,
@@ -133,8 +143,9 @@ public:
     delete_points_by_id(std::string_view                company_id,
                         const std::vector<std::string>& point_ids) override;
 
-    drogon::Task<Result<std::vector<std::pair<std::string, Embedding>>>>
-    fetch_vectors_by_id(const std::vector<std::string>& point_ids) override;
+    drogon::Task<Result<void>>
+    fetch_vectors_by_id(const std::vector<std::string>&                 point_ids,
+                        std::vector<std::pair<std::string, Embedding>>& out) override;
 
     drogon::Task<Result<void>>
     upsert_raw(std::string_view point_id,
@@ -191,8 +202,9 @@ public:
     delete_points_by_id(std::string_view                company_id,
                         const std::vector<std::string>& point_ids) override;
 
-    drogon::Task<Result<std::vector<std::pair<std::string, Embedding>>>>
-    fetch_vectors_by_id(const std::vector<std::string>& point_ids) override;
+    drogon::Task<Result<void>>
+    fetch_vectors_by_id(const std::vector<std::string>&                 point_ids,
+                        std::vector<std::pair<std::string, Embedding>>& out) override;
 
     drogon::Task<Result<void>>
     upsert_raw(std::string_view point_id,

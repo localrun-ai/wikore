@@ -353,11 +353,14 @@ QdrantVectorStore::delete_points_by_id(std::string_view                company_i
 // POST /points body with `with_vector=true`; unknown ids are silently
 // omitted from the response (Qdrant behaviour), which matches the
 // port's documented contract.
-drogon::Task<Result<std::vector<std::pair<std::string, Embedding>>>>
-QdrantVectorStore::fetch_vectors_by_id(const std::vector<std::string>& point_ids)
+drogon::Task<Result<void>>
+QdrantVectorStore::fetch_vectors_by_id(
+    const std::vector<std::string>&                 point_ids,
+    std::vector<std::pair<std::string, Embedding>>& out)
 {
+    out.clear();
     if (point_ids.empty())
-        co_return std::vector<std::pair<std::string, Embedding>>{};
+        co_return Result<void>{};
 
     std::string ids_json = "[";
     for (size_t i = 0; i < point_ids.size(); ++i) {
@@ -397,11 +400,10 @@ QdrantVectorStore::fetch_vectors_by_id(const std::vector<std::string>& point_ids
             "qdrant fetch_vectors_by_id: response parse error: {}",
             glz::format_error(err, resp->getBody()))));
     }
-    std::vector<std::pair<std::string, Embedding>> out;
     out.reserve(parsed.result.size());
     for (auto& p : parsed.result)
         out.emplace_back(std::move(p.id), std::move(p.vector));
-    co_return out;
+    co_return Result<void>{};
 }
 
 // Upsert one point with a caller-built JSON payload. Used by the
@@ -624,17 +626,19 @@ NullVectorStore::delete_points_by_id(std::string_view company_id,
     co_return Result<void>{};
 }
 
-drogon::Task<Result<std::vector<std::pair<std::string, Embedding>>>>
-NullVectorStore::fetch_vectors_by_id(const std::vector<std::string>& point_ids)
+drogon::Task<Result<void>>
+NullVectorStore::fetch_vectors_by_id(
+    const std::vector<std::string>&                 point_ids,
+    std::vector<std::pair<std::string, Embedding>>& out)
 {
-    std::vector<std::pair<std::string, Embedding>> out;
+    out.clear();
     for (const auto& id : point_ids) {
         for (const auto& p : _points)
             if (p.id == id) { out.emplace_back(p.id, p.vector); break; }
         for (const auto& e : _raw_vectors)
             if (e.first == id) { out.emplace_back(e.first, e.second); break; }
     }
-    co_return out;
+    co_return Result<void>{};
 }
 
 drogon::Task<Result<void>>

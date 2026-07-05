@@ -425,9 +425,22 @@ EmbedEdgeWorker::fetch_endpoint_vectors(std::shared_ptr<rag::VectorStorePort> ch
                                         rag::Embedding&    out_v0,
                                         rag::Embedding&    out_v1)
 {
-    auto vecs = co_await chunk_store->fetch_vectors_by_id({ep0_pid, ep1_pid});
-    if (!vecs) co_return std::unexpected(vecs.error());
-    for (auto& kv : *vecs) {
+    // Named lvalues only in and around the co_await: the CI compiler's
+    // coroutine-frame emitter ICEs (build_special_member_call,
+    // cp/call.cc:11096) on a braced-init temporary argument inside the
+    // awaited call, and on resuming with a nested
+    // expected<vector<pair<string, Embedding>>> — hence the hoisted ids
+    // vector and the out-parameter port signature.
+    std::vector<std::string> pids;
+    pids.reserve(2);
+    pids.push_back(ep0_pid);
+    pids.push_back(ep1_pid);
+    std::vector<std::pair<std::string, rag::Embedding>> vecs;
+    {
+        auto r = co_await chunk_store->fetch_vectors_by_id(pids, vecs);
+        if (!r) co_return std::unexpected(r.error());
+    }
+    for (auto& kv : vecs) {
         if (kv.first == ep0_pid) out_v0 = std::move(kv.second);
         else if (kv.first == ep1_pid) out_v1 = std::move(kv.second);
     }
