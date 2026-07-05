@@ -64,6 +64,39 @@ public:
             std::move(section_heading),
         };
     }
+
+    // Sibling factory for AllowedRelationship. Same passkey pattern —
+    // AllowedRelationship::ConstructionToken befriends test_support::TestGate
+    // under WIKORE_ENABLE_TEST_HOOKS, so this is only reachable from test
+    // translation units.
+    static AllowedRelationship make_rel(
+        std::string company_id,
+        std::string edge_id,
+        std::string edge_type,
+        AllowedRelationship::AllowedEndpoint ep0,
+        AllowedRelationship::AllowedEndpoint ep1,
+        std::string  direction    = "directed",
+        std::string  origin       = "administrator",
+        std::string  review_state = "accepted",
+        float        score        = 0.9f,
+        double       confidence   = 0.9,
+        std::int64_t edge_version = 1)
+    {
+        return AllowedRelationship{
+            AllowedRelationship::ConstructionToken{},
+            std::move(company_id),
+            std::move(edge_id),
+            std::move(edge_type),
+            std::move(direction),
+            std::move(origin),
+            score,
+            confidence,
+            std::move(review_state),
+            edge_version,
+            std::move(ep0),
+            std::move(ep1),
+        };
+    }
 };
 
 // Convenience wrapper — defaults company_id to "test-company" for tests
@@ -79,6 +112,44 @@ inline AllowedChunk make_chunk(
     return TestGate::make(std::move(company_id), std::move(chunk_id),
                           std::move(text), std::move(document_version_id),
                           score, std::move(section_heading));
+}
+
+// Convenience wrapper for AllowedRelationship. Fills reasonable defaults
+// for the "administrator/accepted/directed" case; tests that need a
+// different origin, review_state, or direction override them.
+inline AllowedRelationship make_rel(
+    std::string edge_id,
+    std::string edge_type,
+    AllowedRelationship::AllowedEndpoint ep0,
+    AllowedRelationship::AllowedEndpoint ep1,
+    std::string company_id   = "test-company",
+    std::string direction    = "directed",
+    std::string origin       = "administrator",
+    std::string review_state = "accepted",
+    float       score        = 0.9f,
+    double      confidence   = 0.9,
+    std::int64_t edge_version = 1)
+{
+    return TestGate::make_rel(
+        std::move(company_id), std::move(edge_id), std::move(edge_type),
+        std::move(ep0), std::move(ep1),
+        std::move(direction), std::move(origin), std::move(review_state),
+        score, confidence, edge_version);
+}
+
+// Convenience for constructing an endpoint inline.
+inline AllowedRelationship::AllowedEndpoint make_endpoint(
+    int ordinal, std::string chunk_id, std::string text,
+    std::string document_version_id = "test-ver",
+    std::optional<std::string> section_heading = std::nullopt)
+{
+    return AllowedRelationship::AllowedEndpoint{
+        .ordinal              = ordinal,
+        .chunk_id             = std::move(chunk_id),
+        .document_version_id  = std::move(document_version_id),
+        .text                 = std::move(text),
+        .section_heading      = std::move(section_heading),
+    };
 }
 
 } // namespace wikore::rag::test_support

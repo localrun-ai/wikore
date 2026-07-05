@@ -273,6 +273,7 @@ public:
                         std::string  edge_id,
                         std::string  edge_type,
                         std::string  direction,
+                        std::string  origin,
                         float        score,
                         double       confidence,
                         std::string  review_state,
@@ -283,6 +284,7 @@ public:
         , edge_id_(std::move(edge_id))
         , edge_type_(std::move(edge_type))
         , direction_(std::move(direction))
+        , origin_(std::move(origin))
         , score_(score)
         , confidence_(confidence)
         , review_state_(std::move(review_state))
@@ -296,6 +298,13 @@ public:
     [[nodiscard]] const std::string& edge_id()      const noexcept { return edge_id_; }
     [[nodiscard]] const std::string& edge_type()    const noexcept { return edge_type_; }
     [[nodiscard]] const std::string& direction()    const noexcept { return direction_; }
+    // origin is a V034 knowledge_edges enum: 'administrator' (explicit
+    // human decision), 'inference' (model-proposed), or 'deterministic'
+    // (produced by a scheduled rule). Surfaced here because the
+    // ContextBuilder rendering per docs §"Context construction" must
+    // label inferred edges to prevent the LLM from claiming a strength
+    // the edge does not have.
+    [[nodiscard]] const std::string& origin()       const noexcept { return origin_; }
     [[nodiscard]] float              score()        const noexcept { return score_; }
     [[nodiscard]] double             confidence()   const noexcept { return confidence_; }
     [[nodiscard]] const std::string& review_state() const noexcept { return review_state_; }
@@ -308,6 +317,7 @@ private:
     std::string     edge_id_;
     std::string     edge_type_;
     std::string     direction_;
+    std::string     origin_;
     float           score_        = 0.0f;
     double          confidence_   = 0.0;
     std::string     review_state_;

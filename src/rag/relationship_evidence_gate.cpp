@@ -65,7 +65,7 @@ constexpr auto kGateSql = R"(
         SELECT DISTINCT unnest($5::uuid[]) AS edge_id
     ),
     edge_records AS (
-        SELECT e.id, e.edge_type, e.direction, e.confidence,
+        SELECT e.id, e.edge_type, e.direction, e.origin, e.confidence,
                e.review_state, e.edge_version
         FROM   knowledge_edges e
         JOIN   candidate_edges c ON c.edge_id = e.id
@@ -164,6 +164,7 @@ constexpr auto kGateSql = R"(
     SELECT er.id::text                     AS edge_id,
            er.edge_type,
            er.direction,
+           er.origin,
            er.confidence::float8           AS confidence,
            er.review_state,
            er.edge_version::bigint         AS edge_version,
@@ -183,6 +184,7 @@ struct HydratedRow {
     std::string  edge_id;
     std::string  edge_type;
     std::string  direction;
+    std::string  origin;
     double       confidence   = 0.0;
     std::string  review_state;
     std::int64_t edge_version = 0;
@@ -236,6 +238,7 @@ RelationshipEvidenceGate::evaluate(
             h.edge_id             = r["edge_id"].as<std::string>();
             h.edge_type           = r["edge_type"].as<std::string>();
             h.direction           = r["direction"].as<std::string>();
+            h.origin              = r["origin"].as<std::string>();
             h.confidence          = r["confidence"].as<double>();
             h.review_state        = r["review_state"].as<std::string>();
             h.edge_version        = r["edge_version"].as<std::int64_t>();
@@ -283,6 +286,7 @@ RelationshipEvidenceGate::evaluate(
                          std::move(row0.edge_id),   // both rows share edge_id
                          std::move(row0.edge_type),
                          std::move(row0.direction),
+                         std::move(row0.origin),
                          c.score,
                          row0.confidence,
                          std::move(row0.review_state),
