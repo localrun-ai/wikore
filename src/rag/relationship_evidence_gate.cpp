@@ -32,21 +32,20 @@ std::string pg_array(const std::vector<std::string>& v)
 //   * edge_records            — tenant + state filter on knowledge_edges.
 //   * required_endpoints      — pull ordinal 0 and 1 for each surviving
 //                               edge from knowledge_edge_endpoints.
-//   * reader_scope /
-//     reader_grant_keys       — reused from G1: the caller's org-unit
-//                               scope, closed upward through
-//                               org_unit_closure so a grant to an
-//                               ancestor covers descendants.
+//   * reader_scope            — the caller's org-unit membership scope,
+//                               passed through to the shared visibility
+//                               function below. Ancestor closure is
+//                               applied inside the function.
 //   * cand_docs               — owning documents of every endpoint's
 //                               chunk, filtered by lifecycle +
 //                               sensitivity.
-//   * visible                 — arm 1 (owner-in-scope), arm 2 (grant
-//                               with principal_type='org_unit'), arm 3
-//                               (grant on an ancestor org_unit whose
-//                               subtree contains the doc's owner).
-//                               EXACTLY the three arms G1 uses; ANY
-//                               drift between G1 and G2 is a security
-//                               bug. See the extraction comment below.
+//   * visible                 — delegates to V038's
+//                               wikore_visible_doc_ids(company_id,
+//                               reader_scope, cand_doc_ids). Both G1
+//                               and G2 call it, so the three ACL arms
+//                               (ownership, direct grant, org-unit
+//                               grant with closure) cannot drift
+//                               between the chunk and edge gates.
 //   * authorized_endpoints    — endpoints whose owning document is in
 //                               `visible`.
 //   * admitted_edges          — edges where BOTH ordinals (0 AND 1)
@@ -54,7 +53,9 @@ std::string pg_array(const std::vector<std::string>& v)
 //                               HAVING count clauses are the whole-
 //                               relationship invariant: an edge with
 //                               one visible endpoint is dropped
-//                               entirely, not partially hydrated.
+//                               entirely, not partially hydrated. This
+//                               is endpoint-cardinality logic, NOT an
+//                               ACL arm, so it stays inline in G2.
 //
 // The final SELECT hydrates edge fields + BOTH endpoint chunks' text
 // and section heading in a single row per (edge, ordinal). C++ side
