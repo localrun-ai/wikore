@@ -151,15 +151,40 @@ QdrantRelationshipVectorStore::search(std::string_view                company_id
         co_return std::unexpected(Error::unavailable(
             std::format("qdrant edge search: {}", ex.what())));
     }
-    if (static_cast<int>(resp->getStatusCode()) != 200)
-        co_return std::unexpected(Error::unavailable(
-            std::format("qdrant edge search returned {}",
-                        static_cast<int>(resp->getStatusCode()))));
+    co_return parse_search_response(
+        static_cast<int>(resp->getStatusCode()),
+        resp->getBody(),
+        company_id,
+        _collection);
+}
+
+Result<std::vector<EdgeCandidate>>
+QdrantRelationshipVectorStore::parse_search_response(
+    int              status_code,
+    std::string_view body,
+    std::string_view company_id,
+    std::string_view collection_name_for_log)
+{
+    if (status_code == 404) {
+        // Missing collection = "zero edges indexed for this deployment"
+        // (a recall issue), not an upstream outage. Returning empty here
+        // lets Bridge intent return an honest 200-empty and Automatic
+        // degrade to chunk-only, per docs §"Automatic intent" partial-
+        // answer semantics. Every other non-200 stays as unavailable so
+        // a genuine Qdrant fault surfaces cleanly.
+        spdlog::info("[qdrant-edge-search] collection '{}' returns 404 "
+                     "(not provisioned yet); treating as empty",
+                     collection_name_for_log);
+        return std::vector<EdgeCandidate>{};
+    }
+    if (status_code != 200)
+        return std::unexpected(Error::unavailable(
+            std::format("qdrant edge search returned {}", status_code)));
 
     QdrantEdgeSearchResponse parsed;
     if (auto err = glz::read<glz::opts{.error_on_unknown_keys = false}>(
-            parsed, resp->getBody()); err) {
-        co_return std::unexpected(Error::unavailable(
+            parsed, body); err) {
+        return std::unexpected(Error::unavailable(
             "qdrant edge search response parse failed"));
     }
 
@@ -187,7 +212,7 @@ QdrantRelationshipVectorStore::search(std::string_view                company_id
             .endpoint_1_chunk_id = std::move(r.payload.endpoint_1_chunk_id),
         });
     }
-    co_return out;
+    return out;
 }
 
 // ---------------------------------------------------------------------------

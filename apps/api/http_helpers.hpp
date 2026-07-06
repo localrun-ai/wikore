@@ -24,14 +24,15 @@
 
 // ---------------------------------------------------------------------------
 // Shared JSON / status / validation helpers for the HTTP handlers under
-// apps/api/. Kept as inline functions in a header rather than a translation
-// unit so anonymous-namespace symbols in the individual handler files don't
-// have to be moved into a public library — everything here is header-inline
-// with internal linkage.
+// apps/api/. Kept as `inline` functions in a header rather than in a
+// translation unit so anonymous-namespace symbols in the individual
+// handler files don't have to be moved into a public library. The
+// symbols have external (inline) linkage — the ODR merge is safe here
+// because every definition is textually identical across TUs.
 //
-// Every helper follows the same contract as the existing wiki_query.cpp: log
-// server-side details, return client-safe messages, never leak DB error
-// strings past a 5xx boundary.
+// Every helper follows the same contract as the existing wiki_query.cpp:
+// log server-side details, return client-safe messages, never leak DB
+// error strings past a 5xx boundary.
 // ---------------------------------------------------------------------------
 
 namespace wikore::api::http {
