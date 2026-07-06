@@ -65,7 +65,7 @@ constexpr auto kGateSql = R"(
         SELECT DISTINCT unnest($5::uuid[]) AS edge_id
     ),
     edge_records AS (
-        SELECT e.id, e.edge_type, e.direction, e.confidence,
+        SELECT e.id, e.edge_type, e.direction, e.origin, e.confidence,
                e.review_state, e.edge_version
         FROM   knowledge_edges e
         JOIN   candidate_edges c ON c.edge_id = e.id
@@ -94,7 +94,7 @@ constexpr auto kGateSql = R"(
     cand_docs AS (
         SELECT DISTINCT d.id AS doc_id,
                         d.owner_org_unit_id AS owner,
-                        ep.edge_id, ep.ordinal, ep.chunk_id,
+                        ep.edge_id, ep.ordinal, ep.chunk_id, ep.role,
                         dc.document_version_id, dc.section_id, dc.content
         FROM   required_endpoints ep
         JOIN   document_chunks    dc ON dc.id = ep.chunk_id
@@ -144,7 +144,7 @@ constexpr auto kGateSql = R"(
                 AND rg.principal_id IN (SELECT ou_id FROM reader_grant_keys))
     ),
     authorized_endpoints AS (
-        SELECT cd.edge_id, cd.ordinal, cd.chunk_id,
+        SELECT cd.edge_id, cd.ordinal, cd.chunk_id, cd.role,
                cd.document_version_id, cd.section_id, cd.content
         FROM   cand_docs cd
         WHERE  cd.doc_id IN (SELECT doc_id FROM visible)
@@ -164,10 +164,12 @@ constexpr auto kGateSql = R"(
     SELECT er.id::text                     AS edge_id,
            er.edge_type,
            er.direction,
+           er.origin,
            er.confidence::float8           AS confidence,
            er.review_state,
            er.edge_version::bigint         AS edge_version,
            ae.ordinal                       AS ordinal,
+           ae.role                          AS role,
            ae.chunk_id::text                AS chunk_id,
            ae.document_version_id::text    AS document_version_id,
            ae.content                       AS content,
@@ -183,10 +185,12 @@ struct HydratedRow {
     std::string  edge_id;
     std::string  edge_type;
     std::string  direction;
+    std::string  origin;
     double       confidence   = 0.0;
     std::string  review_state;
     std::int64_t edge_version = 0;
     int          ordinal      = 0;
+    std::string  role;
     std::string  chunk_id;
     std::string  document_version_id;
     std::string  content;
@@ -236,10 +240,12 @@ RelationshipEvidenceGate::evaluate(
             h.edge_id             = r["edge_id"].as<std::string>();
             h.edge_type           = r["edge_type"].as<std::string>();
             h.direction           = r["direction"].as<std::string>();
+            h.origin              = r["origin"].as<std::string>();
             h.confidence          = r["confidence"].as<double>();
             h.review_state        = r["review_state"].as<std::string>();
             h.edge_version        = r["edge_version"].as<std::int64_t>();
             h.ordinal             = r["ordinal"].as<int>();
+            h.role                = r["role"].as<std::string>();
             h.chunk_id            = r["chunk_id"].as<std::string>();
             h.document_version_id = r["document_version_id"].as<std::string>();
             h.content             = r["content"].as<std::string>();
@@ -266,6 +272,7 @@ RelationshipEvidenceGate::evaluate(
 
         AllowedRelationship::AllowedEndpoint ep0{
             .ordinal              = 0,
+            .role                 = std::move(row0.role),
             .chunk_id             = std::move(row0.chunk_id),
             .document_version_id  = std::move(row0.document_version_id),
             .text                 = std::move(row0.content),
@@ -273,6 +280,7 @@ RelationshipEvidenceGate::evaluate(
         };
         AllowedRelationship::AllowedEndpoint ep1{
             .ordinal              = 1,
+            .role                 = std::move(row1.role),
             .chunk_id             = std::move(row1.chunk_id),
             .document_version_id  = std::move(row1.document_version_id),
             .text                 = std::move(row1.content),
@@ -283,6 +291,7 @@ RelationshipEvidenceGate::evaluate(
                          std::move(row0.edge_id),   // both rows share edge_id
                          std::move(row0.edge_type),
                          std::move(row0.direction),
+                         std::move(row0.origin),
                          c.score,
                          row0.confidence,
                          std::move(row0.review_state),

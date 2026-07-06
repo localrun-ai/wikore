@@ -34,7 +34,18 @@ struct PromptContext {
     // ChatMessages instead of flattening instructions into user content.
     std::string system_message;
     std::string user_message;
+
+    // Chunk IDs cited in the prompt, in the order [SRC N] labels were
+    // assigned. When a chunk appears both as standalone evidence AND as
+    // a relationship endpoint, its ID appears exactly once (dedup keys
+    // by chunk_id). The [SRC N] label of a chunk_id is `1 + index_of`
+    // that chunk_id in this vector.
     std::vector<std::string> source_chunk_ids;
+
+    // Edge IDs cited in the prompt, in the order [REL N] labels were
+    // assigned. Empty for pure chunk (fact-intent) evidence.
+    std::vector<std::string> source_edge_ids;
+
     std::size_t prompt_tokens = 0;
     std::size_t prompt_bytes  = 0;
 };

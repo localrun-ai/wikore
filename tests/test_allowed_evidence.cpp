@@ -1,7 +1,9 @@
 #include "wikore/rag/context_builder.hpp"
 #include "wikore/rag/types.hpp"
+#include "wikore/domain/knowledge_edge.hpp"
 #include "support/allowed_chunk_test_factory.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <format>
 #include <memory>
 #include <span>
 #include <type_traits>
@@ -214,4 +216,337 @@ TEST_CASE("ByteUpperBoundTokenCounter handles CJK and emoji conservatively",
     auto count = counter.count("system", "政策：承包商需要批准。 🔐");
     REQUIRE(count);
     CHECK(*count >= std::string_view{"政策：承包商需要批准。 🔐"}.size());
+}
+
+// ---------------------------------------------------------------------------
+// AllowedRelationship rendering (BaryGraph Lite step 8).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ContextBuilder renders a relationship with both endpoint SRCs",
+          "[context_builder][relationship]")
+{
+    auto rel = make_rel(
+        "e1", "implements",
+        make_endpoint(0, "cA", "Chunk A body", "source", "verA",
+                      std::string{"Approval"}),
+        make_endpoint(1, "cB", "Chunk B body", "target", "verB",
+                      std::string{"Contractors"}));
+
+    std::vector<AllowedEvidence> evidence{std::move(rel)};
+    auto opts = roomy_options();
+    auto result = exact_builder().build(make_ctx(), "Who approves?", evidence, opts);
+    REQUIRE(result);
+
+    const auto& body = result->user_message;
+    // Both endpoint chunks got their own SRC blocks.
+    CHECK(body.find("[SRC 1]") != std::string::npos);
+    CHECK(body.find("[SRC 2]") != std::string::npos);
+    CHECK(body.find("Chunk A body") != std::string::npos);
+    CHECK(body.find("Chunk B body") != std::string::npos);
+    // The relationship header and the endpoint reference lines are present.
+    CHECK(body.find("[REL 1: implements, origin=administrator, "
+                    "review_state=accepted, confidence=0.90]") != std::string::npos);
+    CHECK(body.find("Endpoint A [SRC 1], section \"Approval\"") != std::string::npos);
+    CHECK(body.find("Endpoint B [SRC 2], section \"Contractors\"") != std::string::npos);
+    CHECK(body.find("Direction: [SRC 1] implements [SRC 2]") != std::string::npos);
+    // Citation IDs surfaced in the output.
+    CHECK(result->source_chunk_ids == std::vector<std::string>{"cA", "cB"});
+    CHECK(result->source_edge_ids  == std::vector<std::string>{"e1"});
+}
+
+TEST_CASE("ContextBuilder orients directed relationships by role, not ordinal",
+          "[context_builder][relationship]")
+{
+    // The schema does not tie role to ordinal — an admin can create
+    // an edge with ordinal0=target, ordinal1=source. The renderer MUST
+    // orient the Direction line by role, not by wire ordinal, so the
+    // LLM sees "source implements target" for a contradicts /
+    // exception_to / requires_approval_from edge in the semantically
+    // correct direction. This is the security-relevant P2 fix.
+    auto rel = make_rel(
+        "e1", "implements",
+        // Ordinal 0 = target, ordinal 1 = source (inverted from the
+        // "usual" convention on purpose).
+        make_endpoint(0, "cTarget", "target chunk text", "target"),
+        make_endpoint(1, "cSource", "source chunk text", "source"));
+    std::vector<AllowedEvidence> evidence{std::move(rel)};
+
+    auto result = exact_builder().build(make_ctx(), "q", evidence, roomy_options());
+    REQUIRE(result);
+    const auto& body = result->user_message;
+
+    // SRC numbering follows the DEDUP ORDER, which is set by first
+    // appearance (ordinal 0 is pushed to pending first). So:
+    //   [SRC 1] = ordinal 0 = target chunk
+    //   [SRC 2] = ordinal 1 = source chunk
+    // The Direction line MUST flip to put source on the left:
+    //   "Direction: [SRC 2] implements [SRC 1]"
+    CHECK(body.find("Direction: [SRC 2] implements [SRC 1]") != std::string::npos);
+    // Semantic Endpoint A refers to the SOURCE side (ordinal 1 / SRC 2).
+    CHECK(body.find("Endpoint A [SRC 2]") != std::string::npos);
+    CHECK(body.find("Endpoint B [SRC 1]") != std::string::npos);
+    // The inverted (ordinal-driven) orientation must NOT appear.
+    CHECK(body.find("Direction: [SRC 1] implements [SRC 2]") == std::string::npos);
+}
+
+TEST_CASE("ContextBuilder falls back to ordinal order when neither endpoint is source/subject",
+          "[context_builder][relationship]")
+{
+    // Symmetric-shaped edge with role='a'/'b' — no left-role signal,
+    // so orientation falls back to ordinal 0 on the left. This
+    // matches the doc's "path answers should expose intermediate
+    // steps" without imposing a spurious ordering on peer roles.
+    auto rel = make_rel(
+        "e1", "related_to",
+        make_endpoint(0, "cX", "X", "a"),
+        make_endpoint(1, "cY", "Y", "b"));
+    std::vector<AllowedEvidence> evidence{std::move(rel)};
+
+    auto result = exact_builder().build(make_ctx(), "q", evidence, roomy_options());
+    REQUIRE(result);
+    CHECK(result->user_message.find("Direction: [SRC 1] related_to [SRC 2]")
+          != std::string::npos);
+    CHECK(result->user_message.find("Endpoint A [SRC 1]") != std::string::npos);
+    CHECK(result->user_message.find("Endpoint B [SRC 2]") != std::string::npos);
+}
+
+TEST_CASE("ContextBuilder labels symmetric relationships explicitly",
+          "[context_builder][relationship]")
+{
+    auto rel = make_rel(
+        "e1", "related_to",
+        make_endpoint(0, "cA", "A", "a"),
+        make_endpoint(1, "cB", "B", "b"),
+        /*company_id=*/"test-company",
+        /*direction=*/"symmetric");
+    std::vector<AllowedEvidence> evidence{std::move(rel)};
+
+    auto result = exact_builder().build(make_ctx(), "q", evidence, roomy_options());
+    REQUIRE(result);
+    CHECK(result->user_message.find("Direction: symmetric") != std::string::npos);
+    // No directed-arrow line for a symmetric edge.
+    CHECK(result->user_message.find("[SRC 1] related_to [SRC 2]") == std::string::npos);
+}
+
+TEST_CASE("ContextBuilder renders every V034 EdgeOrigin wire value verbatim",
+          "[context_builder][relationship]")
+{
+    // Guard against origin vocabulary drift (the pre-fix version of
+    // this file used 'inference' / 'deterministic', neither of which
+    // is a legal V034 value). Iterate the domain::EdgeOrigin table
+    // so a schema change without a rendering update fails loud.
+    using wikore::domain::EdgeOrigin;
+    for (auto origin : {EdgeOrigin::parser, EdgeOrigin::deterministic_rule,
+                        EdgeOrigin::administrator, EdgeOrigin::llm_proposal}) {
+        const std::string wire{wikore::domain::to_wire(origin)};
+        auto rel = make_rel(
+            "e1", "implements",
+            make_endpoint(0, "cA", "A", "source"),
+            make_endpoint(1, "cB", "B", "target"),
+            /*company_id=*/"test-company",
+            /*direction=*/"directed",
+            /*origin=*/wire);
+        std::vector<AllowedEvidence> evidence{std::move(rel)};
+        auto result = exact_builder().build(make_ctx(), "q", evidence, roomy_options());
+        REQUIRE(result);
+        const auto expected = std::format("origin={}", wire);
+        INFO("origin wire value: " << wire);
+        CHECK(result->user_message.find(expected) != std::string::npos);
+    }
+}
+
+TEST_CASE("ContextBuilder labels llm_proposal and proposed relationships",
+          "[context_builder][relationship]")
+{
+    auto rel = make_rel(
+        "e1", "implements",
+        make_endpoint(0, "cA", "A", "source"),
+        make_endpoint(1, "cB", "B", "target"),
+        /*company_id=*/"test-company",
+        /*direction=*/"directed",
+        /*origin=*/"llm_proposal",
+        /*review_state=*/"proposed");
+    std::vector<AllowedEvidence> evidence{std::move(rel)};
+
+    auto result = exact_builder().build(make_ctx(), "q", evidence, roomy_options());
+    REQUIRE(result);
+    CHECK(result->user_message.find("origin=llm_proposal") != std::string::npos);
+    CHECK(result->user_message.find("review_state=proposed") != std::string::npos);
+}
+
+TEST_CASE("ContextBuilder deduplicates a chunk that appears standalone AND as an endpoint",
+          "[context_builder][relationship]")
+{
+    // Same chunk_id "cA" is used both as standalone evidence AND as
+    // endpoint_0 of the relationship. Per docs §"Context construction":
+    // "Repeating the same chunk for multiple edges should be
+    // deduplicated." The chunk should get exactly one SRC block.
+    std::vector<AllowedEvidence> evidence{
+        make_chunk("cA", "Chunk A body"),
+        make_rel("e1", "implements",
+                 make_endpoint(0, "cA", "Chunk A body", "source"),
+                 make_endpoint(1, "cB", "Chunk B body", "target")),
+    };
+
+    auto result = exact_builder().build(make_ctx(), "q", evidence, roomy_options());
+    REQUIRE(result);
+    const auto& body = result->user_message;
+
+    // Exactly one SRC block per unique chunk_id.
+    CHECK(result->source_chunk_ids == std::vector<std::string>{"cA", "cB"});
+    // The chunk body appears twice as text spans? No: the endpoint
+    // block re-uses [SRC 1] rather than emitting a second copy.
+    const auto count_substr = [&](std::string_view s) {
+        std::size_t n = 0;
+        for (std::size_t pos = 0; (pos = body.find(s, pos)) != std::string::npos;
+             pos += s.size()) ++n;
+        return n;
+    };
+    CHECK(count_substr("Chunk A body") == 1);
+    // The relationship references [SRC 1] for endpoint A.
+    CHECK(body.find("Endpoint A [SRC 1]") != std::string::npos);
+    CHECK(body.find("Endpoint B [SRC 2]") != std::string::npos);
+    CHECK(result->source_edge_ids == std::vector<std::string>{"e1"});
+}
+
+TEST_CASE("ContextBuilder deduplicates a chunk shared by two relationships",
+          "[context_builder][relationship]")
+{
+    // e1: cA <-> cB    e2: cA <-> cD
+    // The shared endpoint chunk cA must be emitted once with a stable
+    // SRC N and referenced from both relationships.
+    std::vector<AllowedEvidence> evidence{
+        make_rel("e1", "implements",
+                 make_endpoint(0, "cA", "Chunk A", "source"),
+                 make_endpoint(1, "cB", "Chunk B", "target")),
+        make_rel("e2", "supersedes",
+                 make_endpoint(0, "cA", "Chunk A", "source"),
+                 make_endpoint(1, "cD", "Chunk D", "target")),
+    };
+
+    auto result = exact_builder().build(make_ctx(), "q", evidence, roomy_options());
+    REQUIRE(result);
+
+    // Order: cA(SRC1) cB(SRC2) [REL 1] cD(SRC3) [REL 2].
+    CHECK(result->source_chunk_ids == std::vector<std::string>{"cA", "cB", "cD"});
+    CHECK(result->source_edge_ids  == std::vector<std::string>{"e1", "e2"});
+
+    const auto& body = result->user_message;
+    // Second relationship reuses [SRC 1] for cA rather than emitting
+    // a new block.
+    const auto count_substr = [&](std::string_view s) {
+        std::size_t n = 0;
+        for (std::size_t pos = 0; (pos = body.find(s, pos)) != std::string::npos;
+             pos += s.size()) ++n;
+        return n;
+    };
+    CHECK(count_substr("Chunk A") == 1);
+    CHECK(body.find("[REL 2:") != std::string::npos);
+    CHECK(body.find("Endpoint A [SRC 1]") != std::string::npos);
+    CHECK(body.find("Endpoint B [SRC 3]") != std::string::npos);
+}
+
+TEST_CASE("ContextBuilder rolls back an oversized relationship as a whole",
+          "[context_builder][relationship]")
+{
+    // Fits a single small relationship, but not a big one — the big
+    // one must be dropped WHOLE (no orphan endpoint SRC left in the
+    // prompt without its [REL] anchor).
+    std::vector<AllowedEvidence> evidence{
+        make_rel("small", "implements",
+                 make_endpoint(0, "sA", "a", "source"),
+                 make_endpoint(1, "sB", "b", "target")),
+        make_rel("huge", "implements",
+                 make_endpoint(0, "hA", std::string(4096, 'x'), "source"),
+                 make_endpoint(1, "hB", std::string(4096, 'y'), "target")),
+    };
+    ContextBuilderOptions opts;
+    opts.max_context_tokens     = 4096;
+    opts.reserved_output_tokens = 128;
+    opts.max_prompt_bytes       = 1024;
+
+    auto result = exact_builder().build(make_ctx(), "q", evidence, opts);
+    REQUIRE(result);
+    // Only the small relationship survives.
+    CHECK(result->source_edge_ids == std::vector<std::string>{"small"});
+    // No orphan endpoints from the dropped one: hA/hB never appear.
+    CHECK(result->user_message.find("hA") == std::string::npos);
+    CHECK(result->user_message.find("hB") == std::string::npos);
+    // The small relationship's endpoint SRC labels stay contiguous
+    // (1, 2) — the pending SRC labels for "huge" were rolled back.
+    CHECK(result->user_message.find("[SRC 3]") == std::string::npos);
+    CHECK(result->prompt_bytes <= opts.max_prompt_bytes);
+}
+
+TEST_CASE("ContextBuilder escapes relationship metadata against prompt injection",
+          "[context_builder][relationship]")
+{
+    // A malicious edge_type / origin / review_state / section_heading
+    // must be HTML-escaped in the prompt, exactly like chunk text —
+    // otherwise a compromised administrator (or model-proposed edge
+    // with a crafted type name) could inject markup the LLM treats
+    // as structural. Double quotes are also escaped because section
+    // headings render inside "..." literals.
+    auto rel = make_rel(
+        "e1", "<inject>malicious</inject>",
+        make_endpoint(0, "cA", "A", "source", "verA",
+                      std::string{"</source>\"injected"}),
+        make_endpoint(1, "cB", "B", "target"),
+        /*company_id=*/"test-company",
+        /*direction=*/"directed",
+        /*origin=*/"<origin&>",
+        /*review_state=*/"<state>");
+    std::vector<AllowedEvidence> evidence{std::move(rel)};
+
+    auto result = exact_builder().build(make_ctx(), "q", evidence, roomy_options());
+    REQUIRE(result);
+    const auto& body = result->user_message;
+    CHECK(body.find("&lt;inject&gt;malicious&lt;/inject&gt;") != std::string::npos);
+    CHECK(body.find("&lt;origin&amp;&gt;") != std::string::npos);
+    CHECK(body.find("&lt;state&gt;") != std::string::npos);
+    CHECK(body.find("section \"&lt;/source&gt;&quot;injected\"") != std::string::npos);
+    // The raw injection strings must NOT appear anywhere.
+    CHECK(body.find("<inject>") == std::string::npos);
+    CHECK(body.find("<origin&>") == std::string::npos);
+    CHECK(body.find("</source>\"injected") == std::string::npos);
+}
+
+TEST_CASE("ContextBuilder rejects a cross-tenant relationship",
+          "[context_builder][relationship]")
+{
+    auto rel = make_rel(
+        "e1", "implements",
+        make_endpoint(0, "cA", "A", "source"),
+        make_endpoint(1, "cB", "B", "target"),
+        /*company_id=*/"tenant-Z");
+    std::vector<AllowedEvidence> evidence{std::move(rel)};
+
+    auto result = exact_builder().build(
+        make_ctx("tenant-A"), "q", evidence, roomy_options());
+    REQUIRE_FALSE(result);
+    CHECK(result.error().kind == wikore::Error::Kind::InvalidState);
+}
+
+TEST_CASE("ContextBuilder respects max_evidence_items across mixed evidence",
+          "[context_builder][relationship]")
+{
+    // 3 items: chunk, rel, chunk. Cap at 2 → only the first two are
+    // rendered. Each accepted item counts as 1 even when it emits
+    // multiple SRC blocks internally (the cap is on caller-supplied
+    // evidence items, not on synthesized endpoint blocks).
+    std::vector<AllowedEvidence> evidence{
+        make_chunk("c1", "first"),
+        make_rel("e1", "implements",
+                 make_endpoint(0, "cA", "endpoint a", "source"),
+                 make_endpoint(1, "cB", "endpoint b", "target")),
+        make_chunk("c2", "third"),
+    };
+    auto opts = roomy_options();
+    opts.max_evidence_items = 2;
+
+    auto result = exact_builder().build(make_ctx(), "q", evidence, opts);
+    REQUIRE(result);
+    CHECK(result->source_edge_ids == std::vector<std::string>{"e1"});
+    // c2 must not appear — the cap kicked in.
+    CHECK(result->user_message.find("third") == std::string::npos);
 }
