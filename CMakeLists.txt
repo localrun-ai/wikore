@@ -157,6 +157,7 @@ add_library(wikore_rag STATIC
     src/application/embed_type_vectors.cpp
     src/rag/relationship_evidence_gate.cpp
     src/rag/relationship_vector_store.cpp
+    src/rag/answer_use_case.cpp
 )
 target_link_libraries(wikore_rag PUBLIC wikore_core)
 

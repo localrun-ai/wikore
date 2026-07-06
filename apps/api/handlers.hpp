@@ -1,6 +1,7 @@
 #pragma once
 #include "wikore/rag/retrieval_orchestrator.hpp"
 #include "wikore/rag/knowledge_edge_repo.hpp"
+#include "wikore/rag/answer_use_case.hpp"
 #include <drogon/HttpRequest.h>
 #include <drogon/HttpResponse.h>
 #include <drogon/orm/DbClient.h>
@@ -49,6 +50,19 @@ wiki_evidence(std::shared_ptr<rag::RetrievalOrchestrator> orch,
               drogon::orm::DbClientPtr                    db,
               drogon::HttpRequestPtr                      req,
               std::string                                 org_unit_id);
+
+// POST /api/orgs/{orgUnitId}/wiki/answer - grounded LLM answer with
+// citations (step 8c).
+//
+// Runs retrieve_evidence → ContextBuilder → LlmProvider through
+// AnswerUseCase, returning the generated answer alongside the allowed
+// citation ID sets the prompt exposed. Auth + tenant + scope handled
+// identically to /wiki/evidence.
+drogon::Task<drogon::HttpResponsePtr>
+wiki_answer(std::shared_ptr<rag::AnswerUseCase> use_case,
+            drogon::orm::DbClientPtr            db,
+            drogon::HttpRequestPtr              req,
+            std::string                         org_unit_id);
 
 // GET /api/me - the authenticated caller's identity + tenant.
 //
