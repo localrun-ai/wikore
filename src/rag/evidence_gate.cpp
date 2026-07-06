@@ -22,23 +22,12 @@ std::string pg_array(const std::vector<std::string>& v)
     return out;
 }
 
-// G1 gate query. The WITH block is the validated visibility logic (section 0,
-// property-tested); the final SELECT hydrates the allowed chunks. Resource
-// visibility is resolved live from resource_grants + org_unit_closure.
+// G1 gate query. The visibility arms live in the shared V038 function
+// wikore_visible_doc_ids so this file and RelationshipEvidenceGate
+// (G2) cannot drift — see V038 header for the arm-by-arm contract.
 constexpr auto kGateSql = R"(
-    WITH reader_scope(ou_id) AS (
-        SELECT DISTINCT x FROM unnest($4::uuid[]) AS x
-    ),
-    reader_grant_keys AS (
-        SELECT ou_id FROM reader_scope
-        UNION
-        SELECT c.ancestor_id
-        FROM   org_unit_closure c
-        WHERE  c.company_id = $1::uuid
-          AND  c.descendant_id IN (SELECT ou_id FROM reader_scope)
-    ),
-    cand_docs AS (
-        SELECT DISTINCT d.id AS doc_id, d.owner_org_unit_id AS owner
+    WITH cand_docs AS (
+        SELECT DISTINCT d.id AS doc_id
         FROM   document_chunks   dc
         JOIN   document_versions dv ON dv.id = dc.document_version_id
         JOIN   documents         d  ON d.id  = dv.document_id
@@ -48,37 +37,11 @@ constexpr auto kGateSql = R"(
           AND  dv.sensitivity_label = ANY($3::text[])
     ),
     visible AS (
-        SELECT doc_id FROM cand_docs
-        WHERE  owner IN (SELECT ou_id FROM reader_scope)              -- arm 1
-      UNION
-        SELECT cd.doc_id FROM cand_docs cd                           -- arm 2
-        JOIN   resource_grants rg
-            ON rg.company_id    = $1::uuid
-           AND rg.resource_type = 'document'
-           AND rg.resource_id   = cd.doc_id
-           AND rg.permission IN ('read','write','admin')
-           AND (rg.expires_at IS NULL OR rg.expires_at > now())
-        WHERE  (rg.principal_applies_to = 'self_only'
-                AND rg.principal_id IN (SELECT ou_id FROM reader_scope))
-           OR  (rg.principal_applies_to = 'self_and_descendants'
-                AND rg.principal_id IN (SELECT ou_id FROM reader_grant_keys))
-      UNION
-        SELECT cd.doc_id FROM cand_docs cd                           -- arm 3
-        JOIN   org_unit_closure rc
-            ON rc.company_id    = $1::uuid
-           AND rc.descendant_id = cd.owner
-        JOIN   resource_grants rg
-            ON rg.company_id    = $1::uuid
-           AND rg.resource_type = 'org_unit'
-           AND rg.resource_id   = rc.ancestor_id
-           AND rg.permission IN ('read','write','admin')
-           AND (rg.expires_at IS NULL OR rg.expires_at > now())
-           AND (rg.resource_applies_to = 'self_and_descendants'
-                OR (rg.resource_applies_to = 'self_only' AND rc.depth = 0))
-        WHERE  (rg.principal_applies_to = 'self_only'
-                AND rg.principal_id IN (SELECT ou_id FROM reader_scope))
-           OR  (rg.principal_applies_to = 'self_and_descendants'
-                AND rg.principal_id IN (SELECT ou_id FROM reader_grant_keys))
+        SELECT doc_id
+        FROM   wikore_visible_doc_ids(
+                   $1::uuid,
+                   $4::uuid[],
+                   (SELECT array_agg(doc_id) FROM cand_docs))
     )
     SELECT dc.id::text                  AS chunk_id,
            dc.document_version_id::text AS document_version_id,
