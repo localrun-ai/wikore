@@ -8,8 +8,13 @@
 #include "wikore/rag/embedder.hpp"              // LlamaEmbedder
 #include "wikore/rag/vector_store.hpp"          // QdrantVectorStore
 #include "wikore/rag/evidence_gate.hpp"         // EvidenceGate
+#include "wikore/rag/relationship_evidence_gate.hpp"
+#include "wikore/rag/relationship_vector_store.hpp"
 #include "wikore/rag/retrieval_orchestrator.hpp"
 #include "wikore/rag/knowledge_edge_repo.hpp"
+#include "wikore/rag/context_builder.hpp"
+#include "wikore/rag/llm_provider.hpp"
+#include "wikore/rag/answer_use_case.hpp"
 #include "handlers.hpp"
 
 #include <drogon/drogon.h>
@@ -68,6 +73,7 @@ int main() {
     struct RagDeps {
         std::shared_ptr<wikore::rag::RetrievalOrchestrator> orch;
         std::shared_ptr<wikore::rag::KnowledgeEdgeRepo>     edge_repo;
+        std::shared_ptr<wikore::rag::AnswerUseCase>         answer;
         drogon::orm::DbClientPtr                            db;
     };
     auto deps = std::make_shared<RagDeps>();
@@ -98,7 +104,17 @@ int main() {
             embedder, resolver, vector_store, wikore::rag::EvidenceGate(db),
             edge_store, edge_gate);
         deps->edge_repo = std::make_shared<wikore::rag::KnowledgeEdgeRepo>(db);
-        spdlog::info("[wikore] RAG read path ready (chunk + edge intents)");
+        // Answer path (step 8c): retrieve_evidence → ContextBuilder →
+        // LlmProvider. The LLM provider is materialised from the env-var
+        // shim; when the DB-backed provider registry (V033) lands as the
+        // primary source of provider config this construction moves to
+        // resolve-per-tenant.
+        auto llm = wikore::rag::make_llm_provider(
+            wikore::rag::llm_provider_config_from_env(cfg));
+        auto ctx_builder = std::make_shared<wikore::rag::ContextBuilder>();
+        deps->answer = std::make_shared<wikore::rag::AnswerUseCase>(
+            deps->orch, ctx_builder, std::move(llm));
+        spdlog::info("[wikore] RAG read path ready (chunk + edge intents, answer path)");
     });
 
     // -----------------------------------------------------------------------
@@ -264,6 +280,25 @@ int main() {
             }
             auto resp = co_await wikore::api::wiki_evidence(
                 deps->orch, deps->db, std::move(req), std::move(org_unit_id));
+            cb(resp);
+        },
+        {drogon::Post, "wikore::AuthFilter"});
+
+    // Grounded LLM answer (step 8c): retrieve_evidence → ContextBuilder
+    // → LlmProvider. Same startup guard as the retrieval routes; the
+    // handler itself never throws.
+    drogon::app().registerHandler("/api/orgs/{1}/wiki/answer",
+        [deps](Req req, CB cb, std::string org_unit_id) -> drogon::AsyncTask {
+            if (!deps->answer) {
+                auto r = drogon::HttpResponse::newHttpResponse();
+                r->setStatusCode(drogon::k503ServiceUnavailable);
+                r->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+                r->setBody(R"({"error":"service starting"})");
+                cb(r);
+                co_return;
+            }
+            auto resp = co_await wikore::api::wiki_answer(
+                deps->answer, deps->db, std::move(req), std::move(org_unit_id));
             cb(resp);
         },
         {drogon::Post, "wikore::AuthFilter"});

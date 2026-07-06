@@ -46,6 +46,15 @@ struct PromptContext {
     // assigned. Empty for pure chunk (fact-intent) evidence.
     std::vector<std::string> source_edge_ids;
 
+    // How many caller-supplied AllowedEvidence items reached the
+    // prompt (i.e. were not dropped by budget or item-cap). Distinct
+    // from source_chunk_ids.size() + source_edge_ids.size(): a
+    // relationship that emits two synthesized endpoint SRCs still
+    // counts as ONE included evidence item here, while it contributes
+    // TWO chunk citations + one edge citation to the ID lists. Use
+    // this for "did we ground on anything?" observability.
+    int          evidence_included = 0;
+
     std::size_t prompt_tokens = 0;
     std::size_t prompt_bytes  = 0;
 };
