@@ -32,21 +32,20 @@ std::string pg_array(const std::vector<std::string>& v)
 //   * edge_records            — tenant + state filter on knowledge_edges.
 //   * required_endpoints      — pull ordinal 0 and 1 for each surviving
 //                               edge from knowledge_edge_endpoints.
-//   * reader_scope /
-//     reader_grant_keys       — reused from G1: the caller's org-unit
-//                               scope, closed upward through
-//                               org_unit_closure so a grant to an
-//                               ancestor covers descendants.
+//   * reader_scope            — the caller's org-unit membership scope,
+//                               passed through to the shared visibility
+//                               function below. Ancestor closure is
+//                               applied inside the function.
 //   * cand_docs               — owning documents of every endpoint's
 //                               chunk, filtered by lifecycle +
 //                               sensitivity.
-//   * visible                 — arm 1 (owner-in-scope), arm 2 (grant
-//                               with principal_type='org_unit'), arm 3
-//                               (grant on an ancestor org_unit whose
-//                               subtree contains the doc's owner).
-//                               EXACTLY the three arms G1 uses; ANY
-//                               drift between G1 and G2 is a security
-//                               bug. See the extraction comment below.
+//   * visible                 — delegates to V038's
+//                               wikore_visible_doc_ids(company_id,
+//                               reader_scope, cand_doc_ids). Both G1
+//                               and G2 call it, so the three ACL arms
+//                               (ownership, direct grant, org-unit
+//                               grant with closure) cannot drift
+//                               between the chunk and edge gates.
 //   * authorized_endpoints    — endpoints whose owning document is in
 //                               `visible`.
 //   * admitted_edges          — edges where BOTH ordinals (0 AND 1)
@@ -54,7 +53,9 @@ std::string pg_array(const std::vector<std::string>& v)
 //                               HAVING count clauses are the whole-
 //                               relationship invariant: an edge with
 //                               one visible endpoint is dropped
-//                               entirely, not partially hydrated.
+//                               entirely, not partially hydrated. This
+//                               is endpoint-cardinality logic, NOT an
+//                               ACL arm, so it stays inline in G2.
 //
 // The final SELECT hydrates edge fields + BOTH endpoint chunks' text
 // and section heading in a single row per (edge, ordinal). C++ side
@@ -83,17 +84,8 @@ constexpr auto kGateSql = R"(
     reader_scope(ou_id) AS (
         SELECT DISTINCT x FROM unnest($4::uuid[]) AS x
     ),
-    reader_grant_keys AS (
-        SELECT ou_id FROM reader_scope
-        UNION
-        SELECT c.ancestor_id
-        FROM   org_unit_closure c
-        WHERE  c.company_id = $1::uuid
-          AND  c.descendant_id IN (SELECT ou_id FROM reader_scope)
-    ),
     cand_docs AS (
         SELECT DISTINCT d.id AS doc_id,
-                        d.owner_org_unit_id AS owner,
                         ep.edge_id, ep.ordinal, ep.chunk_id, ep.role,
                         dc.document_version_id, dc.section_id, dc.content
         FROM   required_endpoints ep
@@ -104,44 +96,17 @@ constexpr auto kGateSql = R"(
           AND  dv.lifecycle_status  = ANY($2::text[])
           AND  dv.sensitivity_label = ANY($3::text[])
     ),
-    -- Three visibility arms — MUST stay in lock-step with EvidenceGate
-    -- (G1)'s corresponding arms. Any drift between G1 and G2 is a
-    -- security bug; when the shared visibility SQL is factored into a
-    -- pg function (see docs §"The production query will need to
-    -- reuse or factor the existing visibility SQL carefully") both
-    -- gates will call it.
+    -- Visibility arms live in the V038 wikore_visible_doc_ids function;
+    -- both G1 and G2 call it so the ACL arms cannot drift between the
+    -- chunk and edge gates. The reader_scope input is passed straight
+    -- through; the candidate doc set is the DISTINCT doc_ids in
+    -- cand_docs above.
     visible AS (
-        SELECT doc_id FROM cand_docs
-        WHERE  owner IN (SELECT ou_id FROM reader_scope)
-      UNION
-        SELECT cd.doc_id FROM cand_docs cd
-        JOIN   resource_grants rg
-            ON rg.company_id    = $1::uuid
-           AND rg.resource_type = 'document'
-           AND rg.resource_id   = cd.doc_id
-           AND rg.permission IN ('read','write','admin')
-           AND (rg.expires_at IS NULL OR rg.expires_at > now())
-        WHERE  (rg.principal_applies_to = 'self_only'
-                AND rg.principal_id IN (SELECT ou_id FROM reader_scope))
-           OR  (rg.principal_applies_to = 'self_and_descendants'
-                AND rg.principal_id IN (SELECT ou_id FROM reader_grant_keys))
-      UNION
-        SELECT cd.doc_id FROM cand_docs cd
-        JOIN   org_unit_closure rc
-            ON rc.company_id    = $1::uuid
-           AND rc.descendant_id = cd.owner
-        JOIN   resource_grants rg
-            ON rg.company_id    = $1::uuid
-           AND rg.resource_type = 'org_unit'
-           AND rg.resource_id   = rc.ancestor_id
-           AND rg.permission IN ('read','write','admin')
-           AND (rg.expires_at IS NULL OR rg.expires_at > now())
-           AND (rg.resource_applies_to = 'self_and_descendants'
-                OR (rg.resource_applies_to = 'self_only' AND rc.depth = 0))
-        WHERE  (rg.principal_applies_to = 'self_only'
-                AND rg.principal_id IN (SELECT ou_id FROM reader_scope))
-           OR  (rg.principal_applies_to = 'self_and_descendants'
-                AND rg.principal_id IN (SELECT ou_id FROM reader_grant_keys))
+        SELECT doc_id
+        FROM   wikore_visible_doc_ids(
+                   $1::uuid,
+                   $4::uuid[],
+                   (SELECT array_agg(DISTINCT doc_id) FROM cand_docs))
     ),
     authorized_endpoints AS (
         SELECT cd.edge_id, cd.ordinal, cd.chunk_id, cd.role,

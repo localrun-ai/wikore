@@ -24,6 +24,7 @@ add_executable(wikore_tests
     test_edge_vector_formula.cpp
     test_relationship_evidence_gate.cpp
     test_relationship_vector_store.cpp
+    test_visible_doc_ids_fn.cpp
     test_wiki_query_handler.cpp
     test_wiki_evidence_handler.cpp
     test_wiki_answer_handler.cpp
