@@ -79,6 +79,18 @@ public:
            int                             limit,
            double                          timeout_s = 0) override;
 
+    // Response-parsing helper exposed for testing. Given the HTTP
+    // status and body Qdrant returned, produces the same Result<>
+    // that search() would after receiving that response. Split out
+    // so a unit test can pin the 404-means-empty and the
+    // non-200-means-unavailable semantics without needing a live
+    // Qdrant.
+    static Result<std::vector<EdgeCandidate>>
+    parse_search_response(int              status_code,
+                          std::string_view body,
+                          std::string_view company_id,
+                          std::string_view collection_name_for_log);
+
 private:
     std::string           _qdrant_url;
     std::string           _collection;

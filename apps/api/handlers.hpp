@@ -32,6 +32,24 @@ wiki_query(std::shared_ptr<rag::RetrievalOrchestrator> orch,
            drogon::HttpRequestPtr                      req,
            std::string                                 org_unit_id);
 
+// POST /api/orgs/{orgUnitId}/wiki/evidence - intent-dispatched retrieval.
+//
+// Sibling of wiki_query. Runs the Iteration-3 intent surface added in step 7
+// (retrieve_evidence): Fact returns chunk-only variants (backward-compat
+// shape); Bridge returns AllowedRelationship-only variants; Automatic
+// interleaves both. Returns a discriminated response — each result carries
+// a "kind" field ("chunk" or "relationship") so the client can render each
+// alternative correctly without a schema-guessing pass.
+//
+// Bridge and Automatic require the orchestrator to have an edge Qdrant
+// collection and RelationshipEvidenceGate wired up; Bridge fails closed with
+// 503 when unwired, Automatic degrades to fact-only.
+drogon::Task<drogon::HttpResponsePtr>
+wiki_evidence(std::shared_ptr<rag::RetrievalOrchestrator> orch,
+              drogon::orm::DbClientPtr                    db,
+              drogon::HttpRequestPtr                      req,
+              std::string                                 org_unit_id);
+
 // GET /api/me - the authenticated caller's identity + tenant.
 //
 // Behind AuthFilter, so `identity` is present and its user_id is the internal

@@ -3,6 +3,7 @@
 # exposed via the PUBLIC include dir so consumers can `#include "handlers.hpp"`.
 add_library(wikore_api_handlers STATIC
     wiki_query.cpp
+    wiki_evidence.cpp
     me.cpp
     orgs_tree.cpp
     org_get.cpp
