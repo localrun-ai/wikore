@@ -4,6 +4,7 @@
 add_library(wikore_api_handlers STATIC
     wiki_query.cpp
     wiki_evidence.cpp
+    wiki_answer.cpp
     me.cpp
     orgs_tree.cpp
     org_get.cpp

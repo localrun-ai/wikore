@@ -376,6 +376,7 @@ Result<PromptContext> ContextBuilder::build(
 
     out.user_message = std::move(evidence_blocks);
     out.user_message += query_block;
+    out.evidence_included = included;
     out.prompt_bytes = prompt_bytes(out.system_message, out.user_message);
     auto final_tokens = token_counter_->count(out.system_message, out.user_message);
     if (!final_tokens)
