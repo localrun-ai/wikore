@@ -24,6 +24,7 @@ add_executable(wikore_tests
     test_edge_vector_formula.cpp
     test_relationship_evidence_gate.cpp
     test_wiki_query_handler.cpp
+    test_wiki_evidence_handler.cpp
     test_me_handler.cpp
     test_orgs_tree_handler.cpp
     test_org_get_handler.cpp

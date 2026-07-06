@@ -80,11 +80,25 @@ int main() {
             std::make_shared<wikore::PostgresAccessResolver>(db), db);
         auto vector_store =
             std::make_shared<wikore::rag::QdrantVectorStore>(cfg.qdrant_url);
+        // Edge collection: wired in unconditionally so Bridge and Automatic
+        // intents work on any deployment. Bridge/Automatic still fail
+        // closed / degrade at query time if the collection is empty or
+        // missing — the orchestrator does not touch Qdrant at construction
+        // time, and RelationshipVectorStorePort::search returns an empty
+        // result set for a missing collection. Adding the wiring here just
+        // unlocks the intent surface once the collection is provisioned;
+        // there is no runtime cost until a Bridge/Automatic request lands.
+        auto edge_store =
+            std::make_shared<wikore::rag::QdrantRelationshipVectorStore>(
+                cfg.qdrant_url, cfg.qdrant_edge_collection);
+        auto edge_gate =
+            std::make_shared<wikore::rag::RelationshipEvidenceGate>(db);
         deps->db   = db;
         deps->orch = std::make_shared<wikore::rag::RetrievalOrchestrator>(
-            embedder, resolver, vector_store, wikore::rag::EvidenceGate(db));
+            embedder, resolver, vector_store, wikore::rag::EvidenceGate(db),
+            edge_store, edge_gate);
         deps->edge_repo = std::make_shared<wikore::rag::KnowledgeEdgeRepo>(db);
-        spdlog::info("[wikore] RAG read path ready");
+        spdlog::info("[wikore] RAG read path ready (chunk + edge intents)");
     });
 
     // -----------------------------------------------------------------------
@@ -229,6 +243,26 @@ int main() {
                 co_return;
             }
             auto resp = co_await wikore::api::wiki_query(
+                deps->orch, deps->db, std::move(req), std::move(org_unit_id));
+            cb(resp);
+        },
+        {drogon::Post, "wikore::AuthFilter"});
+
+    // Intent-dispatched retrieval (step 7 + 8 surface). Same auth /
+    // startup-race handling as wiki/query above; the handler itself
+    // dispatches on the body's "intent" field and fails closed on Bridge
+    // when the edge collection is unwired.
+    drogon::app().registerHandler("/api/orgs/{1}/wiki/evidence",
+        [deps](Req req, CB cb, std::string org_unit_id) -> drogon::AsyncTask {
+            if (!deps->orch) {
+                auto r = drogon::HttpResponse::newHttpResponse();
+                r->setStatusCode(drogon::k503ServiceUnavailable);
+                r->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+                r->setBody(R"({"error":"service starting"})");
+                cb(r);
+                co_return;
+            }
+            auto resp = co_await wikore::api::wiki_evidence(
                 deps->orch, deps->db, std::move(req), std::move(org_unit_id));
             cb(resp);
         },
